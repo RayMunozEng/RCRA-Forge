@@ -9,20 +9,30 @@ from ui.preferences_dialog import PreferencesDialog
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QSplitter, QVBoxLayout, QHBoxLayout,
     QMenuBar, QMenu, QToolBar, QStatusBar, QFileDialog,
-    QMessageBox, QApplication, QLabel, QFrame, QTabWidget
+    QMessageBox, QApplication, QLabel, QFrame, QTabWidget, QPushButton
 )
-from PyQt6.QtCore import Qt, QThread, QObject, pyqtSignal, QSize
+from PyQt6.QtCore import Qt, QThread, QObject, pyqtSignal, QSize, QTimer
 from PyQt6.QtGui import QAction, QKeySequence, QFont, QColor
 
 from ui.asset_browser import AssetBrowser
 from ui.properties_panel import PropertiesPanel
 from ui.viewport import Viewport3D
+from ui.model_preview import SoftwareModelPreview
 from ui.texture_viewer import TextureViewer
 from ui.controls_dialog import ControlsDialog
 from ui.scene_panel import ScenePanel
 from ui.hex_inspector import HexInspector
 from ui.skeleton_viewer import SkeletonViewer
+from ui.asset_overview import AssetOverview
 from core.archive import TocParser, AssetEntry, ASSET_TYPE_NAMES
+
+
+def _is_effect_role(role: str) -> bool:
+    return (
+        role == 'emissive'
+        or role.startswith('emissive_')
+        or role == 'retail_lava_color_a'
+    )
 
 
 # ── Background loader ──────────────────────────────────────────────────────────
@@ -109,11 +119,14 @@ class AssetLoader(QObject):
     mesh_ready      = pyqtSignal(object)        # ModelAsset
     texture_ready   = pyqtSignal(object)        # TextureAsset
     materials_ready = pyqtSignal(dict)          # {mat_idx: {role: (rgba, w, h, tex_name)}}
+    materials_finished = pyqtSignal(dict)       # complete decoded material map
     skel_ready      = pyqtSignal(object)        # Skeleton
     zone_ready      = pyqtSignal(object)        # ZoneDef
     level_ready     = pyqtSignal(object, object)
     raw_ready       = pyqtSignal(bytes, str)    # raw bytes, label
+    result_ready    = pyqtSignal(object)        # core.asset_loader.AssetResult
     error           = pyqtSignal(str)
+    completed       = pyqtSignal()
 
     def __init__(self, entry, toc_parser, lookup=None):
         super().__init__()
@@ -130,24 +143,64 @@ class AssetLoader(QObject):
 
             # Raw bytes always emitted first (feeds hex inspector)
             self.raw_ready.emit(result.raw, result.label)
+            self.result_ready.emit(result)
 
             if result.error and not any([result.model, result.texture,
-                                         result.zone, result.level]):
+                                         result.actor, result.zone, result.level]):
                 self.error.emit(result.error)
+                return
+
+            if result.actor is not None:
+                actor = result.actor
+                if not actor.model_asset_id:
+                    return
+                model_entry = self.toc_parser.find_entry(actor.model_asset_id)
+                if model_entry is None:
+                    return
+                model_result = load_asset(model_entry, self.toc_parser, self.lookup)
+                if model_result.model is None:
+                    self.error.emit(model_result.error or "Linked actor model could not be parsed")
+                    return
+                self.mesh_ready.emit(model_result.model)
+                if model_result.skeleton is not None:
+                    self.skel_ready.emit(model_result.skeleton)
+                lookup = self.lookup or get_lookup()
+                tex_data = load_model_textures(
+                    model_result.model, model_entry, self.toc_parser, lookup,
+                )
+                if tex_data:
+                    self.materials_ready.emit(tex_data)
+                self.materials_finished.emit(tex_data)
                 return
 
             if result.model is not None:
                 self.mesh_ready.emit(result.model)
                 if result.skeleton is not None:
                     self.skel_ready.emit(result.skeleton)
-                # Texture loading is last — materials_ready triggers thread quit
                 lookup = self.lookup or get_lookup()
                 tex_data = load_model_textures(
-                    result.model, self.entry, self.toc_parser, lookup
+                    result.model, self.entry, self.toc_parser, lookup,
                 )
-                self.materials_ready.emit(tex_data)
+                if tex_data:
+                    self.materials_ready.emit(tex_data)
+                self.materials_finished.emit(tex_data)
 
             elif result.texture is not None:
+                texture = result.texture
+                if texture.hd_len > 0 and texture.hd_width > 0:
+                    candidates = [
+                        candidate
+                        for candidate in self.toc_parser.find_all_entries(self.entry.asset_id)
+                        if candidate.size > self.entry.size
+                    ]
+                    if candidates:
+                        try:
+                            hd_entry = max(candidates, key=lambda candidate: candidate.size)
+                            texture.hd_pixel_data = bytes(
+                                self.toc_parser.extract_asset(hd_entry)
+                            )
+                        except Exception as ex:
+                            print(f"[AssetLoader] HD texture load failed: {ex}")
                 self.texture_ready.emit(result.texture)
 
             elif result.zone is not None:
@@ -161,6 +214,8 @@ class AssetLoader(QObject):
         except Exception as ex:
             import traceback
             self.error.emit(f"{ex}\n{traceback.format_exc()}")
+        finally:
+            self.completed.emit()
 
 
 # ── Main Window ───────────────────────────────────────────────────────────────
@@ -168,7 +223,7 @@ class AssetLoader(QObject):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("RCRA Forge — Ratchet & Clank: Rift Apart Editor")
+        self.setWindowTitle("RCRA Forge — Rift Apart Asset Browser")
         self.resize(1440, 900)
         self._load_thread:   QThread    = None
         self._asset_thread:  QThread    = None
@@ -176,6 +231,9 @@ class MainWindow(QMainWindow):
         self._toc_path:      str        = None   # path to loaded 'toc' file
         self._loader        = None   # keeps TocLoader alive during thread run
         self._asset_loader  = None   # keeps AssetLoader alive during thread run
+        self._queued_entry  = None
+        self._current_actor = None
+        self._ready_library_presented = False
         self._setup_ui()
         self._setup_menus()
         self._setup_toolbar()
@@ -190,14 +248,61 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
+        # Clear source and library summary.
+        hero = QFrame()
+        hero.setObjectName("AppHero")
+        hero.setFixedHeight(92)
+        hero_layout = QHBoxLayout(hero)
+        hero_layout.setContentsMargins(22, 12, 18, 12)
+        hero_layout.setSpacing(18)
+
+        brand = QVBoxLayout()
+        brand.setSpacing(1)
+        title = QLabel("RCRA Forge")
+        title.setObjectName("AppTitle")
+        subtitle = QLabel("Ratchet & Clank: Rift Apart · Game asset browser")
+        subtitle.setObjectName("AppSubtitle")
+        self._active_asset_lbl = QLabel("Connecting to the Steam archive…")
+        self._active_asset_lbl.setObjectName("ActiveAssetLabel")
+        brand.addWidget(title)
+        brand.addWidget(subtitle)
+        brand.addWidget(self._active_asset_lbl)
+        hero_layout.addLayout(brand, 1)
+
+        for key, value_attr, initial in (
+            ("TOTAL ASSETS", "_hero_assets", "—"),
+            ("GAME ARCHIVES", "_hero_archives", "—"),
+            ("KNOWN NAMES", "_hero_named", "—"),
+        ):
+            card = QFrame()
+            card.setObjectName("StatCard")
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(12, 7, 12, 7)
+            card_layout.setSpacing(0)
+            value = QLabel(initial)
+            value.setObjectName("StatValue")
+            label = QLabel(key)
+            label.setObjectName("StatKey")
+            card_layout.addWidget(value, alignment=Qt.AlignmentFlag.AlignCenter)
+            card_layout.addWidget(label, alignment=Qt.AlignmentFlag.AlignCenter)
+            setattr(self, value_attr, value)
+            hero_layout.addWidget(card)
+
+        live_chip = QLabel("Steam game data")
+        live_chip.setObjectName("LiveChip")
+        live_chip.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        live_chip.setFixedSize(108, 34)
+        hero_layout.addWidget(live_chip)
+        root.addWidget(hero)
+
         # ── Outer horizontal split: [Asset Browser | Main Area] ──────────────
         outer = QSplitter(Qt.Orientation.Horizontal)
         outer.setChildrenCollapsible(False)
-        root.addWidget(outer)
+        root.addWidget(outer, 1)
 
         # Left: Asset browser
         self._browser = AssetBrowser()
-        self._browser.setMinimumWidth(180)
+        self._browser.setMinimumWidth(320)
         self._browser.asset_activated.connect(self._on_asset_activated)
         self._browser.group_activated.connect(self._on_group_activated)
         self._browser.quick_export_requested.connect(self._on_quick_export)
@@ -206,54 +311,71 @@ class MainWindow(QMainWindow):
         outer.addWidget(self._browser)
 
         # ── Right side: vertical split [Viewport top | Tabs bottom] ──────────
-        right_splitter = QSplitter(Qt.Orientation.Vertical)
-        right_splitter.setChildrenCollapsible(False)
-        outer.addWidget(right_splitter)
+        self._right_splitter = QSplitter(Qt.Orientation.Vertical)
+        self._right_splitter.setChildrenCollapsible(False)
+        outer.addWidget(self._right_splitter)
+        outer.setStretchFactor(0, 1)
+        outer.setStretchFactor(1, 2)
 
         # ── Top: horizontal split [3D Viewport | Properties] ─────────────────
-        top_splitter = QSplitter(Qt.Orientation.Horizontal)
-        top_splitter.setChildrenCollapsible(False)
-        right_splitter.addWidget(top_splitter)
+        self._top_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._top_splitter.setChildrenCollapsible(False)
+        self._right_splitter.addWidget(self._top_splitter)
 
+        self._model_views = QTabWidget()
+        self._model_views.setObjectName("ModelViewTabs")
+        self._software_preview = SoftwareModelPreview()
         self._viewport = Viewport3D()
         self._viewport.setMinimumHeight(200)
-        top_splitter.addWidget(self._viewport)
+        self._model_views.addTab(self._software_preview, "Model Preview")
+        self._model_views.addTab(self._viewport, "Textured 3D")
+        self._model_views.setToolTip(
+            "Model Preview always shows parsed geometry. "
+            "Textured 3D uses the graphics card for materials and interactive inspection."
+        )
+        self._top_splitter.addWidget(self._model_views)
 
         self._props = PropertiesPanel()
         self._props.set_export_zone_fn(self._on_export_zone_requested)
         self._props.setMinimumWidth(200)
-        top_splitter.addWidget(self._props)
-        top_splitter.setSizes([900, 280])
+        self._top_splitter.addWidget(self._props)
+        self._top_splitter.setSizes([900, 280])
         self._props.lod_changed.connect(self._viewport.set_lod)
 
         # ── Bottom: tabbed panel [Texture | Scene | Skeleton | Hex] ──────────
         self._tab_panel = QTabWidget()
         self._tab_panel.setObjectName("BottomTabs")
         self._tab_panel.setMinimumHeight(312)
-        right_splitter.addWidget(self._tab_panel)
+        self._right_splitter.addWidget(self._tab_panel)
 
-        right_splitter.setSizes([560, 220])
-        right_splitter.setStretchFactor(0, 1)  # viewport stretches
-        right_splitter.setStretchFactor(1, 0)  # bottom panel holds size
+        self._right_splitter.setSizes([520, 300])
+        self._right_splitter.setStretchFactor(0, 1)  # viewport stretches
+        self._right_splitter.setStretchFactor(1, 0)  # bottom panel holds size
 
         # Tab: Texture viewer
+        self._overview = AssetOverview()
+        self._tab_panel.addTab(self._overview, "Asset Details")
+
         self._tex_viewer = TextureViewer()
-        self._tab_panel.addTab(self._tex_viewer, "🖼  Texture")
+        self._tab_panel.addTab(self._tex_viewer, "Texture Preview")
 
         # Tab: Scene hierarchy
         self._scene_panel = ScenePanel()
         self._scene_panel.instance_selected.connect(self._on_instance_selected)
-        self._tab_panel.addTab(self._scene_panel, "🗺  Scene")
+        self._tab_panel.addTab(self._scene_panel, "Scene Objects")
 
         # Tab: Skeleton
         self._skel_viewer = SkeletonViewer()
-        self._tab_panel.addTab(self._skel_viewer, "🦴  Skeleton")
+        self._tab_panel.addTab(self._skel_viewer, "Skeleton")
 
         # Tab: Hex inspector
         self._hex_inspector = HexInspector()
-        self._tab_panel.addTab(self._hex_inspector, "🔬  Hex")
+        self._tab_panel.addTab(self._hex_inspector, "Raw Bytes")
 
-        outer.setSizes([260, 1180])
+        outer.setSizes([480, 960])
+        # The landing page is the Overview.  Do not show an empty black model
+        # viewport before the user has selected a model.
+        self._top_splitter.setVisible(False)
 
         # Status bar
         self._status = QStatusBar()
@@ -266,7 +388,7 @@ class MainWindow(QMainWindow):
         self._progress = QProgressBar()
         self._progress.setRange(0, 0)   # indeterminate spinner
         self._progress.setFixedWidth(120)
-        self._progress.setFixedHeight(14)
+        self._progress.setFixedHeight(20)
         self._progress.setVisible(False)
         self._progress.setTextVisible(False)
         self._status.addPermanentWidget(self._progress)
@@ -314,10 +436,24 @@ class MainWindow(QMainWindow):
         self._act_wire.triggered.connect(self._toggle_wireframe)
         view_m.addAction(self._act_wire)
 
-        act_frame = QAction("Frame All", self)
+        self._act_bloom = QAction("Bloom and emissive glow", self)
+        self._act_bloom.setCheckable(True)
+        self._act_bloom.setChecked(True)
+        self._act_bloom.setToolTip(
+            "Apply HDR glow around lava, energy, lights, and other emissive materials."
+        )
+        self._act_bloom.toggled.connect(self._viewport.set_bloom_enabled)
+        view_m.addAction(self._act_bloom)
+
+        act_frame = QAction("Frame Model", self)
         act_frame.setShortcut(QKeySequence("F"))
         act_frame.triggered.connect(self._frame_scene)
         view_m.addAction(act_frame)
+
+        act_search = QAction("Focus Asset Search", self)
+        act_search.setShortcut(QKeySequence("Ctrl+L"))
+        act_search.triggered.connect(self._browser.focus_search)
+        view_m.addAction(act_search)
 
         view_m.addSeparator()
 
@@ -339,35 +475,23 @@ class MainWindow(QMainWindow):
         tb.setIconSize(QSize(20, 20))
         self.addToolBar(tb)
 
-        act_open = QAction("📂 Open Folder", self)
+        act_open = QAction("Open Rift Apart Folder", self)
         act_open.triggered.connect(self._open_game_folder)
         tb.addAction(act_open)
 
         tb.addSeparator()
-
-        self._act_wire_tb = QAction("⬛ Wireframe", self)
-        self._act_wire_tb.setCheckable(True)
-        self._act_wire_tb.triggered.connect(self._toggle_wireframe)
-        tb.addAction(self._act_wire_tb)
-
-        act_frame_tb = QAction("⊞ Frame", self)
-        act_frame_tb.triggered.connect(self._frame_scene)
-        tb.addAction(act_frame_tb)
-
-        # View preset dropdown
-        from PyQt6.QtWidgets import QComboBox
-        self._view_preset = QComboBox()
-        self._view_preset.setObjectName("ViewPreset")
-        self._view_preset.setFixedWidth(72)
-        self._view_preset.addItems(["Main", "Front", "Back", "Right", "Left", "Top", "Bottom"])
-        self._view_preset.activated.connect(
-            lambda _: self._viewport.set_view_preset(self._view_preset.currentText().lower())
-        )
-        tb.addWidget(self._view_preset)
+        act_search = QAction("Find an Asset", self)
+        act_search.setShortcut(QKeySequence("Ctrl+L"))
+        act_search.triggered.connect(self._browser.focus_search)
+        tb.addAction(act_search)
 
         tb.addSeparator()
 
-        self._game_path_lbl = QLabel("  No game folder loaded  ")
+        guidance = QLabel("  Choose a category, then click a row to preview it.  ")
+        guidance.setObjectName("ToolbarGuidance")
+        tb.addWidget(guidance)
+
+        self._game_path_lbl = QLabel("  Rift Apart folder not loaded  ")
         self._game_path_lbl.setObjectName("GamePathLabel")
         tb.addWidget(self._game_path_lbl)
 
@@ -417,6 +541,11 @@ class MainWindow(QMainWindow):
         if not folder:
             return
 
+        self.load_game_folder(folder)
+
+    def load_game_folder(self, folder: str) -> bool:
+        """Load a Rift Apart install without requiring a folder dialog."""
+        folder = os.path.abspath(folder)
         toc_candidates = [
             os.path.join(folder, 'toc'),
             os.path.join(folder, 'data', 'toc'),
@@ -427,10 +556,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "TOC Not Found",
                 f"Could not find a 'toc' file in:\n{folder}\n\n"
                 "Make sure you selected the correct game folder containing the 'toc' file.")
-            return
+            return False
 
         self._load_toc(toc_path)
         self._game_path_lbl.setText(f"  {os.path.basename(folder)}  ")
+        return True
 
     def _load_hashes_file(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -456,6 +586,12 @@ class MainWindow(QMainWindow):
 
     def _load_toc(self, path: str):
         import time
+        if self._load_thread is not None and self._load_thread.isRunning():
+            self._status_lbl.setText("Steam archive index is already loading — please wait")
+            return
+        # A new load must not let the hashes callback pair with the previous
+        # parser and mark the library ready before this TOC finishes.
+        self._toc_parser = None
         self._toc_path = path
         self._toc_load_start = time.time()
         toc_size_mb = os.path.getsize(path) / (1024*1024)
@@ -464,6 +600,7 @@ class MainWindow(QMainWindow):
         )
         self._progress.setVisible(True)
         self._browser.clear()
+        self._ready_library_presented = False
 
         self._load_thread = QThread(self)
         self._loader = TocLoader(path)          # keep reference on self!
@@ -486,7 +623,13 @@ class MainWindow(QMainWindow):
         self._progress.setVisible(False)
         self._props.set_toc_parser(parser, self._toc_path)
         t1 = time.perf_counter()
-        self._browser.load_entries_grouped(entries, groups, None)
+        from core.hashes import get_lookup
+        lookup = get_lookup()
+        visible_lookup = lookup if lookup and lookup.is_loaded() else None
+        self._browser.load_entries_grouped(entries, groups, visible_lookup)
+        self._hero_assets.setText(f"{len(entries):,}")
+        self._hero_archives.setText(f"{len(parser.archives):,}")
+        self._active_asset_lbl.setText("Index ready — resolving human-readable asset names…")
         t2 = time.perf_counter()
         print(f"[main] progress_hide:{t1-t0:.3f}s  load_browser:{t2-t1:.3f}s  "
               f"wall:{elapsed_wall:.2f}s")
@@ -496,12 +639,65 @@ class MainWindow(QMainWindow):
             f"wall:{elapsed_wall:.1f}s  [{timing}]  — names loading…"
         )
 
+        self._present_ready_library(visible_lookup)
+
     def _on_hashes_ready(self, lookup):
         """Called when hashes.txt finishes loading in background."""
         self._browser.set_lookup(lookup)
+        self._present_ready_library(lookup)
+
+    def _present_ready_library(self, lookup):
+        """Expose a populated browse view once both TOC and names are ready."""
+        if self._ready_library_presented:
+            return
+        if not self._toc_parser or not lookup or not lookup.is_loaded():
+            return
+
         n = len(lookup) if lookup and lookup.is_loaded() else 0
-        current = self._status_lbl.text().replace("— asset names loading…", "")
+        named_installed = 0
+        counts = {"model": 0, "texture": 0, "actor": 0}
+        if self._toc_parser and lookup and lookup.is_loaded():
+            try:
+                ids = self._toc_parser.entries._ids[:len(self._toc_parser.entries)]
+                for asset_id in ids:
+                    path = lookup.lookup(int(asset_id))
+                    if not path:
+                        continue
+                    named_installed += 1
+                    path = path.casefold()
+                    if path.endswith(".model"):
+                        counts["model"] += 1
+                    elif path.endswith(".texture"):
+                        counts["texture"] += 1
+                    elif path.endswith(".actor"):
+                        counts["actor"] += 1
+            except Exception:
+                named_installed = n
+        self._hero_named.setText(f"{named_installed:,}")
+        current = self._status_lbl.text()
+        current = current.replace("— asset names loading…", "").replace("— names loading…", "")
         self._status_lbl.setText(f"{current.strip()}  ·  {n:,} names")
+        # Present a useful populated browser immediately without choosing or
+        # opening a specific asset.  Raw archive buckets looked like an empty
+        # tool to users because every useful row was hidden behind a folder.
+        active_search = self._browser._search.text()
+        active_filter = self._browser.current_type_filter()
+        if not active_search.strip() and active_filter == "All Types":
+            active_filter = ".model"
+        # Reapply even an existing filter: load_entries_grouped deliberately
+        # rebuilds archive wrappers, so a same-folder reload otherwise leaves
+        # the combo saying models while showing only game-archive folders.
+        self._browser.set_search(active_search, active_filter)
+        self._overview.show_ready(
+            len(self._toc_parser.entries) if self._toc_parser else 0,
+            counts["model"],
+            counts["texture"],
+            counts["actor"],
+        )
+        self._active_asset_lbl.setText(
+            f"Ready — {counts['model']:,} models listed • click one to preview"
+        )
+        self._ready_library_presented = True
 
     def _on_load_error(self, msg: str):
         self._progress.setVisible(False)
@@ -513,14 +709,39 @@ class MainWindow(QMainWindow):
             self._status_lbl.setText("No TOC loaded — open a game folder first")
             return
 
+        if self._asset_thread is not None and self._asset_thread.isRunning():
+            self._queued_entry = entry
+            self._status_lbl.setText("Preview queued — finishing the current asset…")
+            return
+
         # Get display name from lookup for the export filename
         lookup = self._browser._lookup
         asset_name = None
+        full_path = f"{entry.asset_id:016X}"
         if lookup and lookup.is_loaded():
             asset_name = lookup.name(entry.asset_id)
+            full_path = lookup.full_path(entry.asset_id)
+            self._active_asset_lbl.setText(full_path)
 
         self._props.set_entry(entry, name=asset_name)
+        # Texture data belongs to exactly one selected asset. Keeping the
+        # previous model's cache could make a later material index accidentally
+        # display or export the wrong texture.
+        self._props._cached_tex_data = {}
+        self._props._mat_names = {}
+        self._model_views.setTabText(1, "Textured 3D")
+        self._model_views.setTabToolTip(
+            1, "Game textures will appear here when the selected model references them."
+        )
         self._current_entry = entry   # cached for texture export mat_names lookup
+        self._current_actor = None
+        extension = full_path.rsplit('.', 1)[-1] if '.' in full_path else "raw"
+        self._overview.show_loading(
+            asset_name or f"{entry.asset_id:016X}", full_path, extension, entry.size
+        )
+        self._top_splitter.setVisible(False)
+        self._right_splitter.setSizes([0, 820])
+        self._tab_panel.setCurrentWidget(self._overview)
         self._status_lbl.setText(f"Loading asset {entry.asset_id:#018x}…")
 
         self._asset_thread = QThread(self)
@@ -531,20 +752,34 @@ class MainWindow(QMainWindow):
         self._asset_loader.mesh_ready.connect(self._on_mesh_ready)
         self._asset_loader.texture_ready.connect(self._on_texture_ready)
         self._asset_loader.materials_ready.connect(self._viewport.load_textures)
+        self._asset_loader.materials_ready.connect(self._software_preview.load_textures)
         self._asset_loader.materials_ready.connect(self._on_materials_ready)
+        self._asset_loader.materials_finished.connect(self._on_materials_finished)
         self._asset_loader.skel_ready.connect(self._on_skel_ready)
         self._asset_loader.zone_ready.connect(self._on_zone_ready)
         self._asset_loader.level_ready.connect(self._on_level_ready)
         self._asset_loader.raw_ready.connect(self._on_raw_ready)
+        self._asset_loader.result_ready.connect(self._on_result_ready)
         self._asset_loader.error.connect(self._on_asset_error)
 
-        # Quit thread only after materials_ready (texture loading is last step in run())
-        # Do NOT quit on mesh_ready — texture loading happens after it.
-        for sig in (self._asset_loader.materials_ready, self._asset_loader.texture_ready,
-                    self._asset_loader.level_ready, self._asset_loader.error):
-            sig.connect(self._asset_thread.quit)
+        # One completion signal covers models, textures, zones and raw assets.
+        # The previous signal-specific scheme left some worker threads alive.
+        self._asset_loader.completed.connect(self._asset_thread.quit)
+        self._asset_loader.completed.connect(self._asset_loader.deleteLater)
+        self._asset_thread.finished.connect(self._on_asset_thread_finished)
 
         self._asset_thread.start()
+
+    def _on_asset_thread_finished(self):
+        thread = self._asset_thread
+        self._asset_thread = None
+        self._asset_loader = None
+        if thread is not None:
+            thread.deleteLater()
+        if self._queued_entry is not None:
+            entry = self._queued_entry
+            self._queued_entry = None
+            QTimer.singleShot(0, lambda e=entry: self._on_asset_activated(e))
 
     def _on_group_activated(self, group):
         """User double-clicked a named group in the Groups tree view."""
@@ -576,7 +811,7 @@ class MainWindow(QMainWindow):
             return
 
         if not self._toc_path:
-            self._status_lbl.setText("✗ No game folder loaded")
+            self._status_lbl.setText("No game data loaded")
             return
 
         try:
@@ -598,10 +833,10 @@ class MainWindow(QMainWindow):
                 from exporters.gltf_exporter import ObjExporter
                 ObjExporter(model, name=stem).export(path)
 
-            self._status_lbl.setText(f"✓ Exported {stem}.{fmt}")
+            self._status_lbl.setText(f"Exported {stem}.{fmt}")
         except Exception as ex:
             import traceback
-            self._status_lbl.setText(f"✗ Export failed: {ex}")
+            self._status_lbl.setText(f"Export failed: {ex}")
             print(f"[quick_export] error: {ex}\n{traceback.format_exc()}")
 
     def _on_add_to_export_list(self, entry):
@@ -623,7 +858,11 @@ class MainWindow(QMainWindow):
         )
 
     def _on_mesh_ready(self, model_asset):
+        self._top_splitter.setVisible(True)
+        self._right_splitter.setSizes([500, 320] if self._current_actor else [590, 230])
+        self._software_preview.load_mesh(model_asset)
         self._viewport.load_mesh(model_asset)
+        self._model_views.setCurrentWidget(self._software_preview)
         self._props.set_mesh_asset(model_asset)
         from core.mesh import mesh_to_numpy
         total_verts = 0
@@ -632,21 +871,90 @@ class MainWindow(QMainWindow):
             pos, _, _, idx = mesh_to_numpy(model_asset, mesh)
             if pos is not None: total_verts += len(pos)
             if idx is not None: total_tris  += len(idx) // 3
-        self._status_lbl.setText(
+        self._model_status_base = (
             f"Model loaded — {total_verts:,} vertices, {total_tris:,} triangles, "
             f"{len(model_asset.meshes)} sub-meshes, {len(model_asset.joints)} bones"
         )
-        self._status_right.setText(f"Sub-meshes: {len(model_asset.meshes)}")
+        self._status_lbl.setText(f"{self._model_status_base} · loading textures…")
+        self._status_right.setText("Textures: loading…")
+        self._model_views.setTabText(1, "Textured 3D (loading…)")
+        if self._current_actor is None:
+            self._overview.show_visual(
+                "3D model",
+                "Use Model Preview for fast geometry. Referenced game textures "
+                "and animated effects appear in the GPU view as they finish loading.",
+                f"{total_verts:,} vertices\n{total_tris:,} triangles\n"
+                f"{len(model_asset.meshes)} sub-meshes\n{len(model_asset.joints)} bones",
+            )
+        else:
+            self._tab_panel.setCurrentWidget(self._overview)
 
     def _on_texture_ready(self, tex_asset):
+        # Textures deserve the main stage; keeping an empty black 3D viewport
+        # above them made successful loads look like failures.
+        self._top_splitter.setVisible(False)
+        self._right_splitter.setSizes([0, 820])
         self._tex_viewer.load_texture(tex_asset)
         self._tab_panel.setCurrentWidget(self._tex_viewer)
         self._status_lbl.setText(
             f"Texture loaded — {tex_asset.width}×{tex_asset.height} {tex_asset.format_name}"
         )
+        self._overview.show_visual(
+            "Texture",
+            "The selected texture is visible in the main image viewer.",
+            f"{tex_asset.width} × {tex_asset.height}\n{tex_asset.format_name}\n"
+            f"{tex_asset.mips} mip levels",
+        )
+
+    def _on_result_ready(self, result):
+        """Turn every parsed result into an obvious, user-visible response."""
+        lookup = self._browser._lookup
+        entry = getattr(self, '_current_entry', None)
+        path = lookup.full_path(entry.asset_id) if entry and lookup and lookup.is_loaded() \
+            else (result.label or "Unknown asset")
+
+        if result.actor is not None:
+            self._current_actor = result.actor
+            self._overview.show_actor(result.actor, path)
+            self._tab_panel.setCurrentWidget(self._overview)
+            if not result.actor.model_asset_id:
+                self._top_splitter.setVisible(False)
+                self._right_splitter.setSizes([0, 820])
+                self._status_lbl.setText(
+                    "Actor loaded — data only; no renderable model is referenced"
+                )
+            else:
+                self._status_lbl.setText("Actor loaded — resolving linked 3D model…")
+            return
+
+        if result.model is not None or result.texture is not None:
+            return
+        if result.zone is not None:
+            self._overview.show_visual(
+                "Scene",
+                "This zone contains placed scene entries. Use Scene Objects to inspect them.",
+                f"{result.zone.entry_count:,} scene entries",
+            )
+            return
+        if result.level is not None:
+            self._overview.show_visual(
+                "Level",
+                "This level container exposes its scene information in Scene Objects.",
+                getattr(result.level, 'description', ''),
+            )
+            return
+
+        size = len(result.raw) if result.raw else (entry.size if entry else 0)
+        self._overview.show_data(result.atype or "Unknown", path, size)
+        self._top_splitter.setVisible(False)
+        self._right_splitter.setSizes([0, 820])
+        self._tab_panel.setCurrentWidget(self._overview)
+        self._status_lbl.setText(
+            f"{(result.atype or 'Data').title()} loaded — information only; no visual preview"
+        )
 
     def _on_materials_ready(self, tex_data: dict):
-        """Cache decoded texture data in the properties panel for texture export."""
+        """Merge progressively decoded texture data for preview and export."""
         if not tex_data:
             return
         # Build mat_names from the current model asset (already parsed, no re-extraction needed)
@@ -662,13 +970,101 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        self._props._cached_tex_data = tex_data
-        self._props._mat_names       = mat_names
+        cached = getattr(self._props, '_cached_tex_data', {}) or {}
+        for mat_idx, slots in tex_data.items():
+            if isinstance(slots, dict) and isinstance(cached.get(mat_idx), dict):
+                cached[mat_idx].update(slots)
+            else:
+                cached[mat_idx] = slots
+        cached_names = getattr(self._props, '_mat_names', {}) or {}
+        cached_names.update(mat_names)
+        self._props._cached_tex_data = cached
+        self._props._mat_names = cached_names
+
+        textured_materials = sum(
+            1 for slots in cached.values()
+            if isinstance(slots, dict) and any(
+                role == 'base_color' or role.startswith('base_color_')
+                or role == 'color_id' or role.startswith('color_id_')
+                for role in slots
+            )
+        )
+        effect_materials = sum(
+            1 for slots in cached.values()
+            if isinstance(slots, dict) and any(
+                _is_effect_role(role)
+                for role in slots
+            )
+        )
+        if effect_materials and not textured_materials:
+            self._status_right.setText(
+                f"Effects: {effect_materials} emissive material"
+                f"{'s' if effect_materials != 1 else ''} ready"
+            )
+        elif textured_materials:
+            self._status_right.setText(
+                f"Textures: {textured_materials} material"
+                f"{'s' if textured_materials != 1 else ''} ready"
+            )
+
+    def _on_materials_finished(self, tex_data: dict):
+        """Make the final textured/untextured state explicit to the user."""
+        base = getattr(self, '_model_status_base', "Model loaded")
+        textured_materials = sum(
+            1 for slots in (tex_data or {}).values()
+            if isinstance(slots, dict) and any(
+                role == 'base_color' or role.startswith('base_color_')
+                or role == 'color_id' or role.startswith('color_id_')
+                for role in slots
+            )
+        )
+        effect_materials = sum(
+            1 for slots in (tex_data or {}).values()
+            if isinstance(slots, dict) and any(
+                _is_effect_role(role)
+                for role in slots
+            )
+        )
+        if textured_materials:
+            suffix = "material" if textured_materials == 1 else "materials"
+            self._model_views.setTabText(1, "Textured 3D")
+            self._model_views.setTabToolTip(
+                1, f"Decoded game textures are active on {textured_materials} {suffix}."
+            )
+            self._status_lbl.setText(
+                f"{base} · textures ready for {textured_materials} {suffix}"
+            )
+            self._status_right.setText(f"Textures: {textured_materials} {suffix}")
+        elif effect_materials:
+            suffix = "material" if effect_materials == 1 else "materials"
+            self._model_views.setTabText(1, "Effects 3D")
+            self._model_views.setTabToolTip(
+                1, f"Animated emissive game effects are active on "
+                f"{effect_materials} {suffix}."
+            )
+            self._status_lbl.setText(
+                f"{base} · animated emissive effects ready for "
+                f"{effect_materials} {suffix}"
+            )
+            self._status_right.setText(f"Effects: {effect_materials} {suffix}")
+            self._model_views.setCurrentWidget(self._viewport)
+        else:
+            self._model_views.setTabText(1, "Material 3D")
+            self._model_views.setTabToolTip(
+                1, "This model uses shader values or procedural material data "
+                "rather than a base-colour image texture."
+            )
+            self._status_lbl.setText(f"{base} · shader-based material; no base-colour image")
+            self._status_right.setText("Material: shader-based")
 
     def _on_skel_ready(self, skel):
         self._skel_viewer.load_skeleton(skel)
-        self._tab_panel.setCurrentWidget(self._skel_viewer)
-        self._status_lbl.setText(f"Skeleton loaded — {len(skel.bones)} bones")
+        # Skeletons accompany many ordinary models; silently switching tabs
+        # hid the actor explanation and made the preview appear unrelated.
+        if self._current_actor is None:
+            self._status_right.setText(
+                f"{self._status_right.text()}  ·  Bones: {len(skel.bones)}"
+            )
 
     def _on_level_ready(self, level_info, inst_table):
         self._tab_panel.setCurrentWidget(self._scene_panel)
@@ -716,7 +1112,7 @@ class MainWindow(QMainWindow):
         if _bar:
             _bar.setStyleSheet(
                 "QProgressBar { height: 20px; color: #e0e4ef; text-align: center; "
-                "font-size: 11px; background: #1e2028; border: 1px solid #2a2d36; "
+                "font-size: 12px; background: #1e2028; border: 1px solid #2a2d36; "
                 "border-radius: 3px; } "
                 "QProgressBar::chunk { background: #3a6fbf; border-radius: 3px; }"
             )
@@ -763,6 +1159,8 @@ class MainWindow(QMainWindow):
     def _on_asset_error(self, msg: str):
         self._status_lbl.setText(f"Asset error: {msg}")
         self._props.log(f"[ERR] {msg}")
+        self._overview.show_error(msg)
+        self._tab_panel.setCurrentWidget(self._overview)
 
     def _on_instance_selected(self, entry):
         """Focus viewport camera on the selected scene node's world position."""
@@ -789,16 +1187,19 @@ class MainWindow(QMainWindow):
     def _toggle_wireframe(self, checked: bool):
         self._viewport.set_wireframe(checked)
         self._act_wire.setChecked(checked)
-        self._act_wire_tb.setChecked(checked)
 
     def _frame_scene(self):
-        self._viewport.frame_model()
+        if self._model_views.currentWidget() is self._software_preview:
+            self._software_preview.reset_view()
+        else:
+            self._viewport.frame_model()
 
     def _open_controls_dialog(self):
         dlg = ControlsDialog(self)
         dlg.exec()
-        # Always reload so viewport picks up any saved changes
+        # Always reload so both preview implementations pick up saved changes.
         self._viewport.reload_controls()
+        self._software_preview.reload_controls()
 
     def _open_preferences(self):
         """Open the Preferences dialog (theme / colour customisation)."""
@@ -833,9 +1234,11 @@ class MainWindow(QMainWindow):
                     cfg = json.load(f)
                 if "theme" in cfg:
                     theme_manager.from_dict(cfg["theme"])
-                    self.setStyleSheet(theme_manager.stylesheet())
         except Exception as ex:
             print(f"[config] failed to load: {ex}")
+        # The built-in theme is the default even when no config file exists.
+        # Previously a fresh install never applied any stylesheet at all.
+        self.setStyleSheet(theme_manager.stylesheet())
 
     def _show_about(self):
         QMessageBox.about(self, "About RCRA Forge",

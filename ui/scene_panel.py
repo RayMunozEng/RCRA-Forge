@@ -34,11 +34,13 @@ class ScenePanel(QWidget):
         # Root node — zone name
         root = QTreeWidgetItem(self._tree)
         short_name = zone.name.split('/')[-1] if '/' in zone.name else zone.name
-        root.setText(0, f"🗺  {short_name}")
+        root.setText(0, f"Scene: {short_name}")
         root.setText(1, f"{zone.entry_count} nodes")
         f = root.font(0)
+        f.setPointSize(10)
         f.setWeight(QFont.Weight.Bold)
         root.setFont(0, f)
+        root.setFont(1, f)
         root.setForeground(0, QColor('#5dade2'))
         root.setExpanded(True)
 
@@ -50,6 +52,10 @@ class ScenePanel(QWidget):
                       f'actor_{entry.asset_id:#018x}'
             item.setText(0, f"  {display}")
             item.setText(1, f"({entry.x:.1f}, {entry.y:.1f}, {entry.z:.1f})")
+            row_font = item.font(0)
+            row_font.setPointSize(10)
+            item.setFont(0, row_font)
+            item.setFont(1, row_font)
             item.setForeground(1, QColor('#aaaaaa'))
             item.setData(0, Qt.ItemDataRole.UserRole, entry)
 
@@ -74,8 +80,10 @@ class ScenePanel(QWidget):
         root = QTreeWidgetItem(self._tree)
         root.setText(0, f"📦  {level_info.asset_type}")
         f = root.font(0)
+        f.setPointSize(10)
         f.setWeight(QFont.Weight.Bold)
         root.setFont(0, f)
+        root.setFont(1, f)
         root.setForeground(0, QColor('#5dade2'))
         root.setExpanded(True)
         self._info.setPlainText(level_info.description)
@@ -121,7 +129,7 @@ class ScenePanel(QWidget):
         # Info text box — shows detailed node list
         info_lbl = QLabel("  Scene nodes")
         info_lbl.setObjectName("SubPanelLabel")
-        info_lbl.setFixedHeight(22)
+        info_lbl.setFixedHeight(24)
         layout.addWidget(info_lbl)
 
         self._info = QTextEdit()
@@ -138,7 +146,7 @@ class ScenePanel(QWidget):
         self._status = QLabel("No zone loaded")
         self._status.setObjectName("StatusLabel")
         self._status.setContentsMargins(8, 3, 8, 3)
-        self._status.setFixedHeight(20)
+        self._status.setFixedHeight(26)
         layout.addWidget(self._status)
 
     def _on_item_clicked(self, item, column):

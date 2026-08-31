@@ -289,7 +289,7 @@ class HexInspector(QWidget):
         # Header
         hdr = QFrame()
         hdr.setObjectName("BrowserHeader")
-        hdr.setFixedHeight(36)
+        hdr.setFixedHeight(44)
         hl = QHBoxLayout(hdr)
         hl.setContentsMargins(8, 4, 8, 4)
         title = QLabel("HEX INSPECTOR")
@@ -303,18 +303,18 @@ class HexInspector(QWidget):
         self._jump_edit.setObjectName("SearchBox")
         self._jump_edit.setPlaceholderText("0x0000")
         self._jump_edit.setFixedWidth(80)
-        self._jump_edit.setFixedHeight(22)
+        self._jump_edit.setFixedHeight(32)
         self._jump_edit.returnPressed.connect(self._do_jump)
         hl.addWidget(self._jump_edit)
         btn = QPushButton("→")
-        btn.setFixedSize(22, 22)
+        btn.setFixedSize(28, 28)
         btn.clicked.connect(self._do_jump)
         hl.addWidget(btn)
 
         # Export hex dump button
-        self._btn_export = QPushButton("⬇  Export .txt")
+        self._btn_export = QPushButton("Export text…")
         self._btn_export.setObjectName("ExportBtn")
-        self._btn_export.setFixedHeight(24)
+        self._btn_export.setFixedHeight(32)
         self._btn_export.setEnabled(False)
         self._btn_export.setToolTip("Save full hex dump as a .txt file for analysis")
         self._btn_export.clicked.connect(self._do_export)
@@ -344,7 +344,7 @@ class HexInspector(QWidget):
         self._size_lbl = QLabel("No data loaded")
         self._size_lbl.setObjectName("StatusLabel")
         self._size_lbl.setContentsMargins(8, 3, 8, 3)
-        self._size_lbl.setFixedHeight(20)
+        self._size_lbl.setFixedHeight(26)
         layout.addWidget(self._size_lbl)
 
     def _on_scroll(self, value: int):

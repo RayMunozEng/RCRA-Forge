@@ -16,6 +16,7 @@ Usage
 """
 
 import json, os, copy
+from pathlib import Path
 from typing import Dict
 
 # ── Slot definitions ─────────────────────────────────────────────────────────
@@ -58,36 +59,36 @@ SLOTS: Dict[str, str] = {
 
 PRESETS: Dict[str, Dict[str, str]] = {
     "Dark (Default)": {
-        "BG_BASE"         : "#1a1c22",
-        "BG_PANEL"        : "#13151a",
-        "BG_DEEP"         : "#0d0f14",
-        "BG_SURFACE"      : "#1e2028",
-        "BG_ALT"          : "#1d1f26",
-        "BG_HOVER"        : "#22263a",
-        "BG_SELECT"       : "#253a5e",
-        "BG_SELECT_DEEP"  : "#1f3055",
-        "BORDER"          : "#2a2d36",
-        "BORDER_FOCUS"    : "#3a6fbf",
-        "BORDER_STRONG"   : "#3a3d4a",
-        "TEXT_PRIMARY"    : "#d4d8e0",
-        "TEXT_SECONDARY"  : "#c0c4cc",
-        "TEXT_DIM"        : "#a0a8b8",
-        "TEXT_MUTED"      : "#6a7080",
+        "BG_BASE"         : "#0b111c",
+        "BG_PANEL"        : "#111a2a",
+        "BG_DEEP"         : "#070c14",
+        "BG_SURFACE"      : "#1a2940",
+        "BG_ALT"          : "#142034",
+        "BG_HOVER"        : "#263b5c",
+        "BG_SELECT"       : "#355b91",
+        "BG_SELECT_DEEP"  : "#294a78",
+        "BORDER"          : "#334867",
+        "BORDER_FOCUS"    : "#ff8b32",
+        "BORDER_STRONG"   : "#4a6389",
+        "TEXT_PRIMARY"    : "#f3f7ff",
+        "TEXT_SECONDARY"  : "#d9e3f2",
+        "TEXT_DIM"        : "#bac8dc",
+        "TEXT_MUTED"      : "#93a6c5",
         "TEXT_SELECT"     : "#ffffff",
-        "TEXT_MONO"       : "#90b8d8",
-        "ACCENT"          : "#3a6fbf",
-        "ACCENT_HOVER"    : "#2560af",
-        "ACCENT_PRESS"    : "#143a7a",
-        "ACCENT_LIGHT"    : "#5ba3f5",
-        "ACCENT_BRIGHT"   : "#5dade2",
-        "WARN"            : "#f0a500",
-        "WARN_HOVER"      : "#f0c040",
-        "WARN_BG"         : "#2a2210",
-        "SCROLLBAR"       : "#2a3040",
-        "SCROLLBAR_HOVER" : "#3a4560",
-        "EXPORT_BG"       : "#1f4a8f",
-        "EXPORT_BORDER"   : "#3a70cf",
-        "EXPORT_TEXT"     : "#e0eaff",
+        "TEXT_MONO"       : "#a9d6ff",
+        "ACCENT"          : "#3979c7",
+        "ACCENT_HOVER"    : "#4b8bd8",
+        "ACCENT_PRESS"    : "#24568f",
+        "ACCENT_LIGHT"    : "#80bdff",
+        "ACCENT_BRIGHT"   : "#70c4ff",
+        "WARN"            : "#ff8b32",
+        "WARN_HOVER"      : "#ffad68",
+        "WARN_BG"         : "#3b2717",
+        "SCROLLBAR"       : "#405574",
+        "SCROLLBAR_HOVER" : "#5b749b",
+        "EXPORT_BG"       : "#2865aa",
+        "EXPORT_BORDER"   : "#65a5ed",
+        "EXPORT_TEXT"     : "#ffffff",
     },
     "Midnight Blue": {
         "BG_BASE"         : "#0e1420",
@@ -191,12 +192,55 @@ PRESETS: Dict[str, Dict[str, str]] = {
 
 def _build_stylesheet(c: Dict[str, str]) -> str:
     """Build the full Qt stylesheet from a colour slot dict."""
+    icon_dir = Path(__file__).resolve().parents[1] / "ui" / "icons"
+    chevron_right = (icon_dir / "chevron-right.svg").as_posix()
+    chevron_down = (icon_dir / "chevron-down.svg").as_posix()
+    chevron_up = (icon_dir / "chevron-up.svg").as_posix()
     return f"""
         QMainWindow, QWidget {{
             background: {c['BG_BASE']};
             color: {c['TEXT_PRIMARY']};
             font-family: 'Segoe UI', 'SF Pro Text', 'Helvetica Neue', sans-serif;
-            font-size: 11px;
+            font-size: 13px;
+        }}
+        #AppHero {{
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                stop:0 #090d18, stop:0.42 #121b31, stop:0.76 #172542, stop:1 #0c1220);
+            border-bottom: 2px solid #ff7a18;
+        }}
+        #AppTitle {{
+            color: #ffffff;
+            font-size: 24px;
+            font-weight: 800;
+            letter-spacing: 3px;
+        }}
+        #AppSubtitle {{
+            color: #ff9b45;
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 1.4px;
+        }}
+        #ActiveAssetLabel {{
+            color: #7f94b9;
+            font-family: 'Consolas', 'JetBrains Mono', monospace;
+            font-size: 12px;
+        }}
+        #StatCard {{
+            min-width: 88px;
+            background: rgba(10, 16, 29, 185);
+            border: 1px solid #2c426b;
+            border-radius: 8px;
+        }}
+        #StatValue {{ color: #eef7ff; font-size: 18px; font-weight: 700; }}
+        #StatKey {{ color: #9eb0cc; font-size: 11px; font-weight: 700; letter-spacing: 1.3px; }}
+        #LiveChip {{
+            color: #7dffb2;
+            background: rgba(19, 63, 48, 180);
+            border: 1px solid #2b9d69;
+            border-radius: 17px;
+            font-size: 12px;
+            font-weight: 800;
+            letter-spacing: 0.8px;
         }}
         QMenuBar {{
             background: {c['BG_PANEL']};
@@ -240,7 +284,7 @@ def _build_stylesheet(c: Dict[str, str]) -> str:
             border: none;
             border-bottom: 2px solid transparent;
             padding: 5px 14px;
-            font-size: 10px;
+            font-size: 12px;
             font-weight: 600;
             letter-spacing: 0.5px;
         }}
@@ -252,43 +296,83 @@ def _build_stylesheet(c: Dict[str, str]) -> str:
         }}
         #BottomTabs QTabWidget::pane {{ border: none; }}
 
+        #ModelViewTabs {{ background: {c['BG_DEEP']}; }}
+        #ModelViewTabs::pane {{ border: 1px solid {c['BORDER_STRONG']}; border-top: none; }}
+        #ModelViewTabs QTabBar::tab {{
+            background: {c['BG_PANEL']};
+            color: {c['TEXT_DIM']};
+            border: 1px solid {c['BORDER']};
+            border-bottom: 2px solid {c['BORDER']};
+            padding: 7px 18px;
+            font-size: 12px;
+            font-weight: 700;
+        }}
+        #ModelViewTabs QTabBar::tab:hover {{ color: #ffffff; background: {c['BG_HOVER']}; }}
+        #ModelViewTabs QTabBar::tab:selected {{
+            color: #ffffff;
+            background: {c['BG_SELECT_DEEP']};
+            border-bottom: 2px solid #ff8b32;
+        }}
+
         #BrowserHeader {{
             background: {c['BG_PANEL']};
-            border-bottom: 1px solid {c['BORDER']};
+            border-bottom: 1px solid #31486f;
         }}
         #PanelTitle {{
-            font-size: 10px;
-            font-weight: 600;
-            letter-spacing: 1.5px;
-            color: {c['TEXT_MUTED']};
+            font-size: 16px;
+            font-weight: 800;
+            letter-spacing: 1.8px;
+            color: #f4f7ff;
         }}
-        #FilterBar {{ background: {c['BG_DEEP']}; border-bottom: 1px solid {c['BORDER']}; }}
+        #PanelSubtitle {{ color: #ff9b45; font-size: 12px; font-weight: 700; letter-spacing: 1px; }}
+        #FilterBar {{ background: {c['BG_PANEL']}; border-bottom: 1px solid #283855; }}
         #SearchBox {{
-            background: {c['BG_SURFACE']};
-            border: 1px solid {c['BORDER']};
-            border-radius: 4px;
-            padding: 3px 6px;
+            background: #151e31;
+            border: 1px solid #344a72;
+            border-radius: 7px;
+            padding: 5px 10px;
             color: {c['TEXT_PRIMARY']};
+            selection-background-color: #e76f18;
+            font-size: 13px;
         }}
-        #SearchBox:focus {{ border-color: {c['BORDER_FOCUS']}; }}
+        #SearchBox:focus {{ border: 1px solid #ff8428; background: #19243a; }}
         #TypeFilter {{
             background: {c['BG_SURFACE']};
             border: 1px solid {c['BORDER']};
             border-radius: 4px;
             color: {c['TEXT_SECONDARY']};
+            font-size: 13px;
         }}
         #AssetTree {{
-            background: {c['BG_BASE']};
+            background: #0d121e;
             border: none;
             color: {c['TEXT_SECONDARY']};
-            alternate-background-color: {c['BG_ALT']};
+            alternate-background-color: #111827;
             selection-background-color: {c['BG_SELECT']};
+            font-size: 13px;
         }}
-        #AssetTree::item {{ padding: 2px 4px; border-radius: 2px; }}
+        #AssetTree QHeaderView::section {{
+            background: #151e31;
+            color: {c['TEXT_MUTED']};
+            border: none;
+            border-bottom: 1px solid #2b3d5e;
+            padding: 4px 6px;
+            font-size: 11px;
+            font-weight: 800;
+            letter-spacing: 1px;
+        }}
+        #AssetTree::item {{ padding: 4px 5px; border-radius: 3px; }}
         #AssetTree::item:hover    {{ background: {c['BG_HOVER']}; }}
-        #AssetTree::item:selected {{ background: {c['BG_SELECT']}; color: {c['TEXT_SELECT']}; }}
+        #AssetTree::item:selected {{ background: #304b78; color: #ffffff; border-left: 3px solid #ff8428; }}
+        QTreeView::branch {{ background: transparent; }}
+        QTreeView::branch:has-children:closed {{
+            image: url("{chevron_right}");
+        }}
+        QTreeView::branch:has-children:open {{
+            image: url("{chevron_down}");
+        }}
         #StatusLabel {{
-            font-size: 10px;
+            font-size: 12px;
             color: {c['TEXT_MUTED']};
             background: {c['BG_PANEL']};
             border-top: 1px solid {c['BORDER']};
@@ -296,7 +380,7 @@ def _build_stylesheet(c: Dict[str, str]) -> str:
         #SubPanelLabel {{
             background: {c['BG_DEEP']};
             color: {c['TEXT_MUTED']};
-            font-size: 10px;
+            font-size: 12px;
             font-weight: 600;
             letter-spacing: 1px;
             border-bottom: 1px solid {c['BORDER']};
@@ -304,7 +388,7 @@ def _build_stylesheet(c: Dict[str, str]) -> str:
         }}
 
         QGroupBox {{
-            font-size: 10px;
+            font-size: 12px;
             font-weight: 600;
             color: {c['TEXT_MUTED']};
             border: 1px solid {c['BORDER']};
@@ -321,7 +405,7 @@ def _build_stylesheet(c: Dict[str, str]) -> str:
         #FieldValue {{
             color: {c['TEXT_MONO']};
             font-family: 'Consolas', 'JetBrains Mono', monospace;
-            font-size: 11px;
+            font-size: 13px;
         }}
         #FmtCombo {{
             background: {c['BG_SURFACE']};
@@ -350,7 +434,7 @@ def _build_stylesheet(c: Dict[str, str]) -> str:
         #ExportBtn:hover   {{ background: {c['ACCENT_HOVER']}; }}
         #ExportBtn:pressed {{ background: {c['ACCENT_PRESS']}; }}
         #ExportBtn:disabled {{ background: {c['BG_SURFACE']}; color: {c['TEXT_MUTED']}; border-color: {c['BORDER']}; }}
-        #ExportStatus {{ color: {c['ACCENT_LIGHT']}; font-size: 10px; }}
+        #ExportStatus {{ color: {c['ACCENT_LIGHT']}; font-size: 12px; }}
 
         #GroupsToggleBtn {{
             background: transparent;
@@ -358,26 +442,86 @@ def _build_stylesheet(c: Dict[str, str]) -> str:
             border-radius: 4px;
             padding: 2px 8px;
             color: {c['TEXT_DIM']};
-            font-size: 10px;
+            font-size: 12px;
             font-weight: 500;
         }}
         #GroupsToggleBtn:hover   {{ background: {c['WARN_BG']}; border-color: {c['WARN']}; color: {c['WARN_HOVER']}; }}
         #GroupsToggleBtn:checked {{ background: {c['WARN_BG']}; border-color: {c['WARN']}; color: {c['WARN']}; font-weight: 700; }}
         #GroupsToggleBtn:checked:hover {{ background: {c['WARN_BG']}; }}
+        #QuickFilterBtn {{
+            background: #141d2f;
+            border: 1px solid #2c3e60;
+            border-radius: 11px;
+            padding: 2px 8px;
+            color: #7f94b9;
+            font-size: 11px;
+            font-weight: 800;
+            letter-spacing: 0.7px;
+        }}
+        #QuickFilterBtn:hover {{ background: #223454; border-color: #ff8428; color: #ffffff; }}
+        #BrowserGuidance {{
+            color: #91a4c4;
+            font-size: 11px;
+            padding: 2px 2px 0 2px;
+        }}
+        #OverviewBody {{ background: #0d121e; }}
+        #OverviewEyebrow {{
+            color: #ff8b32;
+            font-size: 12px;
+            font-weight: 800;
+            letter-spacing: 1.5px;
+        }}
+        #OverviewTitle {{ color: #f4f7ff; font-size: 24px; font-weight: 750; }}
+        #OverviewPath {{
+            color: #7f94b9;
+            font-family: 'Consolas', 'JetBrains Mono', monospace;
+            font-size: 12px;
+        }}
+        #OverviewDivider {{ color: #293a59; background: #293a59; max-height: 1px; border: none; }}
+        #OverviewMessage {{ color: #d8e3f4; font-size: 15px; line-height: 1.4; }}
+        #OverviewDetails {{
+            color: #92a8cb;
+            background: #121b2c;
+            border: 1px solid #283c60;
+            border-radius: 8px;
+            padding: 14px;
+            font-family: 'Consolas', 'JetBrains Mono', monospace;
+            font-size: 12px;
+        }}
+        #OverviewHint {{
+            color: #7187ad;
+            background: #101a2a;
+            border-left: 3px solid #ff8428;
+            padding: 10px 12px;
+        }}
+        #OverviewBadge {{
+            min-width: 110px;
+            border-radius: 14px;
+            padding: 0 12px;
+            font-size: 11px;
+            font-weight: 800;
+            letter-spacing: 0.8px;
+        }}
+        #OverviewBadge[state="loading"] {{ color: #ffc27a; background: #392716; border: 1px solid #9e6429; }}
+        #OverviewBadge[state="visual"] {{ color: #7dffb2; background: #133f30; border: 1px solid #2b9d69; }}
+        #OverviewBadge[state="data"] {{ color: #a8bad7; background: #1a2538; border: 1px solid #40577b; }}
+        #OverviewBadge[state="warning"] {{ color: #ffd37d; background: #3e3117; border: 1px solid #9d7b2d; }}
+        #OverviewBadge[state="error"] {{ color: #ff9f9f; background: #421c24; border: 1px solid #a34858; }}
         #LogBox {{
             background: {c['BG_PANEL']};
             border: 1px solid {c['BORDER']};
             border-radius: 4px;
             color: {c['TEXT_MUTED']};
             font-family: 'Consolas', 'Courier New', monospace;
-            font-size: 10px;
+            font-size: 12px;
         }}
-        #GamePathLabel {{ color: {c['TEXT_MUTED']}; font-size: 10px; }}
+        #GamePathLabel {{ color: {c['TEXT_DIM']}; font-size: 12px; }}
+        #ToolbarGuidance {{ color: #ffc184; font-size: 12px; font-weight: 650; }}
 
         #ZoomRow {{ background: {c['BG_DEEP']}; border-top: 1px solid {c['BORDER']}; }}
         #TexInfo {{ background: {c['BG_PANEL']}; border-top: 1px solid {c['BORDER']}; }}
-        #TexInfoKey {{ color: {c['TEXT_MUTED']}; font-size: 9px; font-weight: 600; letter-spacing: 1px; }}
-        #TexInfoVal {{ color: {c['TEXT_MONO']}; font-family: 'Consolas', monospace; font-size: 11px; }}
+        #TexInfoKey {{ color: {c['TEXT_DIM']}; font-size: 11px; font-weight: 600; letter-spacing: 1px; }}
+        #TexInfoVal {{ color: {c['TEXT_MONO']}; font-family: 'Consolas', monospace; font-size: 13px; }}
 
         #InstTable {{
             background: {c['BG_BASE']};
@@ -393,7 +537,7 @@ def _build_stylesheet(c: Dict[str, str]) -> str:
             border: none;
             border-bottom: 1px solid {c['BORDER']};
             padding: 3px 6px;
-            font-size: 10px;
+            font-size: 12px;
             font-weight: 600;
         }}
 
@@ -438,7 +582,7 @@ def _build_stylesheet(c: Dict[str, str]) -> str:
             background: {c['BG_PANEL']};
             border-top: 1px solid {c['BORDER']};
             color: {c['TEXT_MUTED']};
-            font-size: 10px;
+            font-size: 12px;
         }}
         QProgressBar {{
             background: {c['BG_SURFACE']};
@@ -447,7 +591,7 @@ def _build_stylesheet(c: Dict[str, str]) -> str:
             height: 16px;
             color: {c['TEXT_PRIMARY']};
             text-align: center;
-            font-size: 10px;
+            font-size: 12px;
         }}
         QProgressBar::chunk {{ background: {c['ACCENT']}; border-radius: 3px; }}
 
@@ -460,6 +604,38 @@ def _build_stylesheet(c: Dict[str, str]) -> str:
         }}
         QPushButton:hover   {{ background: {c['BG_HOVER']}; border-color: {c['BORDER_STRONG']}; }}
         QPushButton:pressed {{ background: {c['BG_ALT']}; }}
+        QPushButton:disabled {{ color: #7586a3; background: #121c2b; border-color: #2c3d58; }}
+
+        QTreeWidget, QListWidget, QTableWidget, QTextEdit, QPlainTextEdit {{
+            background: {c['BG_DEEP']};
+            color: {c['TEXT_SECONDARY']};
+            border: 1px solid {c['BORDER']};
+            selection-background-color: {c['BG_SELECT']};
+            selection-color: #ffffff;
+        }}
+        QSpinBox, QDoubleSpinBox {{
+            background: {c['BG_SURFACE']};
+            color: {c['TEXT_PRIMARY']};
+            border: 1px solid {c['BORDER_STRONG']};
+            border-radius: 4px;
+            padding: 3px 6px;
+        }}
+        QSpinBox::up-button, QDoubleSpinBox::up-button,
+        QSpinBox::down-button, QDoubleSpinBox::down-button {{
+            width: 18px;
+            background: {c['BG_PANEL']};
+            border-left: 1px solid {c['BORDER']};
+        }}
+        QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{
+            image: url("{chevron_up}");
+            width: 11px;
+            height: 11px;
+        }}
+        QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{
+            image: url("{chevron_down}");
+            width: 11px;
+            height: 11px;
+        }}
 
         /* Fix QScrollArea viewport inheritance */
         QScrollArea > QWidget > QWidget,
@@ -478,6 +654,7 @@ def _build_stylesheet(c: Dict[str, str]) -> str:
         }}
         QLabel {{
             color: {c['TEXT_PRIMARY']};
+            background: transparent;
         }}
         QLineEdit {{
             background: {c['BG_SURFACE']};
@@ -491,8 +668,20 @@ def _build_stylesheet(c: Dict[str, str]) -> str:
             background: {c['BG_SURFACE']};
             border: 1px solid {c['BORDER']};
             border-radius: 4px;
-            padding: 3px 6px;
+            padding: 3px 25px 3px 6px;
             color: {c['TEXT_PRIMARY']};
+        }}
+        QComboBox::drop-down {{
+            subcontrol-origin: padding;
+            subcontrol-position: top right;
+            width: 22px;
+            border-left: 1px solid {c['BORDER']};
+            background: {c['BG_PANEL']};
+        }}
+        QComboBox::down-arrow {{
+            image: url("{chevron_down}");
+            width: 12px;
+            height: 12px;
         }}
         QComboBox QAbstractItemView {{
             background: {c['BG_SURFACE']};

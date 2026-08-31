@@ -63,6 +63,11 @@ EXPORT_ROLES = {
     'base_color', 'color_id',
     'specular_color', 'specular_ior',
     'normal', 'mask', 'ambient_occlusion',
+    'emissive', 'effect_mask', 'noise',
+    'retail_lava_color_a', 'retail_lava_color_b',
+    'retail_lava_normal_a', 'retail_lava_normal_b',
+    'retail_lava_noise',
+    'retail_lava_mask_a', 'retail_lava_mask_b',
     'micro_variation',   # _sm — NPC dinosaur detail variation (Grunthors/Monks)
 }
 

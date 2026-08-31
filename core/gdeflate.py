@@ -11,10 +11,19 @@ import platform
 
 lib = None
 if platform.system() == "Windows":
-	try:
-		lib = ctypes.windll.LoadLibrary(os.path.join(os.getcwd(), "libdeflate.dll"))
-	except:
-		pass
+	# Resolve the bundled decoder relative to the application, not the caller's
+	# current working directory.  This keeps texture extraction working when the
+	# viewer is launched from a shortcut, another repository, or Codex.
+	_candidates = (
+		os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "libdeflate.dll"),
+		os.path.join(os.getcwd(), "libdeflate.dll"),
+	)
+	for _candidate in _candidates:
+		try:
+			lib = ctypes.windll.LoadLibrary(_candidate)
+			break
+		except OSError:
+			pass
 
 kGDeflateId = 4
 kDefaultTileSize = 64 * 1024
@@ -74,7 +83,7 @@ def decompress(compressed, outputSize):
 				output[outputOffset + i] = tile[i]
 
 		lib.libdeflate_free_gdeflate_decompressor(ptr)
-	except:
-		pass
+	except Exception as ex:
+		raise RuntimeError(f"GDeflate decode failed: {ex}") from ex
 
 	return output

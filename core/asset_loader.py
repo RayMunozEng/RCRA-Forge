@@ -45,6 +45,7 @@ class AssetResult:
     model:     Optional[Any] = None   # ModelAsset
     skeleton:  Optional[Any] = None   # Skeleton (companion to model)
     texture:   Optional[Any] = None   # TextureAsset
+    actor:     Optional[Any] = None   # ActorAsset
     zone:      Optional[Any] = None   # ZoneDef
     level:     Optional[Any] = None   # LevelInfo
 
@@ -88,10 +89,13 @@ def load_asset(entry, toc_parser, lookup=None) -> AssetResult:
     result = AssetResult(label=label, raw=raw, atype=atype)
 
     if atype == 'model':
-        _parse_model(result, raw, lookup)
+        _parse_model(result, raw, lookup, entry)
 
     elif atype == 'texture':
         _parse_texture(result, raw)
+
+    elif atype == 'actor':
+        _parse_actor(result, raw, lookup)
 
     elif atype == 'zone':
         _parse_zone(result, raw, entry, label, lookup)
@@ -106,12 +110,15 @@ def load_asset(entry, toc_parser, lookup=None) -> AssetResult:
 
 # ── Per-type parsers ──────────────────────────────────────────────────────────
 
-def _parse_model(result: AssetResult, raw: bytes, lookup) -> None:
+def _parse_model(result: AssetResult, raw: bytes, lookup, entry) -> None:
     try:
         print("[asset_loader] parsing model…")
         from core.mesh import ModelParser
         from core.skeleton import Skeleton
         model = ModelParser(raw).parse()
+        if lookup and lookup.is_loaded():
+            model.source_path = lookup.full_path(entry.asset_id) or ''
+        _resolve_model_material_names(model, raw)
         print(f"[asset_loader] model parsed: {len(model.vertexes)} verts, "
               f"{len(model.meshes)} meshes, {len(model.indexes)} indices")
         result.model = model
@@ -132,6 +139,21 @@ def _parse_texture(result: AssetResult, raw: bytes) -> None:
         result.texture = TextureParser(raw).parse()
     except Exception as ex:
         result.error = f"texture parse failed: {ex}\n{traceback.format_exc()}"
+        print(f"[asset_loader] {result.error}")
+
+
+def _parse_actor(result: AssetResult, raw: bytes, lookup) -> None:
+    try:
+        from core.actor import parse_actor_asset
+        result.actor = parse_actor_asset(raw, lookup)
+        if result.actor is None:
+            result.error = "actor parse returned no actor data"
+        elif result.actor.has_model:
+            print(f"[asset_loader] actor model: {result.actor.model_path}")
+        else:
+            print("[asset_loader] data-only actor (no model reference)")
+    except Exception as ex:
+        result.error = f"actor parse failed: {ex}\n{traceback.format_exc()}"
         print(f"[asset_loader] {result.error}")
 
 
@@ -164,7 +186,39 @@ def _parse_level(result: AssetResult, raw: bytes) -> None:
 
 # ── Texture loading ───────────────────────────────────────────────────────────
 
-def load_model_textures(model, entry, toc_parser, lookup) -> dict:
+def _resolve_model_material_names(model, raw: bytes) -> None:
+    """Replace cooked shader labels with the model's authoritative paths.
+
+    ``ModelParser`` also exposes internal material labels used by the renderer,
+    such as ``sal_gnd_lava_flow_001``.  Those are useful fallbacks but cannot
+    identify a concrete material graph.  The model's material table contains
+    the exact ``.material`` path used by texture resolution, so keep both the
+    viewport and texture loader on that single source of truth.
+    """
+    try:
+        from core.archive import DAT1
+
+        dat1 = DAT1(raw)
+        mat_sec = dat1.sections.get(0x3250BB80)
+        if mat_sec is None:
+            return
+        material_indices = sorted({mesh.material_index for mesh in model.meshes})
+        if not material_indices:
+            return
+        names = list(model.material_names or [])
+        required = material_indices[-1] + 1
+        if len(names) < required:
+            names.extend([''] * (required - len(names)))
+        for material_index in material_indices:
+            resolved = _resolve_mat_name(dat1, mat_sec, material_index)
+            if resolved:
+                names[material_index] = resolved
+        model.material_names = names
+    except Exception as ex:
+        print(f"[asset_loader] material path resolution failed: {ex}")
+
+
+def load_model_textures(model, entry, toc_parser, lookup, on_texture=None) -> dict:
     """
     Resolve and decode all PBR texture slots for a parsed ModelAsset.
 
@@ -179,10 +233,19 @@ def load_model_textures(model, entry, toc_parser, lookup) -> dict:
     dict  {mat_idx: {role_key: (rgba_bytes, width, height, tex_name)}}
           Empty dict on total failure; partial results otherwise.
 
+    ``on_texture`` is an optional callback receiving ``(mat_idx, batch)`` as
+    soon as one decoded texture is ready.  The desktop viewer uses this to
+    display base colour and normal maps without waiting for every export-only
+    PBR slot in the model to finish decoding.
+
     Never raises.
     """
     try:
-        from core.material import parse_material_asset
+        from core.material import (
+            TextureSlot,
+            _base_color_candidates,
+            parse_material_asset,
+        )
         from core.texture import TextureParser
         from core.archive import DAT1
         from exporters.texture_exporter import EXPORT_ROLES, _role_in_export_roles
@@ -190,9 +253,19 @@ def load_model_textures(model, entry, toc_parser, lookup) -> dict:
         if not lookup or not lookup.is_loaded():
             return {}
 
-        # Collect unique material indices from look 0 / LOD 0 only
-        mat_indices = sorted({m.material_index for m in model.meshes
-                              if m.look_index == 0 and m.lod_level == 0})
+        # Collect material indices from the best available primary-look LOD.
+        # Cooked Look tables sometimes reference one mesh from several slots;
+        # the parser then retains a non-zero LOD number for otherwise valid
+        # geometry.  Requiring literal LOD0 made those models lose materials.
+        primary_meshes = [mesh for mesh in model.meshes if mesh.look_index == 0]
+        if not primary_meshes:
+            primary_meshes = list(model.meshes)
+        available_lods = sorted({mesh.lod_level for mesh in primary_meshes})
+        material_lod = available_lods[0] if available_lods else 0
+        mat_indices = sorted({
+            mesh.material_index for mesh in primary_meshes
+            if mesh.lod_level == material_lod
+        })
 
         # Re-extract the model bytes to read TAG_MATERIALS section
         raw  = toc_parser.extract_asset(entry)
@@ -201,6 +274,7 @@ def load_model_textures(model, entry, toc_parser, lookup) -> dict:
         mat_sec = dat1.sections.get(TAG_MAT)
 
         result = {}  # {mat_idx: {role_key: (rgba, w, h, tex_name)}}
+        source_path = lookup.full_path(entry.asset_id) or ''
 
         for mat_idx in mat_indices:
             try:
@@ -223,7 +297,44 @@ def load_model_textures(model, entry, toc_parser, lookup) -> dict:
                 mat_asset = parse_material_asset(mat_data)
 
                 mat_result = {}
-                for slot in mat_asset.slots:
+                # Put viewport-visible maps first.  Some character materials
+                # contain several large masks/specular maps before their base
+                # colour; preserving archive order made the Textured 3D tab
+                # look untextured for tens of seconds.
+                role_priority = {
+                    'base_color': 0,
+                    'color_id': 1,
+                    'emissive': 2,
+                    'effect_mask': 3,
+                    'noise': 4,
+                    'normal': 5,
+                    'retail_lava_color_a': 0,
+                    'retail_lava_color_b': 1,
+                    'retail_lava_mask_a': 2,
+                    'retail_lava_mask_b': 3,
+                    'retail_lava_noise': 4,
+                    'retail_lava_normal_a': 5,
+                    'retail_lava_normal_b': 6,
+                }
+                effective_slots = list(mat_asset.slots)
+                if not any(slot.role in ('base_color', 'color_id')
+                           for slot in effective_slots):
+                    recovered_paths = _base_color_candidates(
+                        mat_name, effective_slots, source_path,
+                    )
+                    for candidate_index, candidate_path in enumerate(recovered_paths):
+                        effective_slots.append(TextureSlot(
+                            index=-len(recovered_paths) + candidate_index,
+                            path=candidate_path,
+                            asset_id_lo=0,
+                            role='base_color',
+                        ))
+
+                ordered_slots = sorted(
+                    effective_slots,
+                    key=lambda slot: (role_priority.get(slot.role, 3), slot.index),
+                )
+                for slot in ordered_slots:
                     if not _role_in_export_roles(slot.role):
                         continue
                     role_key = slot.role if slot.role not in mat_result else f"{slot.role}_{slot.index}"
@@ -231,6 +342,11 @@ def load_model_textures(model, entry, toc_parser, lookup) -> dict:
                         slot, role_key, mat_idx, mat_name,
                         toc_parser, lookup, mat_result,
                     )
+                    if on_texture is not None and role_key in mat_result:
+                        try:
+                            on_texture(mat_idx, {role_key: mat_result[role_key]})
+                        except Exception as ex:
+                            print(f"[texload] progressive callback failed: {ex}")
 
                 if mat_result:
                     result[mat_idx] = mat_result
@@ -286,7 +402,8 @@ def _decode_slot(slot, role_key: str, mat_idx: int, mat_name: str,
         tex      = TextureParser(tex_data).parse()
 
         # Attempt HD pixel data load
-        if tex.hd_len > 0 and tex.hd_width > 0 and tex_id is not None:
+        if tex.hd_len > 0 and tex.hd_width > 0 and tex_id is not None \
+                and tex.array_size <= 1:
             all_entries  = toc_parser.find_all_entries(tex_id)
             hd_candidates = [e for e in all_entries if e.size > tex_entry.size]
             if hd_candidates:
@@ -300,13 +417,26 @@ def _decode_slot(slot, role_key: str, mat_idx: int, mat_name: str,
                 except Exception:
                     pass
 
-        rgba = tex.decode_to_rgba()
-        if not rgba:
-            return
+        texture_metadata = {'dxgi_format': tex.fmt}
+        compressed_mip0 = tex.compressed_mip0()
+        use_native_blocks = tex.fmt in (0x5F, 0x60) or (
+            tex.fmt in (0x4F, 0x50, 0x51)
+            and slot.role.startswith('retail_lava_')
+        )
+        if compressed_mip0 and use_native_blocks:
+            # Preserve HDR BC6H and the lava graph's BC4 SRV semantics.  Other
+            # array textures are decoded to RGBA because a Texture2D upload
+            # cannot represent their complete multi-slice compressed layout.
+            texture_metadata['compressed_mip0'] = compressed_mip0
+            rgba = b'compressed'
+        else:
+            rgba = tex.decode_to_rgba()
+            if not rgba:
+                return
         tex_name = slot.name
         w = tex.hd_width  if tex.hd_pixel_data else tex.width
         h = tex.hd_height if tex.hd_pixel_data else tex.height
-        mat_result[role_key] = (rgba, w, h, tex_name)
+        mat_result[role_key] = (rgba, w, h, tex_name, texture_metadata)
         if slot.role == 'albedo':
             print(f"[texload] mat[{mat_idx}] '{mat_name}' albedo {w}×{h}")
         else:

@@ -13,14 +13,14 @@ DAT1 layout (unk1 = 0x88730155 = 'material'):
     This describes which material graph/shader this material uses.
     Size: ~40 bytes
 
-  Section 2  tag=0xF526018? (Texture slot table + string table)
-    Header (12 bytes):
-      uint32  total_size        — byte size of this whole section
-      uint32  entry_count       — number of texture slots (e.g. 7)
-      uint32  string_table_off  — byte offset of string table from section data start
+  Section 2  tag=0xF5260180 (Texture slot table + string table)
+    Header (32 bytes):
+      +0x00 uint32 total_size        — byte size of this whole section
+      +0x14 uint32 texture_count     — number of texture slots
+      +0x18 uint32 entry_array_off   — byte offset of texture entries
+      +0x1C uint32 string_table_off  — byte offset of string table
 
-    Followed by: <entry_count> × float params (at offset header.string_table_off - 0x4C)
-    Then:         <entry_count> × 8-byte entries:
+    Then:         <texture_count> × 8-byte entries:
                     uint32  string_offset   — byte offset of path in string table
                     uint32  asset_id_lo     — low 32 bits of texture asset CRC64 hash
     Then:         string table — null-separated texture paths
@@ -44,10 +44,44 @@ DAT1 layout (unk1 = 0x88730155 = 'material'):
 """
 
 import struct
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
 from core.archive import DAT1
+
+
+BLIZAR_LAVA_FLOW_GRAPH = (
+    'materialgraph/environment/blizarprime/ground/blz_gbl_lava_01_flow/'
+    'blz_gbl_lava_01_flow.materialgraph'
+)
+
+# These hashes are graph input names, not texture asset IDs.  The mapping and
+# two retained graph defaults are taken from the shipped materialgraph's
+# 0x1CAFE804 binding table.  Keeping the graph inputs distinct is essential:
+# the lava material intentionally binds an FX map and a CMA map into the two
+# inputs named as base maps by the graph.
+_BLIZAR_LAVA_BINDING_ROLES = {
+    0x2D487BD9: 'retail_lava_normal_a',
+    0x3A336F9A: 'retail_lava_normal_b',
+    0x8791CCB9: 'retail_lava_noise',
+    0xC97834C0: 'retail_lava_color_a',
+    0xF0F50805: 'retail_lava_color_b',
+}
+_BLIZAR_LAVA_GRAPH_DEFAULTS = (
+    (
+        0x0056CBD0,
+        'retail_lava_mask_a',
+        'textures/environment/ground/gnd_lava_rock_01/'
+        'gnd_lava_rock_01_cma.texture',
+    ),
+    (
+        0x39DBF715,
+        'retail_lava_mask_b',
+        'textures/environment/ground/gnd_lava_rock_01/'
+        'gnd_lava_rock_01_cma.texture',
+    ),
+)
 
 # ── DAT1 section tags ─────────────────────────────────────────────────────────
 TAG_MATERIAL_HEADER  = 0xE1275683   # float params / built data
@@ -92,7 +126,7 @@ _SUFFIX_ROLES = {
     # Used by npc_dinosaur_detail_variation materialgraph (~30 textures total)
     # Makes each individual NPC look slightly unique
     '_sm':        'micro_variation',
-    '_e':         'unknown',
+    '_e':         'emissive',
 }
 
 # Prefix-based roles (checked separately — these are prefixes not suffixes)
@@ -103,8 +137,19 @@ _PREFIX_ROLES = {
 
 def _infer_role(path: str) -> str:
     """Infer texture slot role from path prefix or suffix before .texture."""
-    stem = path.rsplit('.', 1)[0]   # strip .texture
+    stem = path.rsplit('.', 1)[0].lower()   # strip .texture
     filename = stem.rsplit('/', 1)[-1]  # just the filename
+
+    # Effect graphs use descriptive packed-map suffixes rather than the
+    # ordinary character/prop PBR convention. Blizar Prime lava is one such
+    # material: its visible colour is synthesized from an HDR ``_fx`` map,
+    # a ``_cma`` breakup mask, two normals, and a tiled noise source.
+    if 'noise' in filename:
+        return 'noise'
+    if stem.endswith('_fx'):
+        return 'emissive'
+    if stem.endswith('_cma'):
+        return 'effect_mask'
 
     # Check prefixes first (e.g. id_something)
     for prefix, role in _PREFIX_ROLES.items():
@@ -119,18 +164,36 @@ def _infer_role(path: str) -> str:
     return 'unknown'
 
 
+def _base_color_candidates(material_name: str, slots: list,
+                           source_path: str = '') -> list[str]:
+    """Return conservative base-map fallbacks for ordinary materials.
+
+    The Blizar lava graph is deliberately excluded.  Retail bytecode confirms
+    that it synthesizes colour from its FX/CMA inputs; loading a sibling ``_c``
+    texture changes the shipped material rather than repairing it.
+    """
+    context = ' '.join((material_name or '', source_path or '')).replace('\\', '/').lower()
+    if 'lava_rock' not in context:
+        return []
+    return []
+
+
 @dataclass
 class TextureSlot:
     """One texture binding in a material."""
     index:       int          # slot index (0-based)
     path:        str          # full asset path, e.g. 'characters/.../head_n.texture'
-    asset_id_lo: int          # low 32 bits of CRC64 asset ID
+    asset_id_lo: int          # graph input/binding hash (legacy field name)
     role:        str          # inferred role: 'albedo', 'normal', 'metallic', etc.
 
     @property
     def name(self) -> str:
         """Short filename without extension."""
         return self.path.rsplit('/', 1)[-1].rsplit('.', 1)[0]
+
+    @property
+    def binding_hash(self) -> int:
+        return self.asset_id_lo
 
     def __repr__(self):
         return f"<TextureSlot[{self.index}] {self.role} '{self.name}'>"
@@ -141,6 +204,7 @@ class MaterialAsset:
     """Parsed .material asset."""
     graph_path:    str                    # material graph path (shader type)
     slots:         list = field(default_factory=list)  # list[TextureSlot]
+    parameters:    dict = field(default_factory=dict)  # graph-input hash -> raw bytes
 
     @property
     def albedo_slot(self) -> Optional['TextureSlot']:
@@ -264,7 +328,13 @@ class MaterialParser:
     def parse(self) -> MaterialAsset:
         graph_path = self._parse_graph_path()
         slots      = self._parse_texture_slots()
-        return MaterialAsset(graph_path=graph_path, slots=slots)
+        slots      = self._apply_graph_bindings(graph_path, slots)
+        parameters = self._parse_parameters()
+        return MaterialAsset(
+            graph_path=graph_path,
+            slots=slots,
+            parameters=parameters,
+        )
 
     # ── Private ───────────────────────────────────────────────────────────────
 
@@ -281,30 +351,67 @@ class MaterialParser:
                     [1] graph path (e.g. 'required\\materials\\...materialgraph')
         """
         try:
-            # DAT1 header = 16 bytes, directory = section_count × 12 bytes
-            n_sections = len(self.dat1.sections)
-            pool_start = 16 + n_sections * 12
-            pool_data  = self.data[pool_start:]
-
-            if len(pool_data) < 8:
-                return 'unknown'
-
-            pool_size, str_size = struct.unpack_from('<II', pool_data, 0)
-            if str_size == 0 or str_size > len(pool_data) - 8:
-                return 'unknown'
-
-            strings_raw = pool_data[8:8 + str_size]
-            parts = [p.decode('utf-8', errors='replace')
-                     for p in strings_raw.split(b'\x00') if p]
-
-            # Find the materialgraph path
-            for p in parts:
-                if 'materialgraph' in p:
-                    return p.replace('\\', '/')
-            # Fall back to last non-empty part
-            return parts[-1].replace('\\', '/') if parts else 'unknown'
+            match = re.search(
+                rb'([A-Za-z0-9_./\\-]+\.materialgraph)\x00',
+                self.data,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                return re.sub(
+                    r'/+', '/',
+                    match.group(1).decode('utf-8', errors='replace')
+                    .replace('\\', '/'),
+                ).lower()
+            return 'unknown'
         except Exception:
             return 'unknown'
+
+    def _parse_parameters(self) -> dict:
+        """Decode instance parameter overrides from Material Serialized Data."""
+        section = self.dat1.sections.get(TAG_TEXTURE_TABLE)
+        if section is None or len(section) < 40:
+            return {}
+        data = bytes(section)
+        try:
+            _, count, _, _, batch_end = struct.unpack_from('<IIIII', data, 0)
+            keys_end = 40 + count * 8
+            if count > 128 or batch_end < keys_end or batch_end > len(data):
+                return {}
+            values = data[keys_end:batch_end]
+            result = {}
+            for index in range(count):
+                offset, size, key = struct.unpack_from('<HHI', data, 40 + index * 8)
+                result[key] = values[offset:offset + size]
+            return result
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _apply_graph_bindings(graph_path: str, slots: list) -> list:
+        normalized = (graph_path or '').replace('\\', '/').lower().lstrip('/')
+        if normalized != BLIZAR_LAVA_FLOW_GRAPH:
+            return slots
+
+        mapped = []
+        seen = set()
+        for slot in slots:
+            role = _BLIZAR_LAVA_BINDING_ROLES.get(slot.binding_hash, slot.role)
+            mapped.append(TextureSlot(
+                index=slot.index,
+                path=slot.path,
+                asset_id_lo=slot.asset_id_lo,
+                role=role,
+            ))
+            seen.add(slot.binding_hash)
+        for binding_hash, role, path in _BLIZAR_LAVA_GRAPH_DEFAULTS:
+            if binding_hash not in seen:
+                mapped.append(TextureSlot(
+                    index=len(mapped),
+                    path=path,
+                    asset_id_lo=binding_hash,
+                    role=role,
+                ))
+        return mapped
 
     def _parse_texture_slots(self) -> list:
         """
@@ -331,29 +438,32 @@ class MaterialParser:
         """
         slots = []
 
-        # Find the texture table section — largest non-header section
-        sec = None
-        for k, v in self.dat1.sections.items():
-            candidate = bytes(v)
-            if k != TAG_MATERIAL_HEADER and len(candidate) > 100:
-                sec = candidate
-                break
+        # The texture table has an explicit DAT1 tag. Large RGB-blend
+        # materials also contain hundreds of kilobytes of compiled shader
+        # data; choosing the largest non-header section parsed bytecode instead
+        # of the actual bindings and incorrectly reported no textures.
+        tagged = self.dat1.sections.get(TAG_TEXTURE_TABLE)
+        sec = bytes(tagged) if tagged is not None else None
         if sec is None or len(sec) < 32:
             return slots
 
         try:
-            # Read 32-byte header — string_table_off is at +0x1C
-            total_size, entry_count = struct.unpack_from('<II', sec, 0)
+            # Confirmed RCRA header layout:
+            #   +0x14 texture_count
+            #   +0x18 texture_entry_array_offset
+            #   +0x1C texture_string_table_offset
+            # The +0x04 count describes another binding table and silently
+            # drops textures on ordinary materials (or is zero on some).
+            total_size = struct.unpack_from('<I', sec, 0)[0]
+            entry_count = struct.unpack_from('<I', sec, 0x14)[0]
+            entry_array_off = struct.unpack_from('<I', sec, 0x18)[0]
             string_table_off = struct.unpack_from('<I', sec, 0x1C)[0]
 
-            if entry_count == 0 or entry_count > 64:
+            if entry_count == 0 or entry_count > 128:
                 return slots
             if string_table_off >= len(sec):
                 return slots
-
-            # Entry array sits immediately before the string table
-            entry_array_off = string_table_off - entry_count * 8
-            if entry_array_off < 0:
+            if entry_array_off < 32 or entry_array_off + entry_count * 8 > string_table_off:
                 return slots
 
             str_table = sec[string_table_off:]
@@ -366,6 +476,7 @@ class MaterialParser:
                 path = self._read_string(str_table, str_off)
                 if not path:
                     continue
+                path = re.sub(r'/+', '/', path.replace('\\', '/'))
                 slots.append(TextureSlot(
                     index       = i,
                     path        = path,

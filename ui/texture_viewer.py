@@ -129,7 +129,7 @@ class TextureViewer(QWidget):
         zoom_row.setFixedHeight(28)
         zl = QHBoxLayout(zoom_row)
         zl.setContentsMargins(8, 2, 8, 2)
-        zl.addWidget(QLabel("🔍"))
+        zl.addWidget(QLabel("Zoom:"))
         self._zoom_slider = QSlider(Qt.Orientation.Horizontal)
         self._zoom_slider.setRange(5, 800)
         self._zoom_slider.setValue(100)
@@ -160,9 +160,9 @@ class TextureViewer(QWidget):
         self._lbl_bytes = self._info_pair(il, "Raw Size")
         il.addStretch()
 
-        self._btn_export = QPushButton("⬇ Save DDS")
+        self._btn_export = QPushButton("Save texture as DDS…")
         self._btn_export.setObjectName("ExportBtn")
-        self._btn_export.setFixedHeight(24)
+        self._btn_export.setFixedHeight(32)
         self._btn_export.setEnabled(False)
         self._btn_export.clicked.connect(self._export_dds)
         il.addWidget(self._btn_export)
@@ -206,7 +206,8 @@ class TextureViewer(QWidget):
         self._lbl_size.setText(f"{tex.width} × {tex.height}")
         self._lbl_fmt.setText(tex.format_name)
         self._lbl_mips.setText(str(tex.mips))
-        self._lbl_bytes.setText(f"{len(tex.raw_data):,} B")
+        active_data = tex.hd_pixel_data if tex.hd_pixel_data else tex.pixel_data
+        self._lbl_bytes.setText(f"{len(active_data):,} B")
 
     def _export_dds(self):
         if not self._texture:

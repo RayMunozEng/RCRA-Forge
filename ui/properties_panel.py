@@ -140,7 +140,7 @@ class PropertiesPanel(QWidget):
         hdr.setFixedHeight(36)
         hl = QHBoxLayout(hdr)
         hl.setContentsMargins(8, 4, 8, 4)
-        lbl = QLabel("PROPERTIES")
+        lbl = QLabel("Selected asset")
         lbl.setObjectName("PanelTitle")
         hl.addWidget(lbl)
         outer.addWidget(hdr)
@@ -164,29 +164,31 @@ class PropertiesPanel(QWidget):
         self._scroll_widget.setStyleSheet(self.styleSheet())
 
         # ── Info group ─────────────────────────────────────────────────────
-        info_group = QGroupBox("Asset Info")
+        info_group = QGroupBox("File information")
         info_group.setObjectName("PropsGroup")
         form = QFormLayout(info_group)
         form.setSpacing(4)
         form.setContentsMargins(8, 12, 8, 8)
 
+        self._lbl_name = self._field_label()
         self._lbl_id   = self._field_label()
         self._lbl_type = self._field_label()
         self._lbl_size = self._field_label()
         self._lbl_wad  = self._field_label()
         self._lbl_off  = self._field_label()
 
-        form.addRow("Asset ID:", self._lbl_id)
-        form.addRow("Type:",     self._lbl_type)
-        form.addRow("Size:",     self._lbl_size)
-        form.addRow("WAD:",      self._lbl_wad)
-        form.addRow("Offset:",   self._lbl_off)
+        form.addRow("Name:",           self._lbl_name)
+        form.addRow("File type:",      self._lbl_type)
+        form.addRow("File size:",      self._lbl_size)
+        form.addRow("Game archive:",   self._lbl_wad)
+        form.addRow("Archive offset:", self._lbl_off)
+        form.addRow("Asset ID:",       self._lbl_id)
 
         layout.addWidget(info_group)
         layout.addSpacing(4)
 
         # ── Mesh stats ─────────────────────────────────────────────────────
-        self._mesh_group = QGroupBox("Mesh Statistics")
+        self._mesh_group = QGroupBox("Model geometry")
         self._mesh_group.setObjectName("PropsGroup")
         mform = QFormLayout(self._mesh_group)
         mform.setSpacing(4)
@@ -258,7 +260,7 @@ class PropertiesPanel(QWidget):
 
         # LOD selector
         lod_row = QHBoxLayout()
-        lod_row.addWidget(QLabel("LOD:"))
+        lod_row.addWidget(QLabel("Detail level:"))
         self._lod_combo = QComboBox()
         self._lod_combo.setObjectName("FmtCombo")
         self._lod_combo.addItem("LOD 0  (highest)")
@@ -269,7 +271,7 @@ class PropertiesPanel(QWidget):
         elayout.addLayout(lod_row)
 
         # Export button
-        self._btn_export = QPushButton("⬇  Export Asset")
+        self._btn_export = QPushButton("Export selected asset…")
         self._btn_export.setObjectName("ExportBtn")
         self._btn_export.setEnabled(False)
         self._btn_export.clicked.connect(self._do_export)
@@ -287,7 +289,7 @@ class PropertiesPanel(QWidget):
         self._group_info.setWordWrap(True)
         elayout.addWidget(self._group_info)
 
-        self._btn_export_group = QPushButton("⬡  Export Group as GLB")
+        self._btn_export_group = QPushButton("Export selected model group…")
         self._btn_export_group.setObjectName("ExportBtn")
         self._btn_export_group.setEnabled(False)
         self._btn_export_group.setToolTip(
@@ -297,7 +299,7 @@ class PropertiesPanel(QWidget):
         self._btn_export_group.clicked.connect(self._do_export_group)
         elayout.addWidget(self._btn_export_group)
 
-        self._btn_export_zone = QPushButton("🗺  Export Zone as GLB")
+        self._btn_export_zone = QPushButton("Export selected scene zone…")
         self._btn_export_zone.setObjectName("ExportBtn")
         self._btn_export_zone.setEnabled(False)
         self._btn_export_zone.setToolTip(
@@ -307,7 +309,7 @@ class PropertiesPanel(QWidget):
         self._btn_export_zone.clicked.connect(self._do_export_zone)
         elayout.addWidget(self._btn_export_zone)
 
-        self._btn_dump_zone = QPushButton("🔍  Dump Zone Entry Data")
+        self._btn_dump_zone = QPushButton("Inspect scene-zone records")
         self._btn_dump_zone.setObjectName("ExportBtn")
         self._btn_dump_zone.setEnabled(False)
         self._btn_dump_zone.setToolTip(
@@ -332,13 +334,13 @@ class PropertiesPanel(QWidget):
         layout.addWidget(exp_group)
 
         # ── Export List ────────────────────────────────────────────────────────
-        list_group = QGroupBox("Export List")
+        list_group = QGroupBox("Queued exports")
         list_group.setObjectName("PropsGroup")
         llayout = QVBoxLayout(list_group)
         llayout.setContentsMargins(8, 12, 8, 8)
         llayout.setSpacing(4)
 
-        list_hint = QLabel("Right-click any asset to add it here.")
+        list_hint = QLabel("Right-click an asset in Game assets to add it here.")
         list_hint.setObjectName("FieldValue")
         list_hint.setWordWrap(True)
         llayout.addWidget(list_hint)
@@ -351,7 +353,7 @@ class PropertiesPanel(QWidget):
         llayout.addWidget(self._export_list_widget)
 
         list_btn_row = QHBoxLayout()
-        self._btn_clear_list = QPushButton("Clear List")
+        self._btn_clear_list = QPushButton("Clear queue")
         self._btn_clear_list.setObjectName("SmallBtn")
         self._btn_clear_list.setEnabled(False)
         self._btn_clear_list.clicked.connect(self._do_clear_export_list)
@@ -359,7 +361,7 @@ class PropertiesPanel(QWidget):
         list_btn_row.addStretch()
         llayout.addLayout(list_btn_row)
 
-        self._btn_export_list = QPushButton("⬇  Export List as GLB")
+        self._btn_export_list = QPushButton("Export queued assets…")
         self._btn_export_list.setObjectName("ExportBtn")
         self._btn_export_list.setEnabled(False)
         self._btn_export_list.setToolTip(
@@ -398,10 +400,22 @@ class PropertiesPanel(QWidget):
     def set_entry(self, entry: AssetEntry, name: str = None):
         self._entry = entry
         self._asset_name = name  # display name from lookup (e.g. 'hero_ratchet')
+        display_name = name or f"{entry.asset_id:016X}"
+        extension = display_name.rsplit('.', 1)[-1].casefold() if '.' in display_name else ""
+        type_names = {
+            "model": "3D model (.model)",
+            "texture": "Texture (.texture)",
+            "actor": "Actor definition (.actor)",
+            "zone": "Scene zone (.zone)",
+            "level": "Level data (.level)",
+            "material": "Material (.material)",
+            "animclip": "Animation clip (.animclip)",
+        }
+        self._lbl_name.setText(display_name)
         self._lbl_id.setText(f"{entry.asset_id:016X}")
-        self._lbl_type.setText(f"archive {entry.archive}")
+        self._lbl_type.setText(type_names.get(extension, f".{extension}" if extension else "Unknown"))
         self._lbl_size.setText(f"{entry.size:,} bytes")
-        self._lbl_wad.setText(f"archive_{entry.archive:03d}")
+        self._lbl_wad.setText(f"Archive {entry.archive:03d}")
         self._lbl_off.setText(f"{entry.offset:#010x}")
         self._mesh_group.setVisible(False)
         self._btn_export.setEnabled(False)
@@ -504,7 +518,7 @@ class PropertiesPanel(QWidget):
         )
         self._group_info.setTextFormat(Qt.TextFormat.RichText)
         self._btn_export_group.setEnabled(True)
-        self._btn_export_group.setText(f"⬡  Export Group  ({group.count} parts)")
+        self._btn_export_group.setText(f"Export model group ({group.count} files)…")
 
     def log(self, msg: str):
         self._log.append(msg)
@@ -675,7 +689,7 @@ class PropertiesPanel(QWidget):
         if not entries:
             return
         if self._toc_parser is None:
-            self._list_status.setText("✗ No archive loaded — open a game folder first")
+            self._list_status.setText("No game data loaded — open the Rift Apart folder first")
             return
 
         path, _ = QFileDialog.getSaveFileName(
@@ -709,19 +723,19 @@ class PropertiesPanel(QWidget):
                             break
                     exporter.add_model(model, name)
                 except Exception as ex:
-                    self._list_status.setText(f"✗ Failed on {entry.asset_id:#018x}: {ex}")
+                    self._list_status.setText(f"Export failed on {entry.asset_id:#018x}: {ex}")
                     self._btn_export_list.setEnabled(True)
                     self._btn_clear_list.setEnabled(True)
                     return
 
             exporter.export_glb(path)
             import os
-            self._list_status.setText(f"✓ Exported → {os.path.basename(path)}")
+            self._list_status.setText(f"Exported {os.path.basename(path)}")
             self.log(f"[LIST OK] {path}")
 
         except Exception as ex:
             import traceback
-            self._list_status.setText(f"✗ Export failed: {ex}")
+            self._list_status.setText(f"Export failed: {ex}")
             self.log(f"[LIST ERROR] {ex}\n{traceback.format_exc()}")
         finally:
             self._btn_export_list.setEnabled(True)
@@ -731,7 +745,7 @@ class PropertiesPanel(QWidget):
         if not self._group:
             return
         if self._toc_parser is None:
-            self._export_status.setText("✗ No archive loaded — open a game folder first")
+            self._export_status.setText("No game data loaded — open the Rift Apart folder first")
             return
 
         name = self._group.slug.rsplit('/', 1)[-1]
@@ -761,7 +775,7 @@ class PropertiesPanel(QWidget):
         self._progress.setVisible(False)
         self._btn_export_group.setEnabled(True)
         self._btn_export.setEnabled(self._mesh_asset is not None)
-        self._export_status.setText(f"✓ Group exported → {os.path.basename(path)}")
+        self._export_status.setText(f"Exported model group to {os.path.basename(path)}")
         self.log(f"[GROUP OK] {path}")
 
     def _do_export(self):
@@ -846,18 +860,19 @@ class PropertiesPanel(QWidget):
     def _on_export_done(self, path: str):
         self._progress.setVisible(False)
         self._btn_export.setEnabled(True)
-        self._export_status.setText(f"✓ Exported to {os.path.basename(path)}")
+        self._export_status.setText(f"Exported to {os.path.basename(path)}")
         self.log(f"[OK] {path}")
 
     def _on_export_error(self, msg: str):
         self._progress.setVisible(False)
         self._btn_export.setEnabled(True)
-        self._export_status.setText(f"✗ Error: {msg}")
+        self._export_status.setText(f"Export error: {msg}")
         self.log(f"[ERR] {msg}")
 
     @staticmethod
     def _field_label() -> QLabel:
         lbl = QLabel("—")
         lbl.setObjectName("FieldValue")
+        lbl.setWordWrap(True)
         lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         return lbl

@@ -175,7 +175,7 @@ class SkeletonViewer(QWidget):
         self._status = QLabel("No skeleton loaded")
         self._status.setObjectName("StatusLabel")
         self._status.setContentsMargins(8, 3, 8, 3)
-        self._status.setFixedHeight(20)
+        self._status.setFixedHeight(26)
         layout.addWidget(self._status)
 
     def _build_tree(self, skel: Skeleton):

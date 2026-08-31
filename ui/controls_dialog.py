@@ -2,15 +2,12 @@
 ui/controls_dialog.py
 Viewport Controls customisation dialog for RCRA Forge.
 
-Fixed Blender-style mouse bindings:
-  LMB drag          → Orbit
-  MMB drag          → Pan
-  Shift + MMB drag  → Pan (alternate)
-  Ctrl  + MMB drag  → Zoom drag
-  Scroll wheel      → Zoom
-  Numpad 1/3/7      → Front / Right / Top
-  Numpad 5          → Toggle orthographic
-  F                 → Frame model
+Maya-style motion with direct mouse bindings:
+  LMB drag          → Tumble around the model pivot
+  MMB drag          → Track in the camera view plane
+  RMB drag          → Dolly horizontally
+  Scroll wheel      → Dolly
+  F / A             → Frame model
 
 User-configurable:
   - Invert orbit X / Y axes
@@ -26,6 +23,8 @@ from PyQt6.QtWidgets import (
     QPushButton, QDialogButtonBox, QFrame, QLabel,
 )
 from PyQt6.QtCore import Qt, QSettings
+
+from ui.camera_controls import AUTODESK_MOUSE_BINDINGS
 
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
@@ -87,26 +86,20 @@ class ControlsDialog(QDialog):
         root.setContentsMargins(16, 16, 16, 16)
 
         # ── Bindings reference (read-only) ────────────────────────────────────
-        ref_grp = QGroupBox("Mouse Bindings")
+        ref_grp = QGroupBox("Maya-style Camera Motion")
         ref_grp.setStyleSheet("QGroupBox { font-weight: 600; }")
         rf = QFormLayout(ref_grp)
         rf.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         rf.setSpacing(6)
-        bindings = [
-            ("LMB drag",          "Orbit"),
-            ("MMB drag",          "Pan"),
-            ("Shift + MMB drag",  "Pan"),
-            ("Ctrl + MMB drag",   "Zoom"),
-            ("Scroll wheel",      "Zoom"),
-            ("Numpad 1 / 3 / 7", "Front / Right / Top"),
-            ("Numpad 5",          "Toggle orthographic"),
-            ("F",                 "Frame model"),
+        bindings = list(AUTODESK_MOUSE_BINDINGS) + [
+            ("Scroll wheel", "Dolly"),
+            ("F / A", "Frame model"),
         ]
         for key, action in bindings:
             key_lbl = QLabel(key)
-            key_lbl.setStyleSheet("color: #8090a0; font-size: 11px;")
+            key_lbl.setStyleSheet("color: #8090a0; font-size: 12px;")
             act_lbl = QLabel(action)
-            act_lbl.setStyleSheet("font-size: 11px;")
+            act_lbl.setStyleSheet("font-size: 12px;")
             rf.addRow(key_lbl, act_lbl)
         root.addWidget(ref_grp)
 

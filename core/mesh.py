@@ -135,6 +135,7 @@ class ModelAsset:
     skin_data:        Optional[bytes] = None
     skin_batches:     list = field(default_factory=list)
     material_names:   list[str]    = field(default_factory=list)  # short name per material index
+    source_path:      str          = ''  # resolved asset path, populated by asset_loader
 
 
 # ── Parser ────────────────────────────────────────────────────────────────────

@@ -14,6 +14,7 @@ We load all entries since many assets are shared across games.
 
 import os
 import struct
+import re
 from typing import Optional
 
 
@@ -38,6 +39,8 @@ class HashLookup:
             return len(self._map)
 
         self._map.clear()
+        if hasattr(self, '_reverse_map'):
+            del self._reverse_map
         self._loaded = False
         self._path = hashes_path
 
@@ -121,9 +124,12 @@ class HashLookup:
         Reverse lookup: given a path string, return the asset ID (CRC64 hash).
         Case-insensitive — hashes.txt stores lowercase paths.
         """
+        def _normalize(value: str) -> str:
+            return re.sub(r'/+', '/', value.replace('\\', '/')).casefold().lstrip('/')
+
         if not hasattr(self, '_reverse_map'):
-            self._reverse_map = {v.lower(): k for k, v in self._map.items()}
-        return self._reverse_map.get(path.lower())
+            self._reverse_map = {_normalize(v): k for k, v in self._map.items()}
+        return self._reverse_map.get(_normalize(path))
 
     def is_loaded(self) -> bool:
         return self._loaded

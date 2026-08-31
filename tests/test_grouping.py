@@ -7,7 +7,13 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from core.grouping import _slug_from_path, build_groups, MIN_GROUP_SIZE
+from core.grouping import (
+    _model_family_from_path,
+    _slug_from_path,
+    build_groups,
+    build_model_families,
+    MIN_GROUP_SIZE,
+)
 
 
 # ── _slug_from_path ───────────────────────────────────────────────────────────
@@ -176,6 +182,50 @@ def test_build_groups_hex_only_ungrouped():
     groups, ungrouped = build_groups(entries, lookup)
     assert len(groups) == 0
     assert len(ungrouped) == 2
+
+
+def test_model_family_names_character_entities():
+    assert _model_family_from_path(
+        "characters/hero/hero_ratchet/bangle_set/glove.model"
+    )[1] == "Ratchet"
+    assert _model_family_from_path(
+        "characters/enemy/enm_alien_snapper_ps4/enm_alien_snapper.model"
+    )[1] == "Alien Snapper"
+    assert _model_family_from_path(
+        "equipment/weapon/wpn_burstpistol/wpn_burstpistol.model"
+    )[1] == "Burst Pistol"
+    assert _model_family_from_path(
+        "equipment/projectile/proj_ryno/jeep/proj_ryno_jeep.model"
+    )[1] == "Projectiles & ammunition"
+
+
+def test_model_family_names_environment_purpose():
+    assert _model_family_from_path(
+        "environment/sargasso/architecture/sar_arch_wall.model"
+    )[1] == "Architecture"
+    assert _model_family_from_path(
+        "levels/i20_city/openarea/tile_g35/tile_g35_ground.model"
+    )[1] == "Terrain & ground"
+    assert _model_family_from_path(
+        "atmosphere/atm_sky_dome_base/clouds/sky.model"
+    )[1] == "Sky & atmosphere"
+
+
+def test_build_model_families_replaces_singleton_junk_drawer():
+    entries = [_FakeEntry(0x01), _FakeEntry(0x02), _FakeEntry(0x03)]
+    lookup = _FakeLookup({
+        0x01: "characters/hero/hero_ratchet/glove.model",
+        0x02: "characters/hero/hero_rivet/boot.model",
+        0x03: "characters/hero/hero_ratchet/helmet.model",
+    })
+
+    families = build_model_families(entries, lookup)
+
+    assert [(family.display_name, family.count) for family in families] == [
+        ("Ratchet", 2),
+        ("Rivet", 1),
+    ]
+    assert all(family.is_family for family in families)
 
 
 if __name__ == "__main__":

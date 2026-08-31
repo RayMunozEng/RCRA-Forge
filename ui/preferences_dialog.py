@@ -187,7 +187,7 @@ class PreferencesDialog(QDialog):
             cat_lbl.setObjectName("SubPanelLabel")
             cat_lbl.setContentsMargins(0, 10, 0, 4)
             f = QFont()
-            f.setPointSize(8)
+            f.setPointSize(9)
             f.setWeight(QFont.Weight.Bold)
             cat_lbl.setFont(f)
             grid.addWidget(cat_lbl, row, 0, 1, 4)

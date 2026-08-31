@@ -62,6 +62,7 @@ class AssetGroup:
     directory: str                   # common directory prefix, e.g. "characters/enemies/"
     entries: list                    # list of AssetEntry objects
     asset_type: str = "MESH"         # dominant type (.model etc.)
+    is_family: bool = False           # semantic fallback family, not filename variants
 
     @property
     def count(self) -> int:
@@ -157,6 +158,134 @@ def build_groups(entries, lookup) -> tuple[list[AssetGroup], list]:
         groups.append(g)
 
     return groups, ungrouped
+
+
+_ENVIRONMENT_FAMILIES = (
+    (('collision', '/nav/', 'navigation', 'blocker'), 'Collision & navigation'),
+    (('atmosphere', '/sky/', 'sky_', 'cloud'), 'Sky & atmosphere'),
+    (('vegetation', 'foliage', 'flora', '/tree', '/plant'), 'Vegetation'),
+    (('/terrain/', '/ground/', 'landscape', '/tile_'), 'Terrain & ground'),
+    (('/architecture/', '/arch_', 'building', '/structure/'), 'Architecture'),
+    (('/lighting/', '/light/', 'lgt_'), 'Lighting'),
+    (('/water/', 'ocean', 'river', 'waterfall'), 'Water'),
+    (('/prop/', '/props/', '/object/', '/deco', 'set_dressing'), 'Props & set dressing'),
+    (('/prefab', '/instance/', '/assembly/'), 'Prefabs & level assemblies'),
+    (('background', 'scenery', 'setpiece', 'vista'), 'Background & set pieces'),
+)
+
+
+def _normalized_family_token(token: str) -> str:
+    token = (token or '').casefold().strip('_')
+    token = re.sub(r'^(?:hero|enm|npc|amb|civ|wpn|gdgt|veh)_', '', token)
+    token = re.sub(r'_(?:ps4|ps5|pc|art)$', '', token)
+    return token
+
+
+_FAMILY_NAME_OVERRIDES = {
+    'burstpistol': 'Burst Pistol',
+    'buzzblades': 'Buzz Blades',
+    'lightningrod': 'Lightning Rod',
+    'magshield': 'Mag Shield',
+    'mrfunguy': 'Mr. Fungi',
+    'pixelizer': 'Pixelizer',
+}
+
+
+def _friendly_family_name(token: str) -> str:
+    """Turn an internal entity folder such as enm_grunthor_ps4 into Grunthor."""
+    token = _normalized_family_token(token)
+    return _FAMILY_NAME_OVERRIDES.get(
+        token, token.replace('_', ' ').strip().title() or 'Other models'
+    )
+
+
+def _model_family_from_path(path: str) -> tuple[str, str]:
+    """Return a stable semantic family key and user-facing label for a model."""
+    normalized = re.sub(r'/+', '/', (path or '').replace('\\', '/').casefold())
+    parts = [part for part in normalized.split('/') if part]
+
+    if len(parts) >= 3 and parts[0] == 'characters' and parts[1] in {
+        'hero', 'enemy', 'enemies', 'npc', 'ambient', 'civilians', 'weapon', 'gadgets',
+    }:
+        entity = parts[2]
+        return f"character:{_normalized_family_token(entity)}", _friendly_family_name(entity)
+
+    if len(parts) >= 3 and parts[0] == 'equipment' and parts[1] in {'weapon', 'gadget'}:
+        entity = parts[2]
+        return f"equipment:{_normalized_family_token(entity)}", _friendly_family_name(entity)
+
+    if len(parts) >= 2 and parts[0] == 'equipment':
+        equipment_families = {
+            'pickup': 'Pickups & collectibles',
+            'projectile': 'Projectiles & ammunition',
+            'attachment': 'Weapon attachments',
+        }
+        subtype = parts[1]
+        label = equipment_families.get(subtype, _friendly_family_name(subtype))
+        return f"equipment:{subtype}", label
+
+    if 'vehicle' in parts:
+        index = parts.index('vehicle')
+        if index + 1 < len(parts):
+            entity = parts[index + 1]
+            return f"vehicle:{_normalized_family_token(entity)}", _friendly_family_name(entity)
+
+    if normalized.startswith(('visualeffect/', 'visualeffects/', 'objects/fx/')):
+        if '/weapon/' in normalized or '/wpn_' in normalized:
+            return 'effects:weapons', 'Weapon effects'
+        if '/characters/' in normalized:
+            return 'effects:characters', 'Character effects'
+        if '/environment/' in normalized:
+            return 'effects:environment', 'Environment effects'
+        return 'effects:global', 'Global effects'
+
+    if normalized.startswith(('cinematics/', 'ui/', 'models/ui/')):
+        if normalized.startswith(('ui/', 'models/ui/')):
+            return 'cinematics:ui', 'Interface models'
+        return 'cinematics:scenes', 'Cinematic scene pieces'
+
+    environment_roots = (
+        'environment/', 'levels/', 'procedural/', 'prefabs/', 'atmosphere/',
+        'atmospheres/', 'instance/', 'objects/',
+    )
+    if normalized.startswith(environment_roots):
+        for tokens, label in _ENVIRONMENT_FAMILIES:
+            if any(token in normalized for token in tokens):
+                return f"environment:{label.casefold()}", label
+        return 'environment:scenery', 'Level structures & scenery'
+
+    if normalized.startswith('legacy/'):
+        return 'other:legacy', 'Legacy assets'
+    if normalized.startswith(('test/', 'debug/')) or '/test/' in normalized:
+        return 'other:test', 'Test & development models'
+    if parts:
+        label = _friendly_family_name(parts[0])
+        return f"other:{parts[0]}", label
+    return 'other:unknown', 'Other models'
+
+
+def build_model_families(entries, lookup) -> list[AssetGroup]:
+    """Group singleton model files into meaningful path-derived families."""
+    from collections import defaultdict
+
+    families = defaultdict(list)
+    labels = {}
+    for entry in entries:
+        path = lookup.full_path(entry.asset_id) if lookup and lookup.is_loaded() else ''
+        key, label = _model_family_from_path(path)
+        families[key].append(entry)
+        labels[key] = label
+
+    result = []
+    for key, members in families.items():
+        result.append(AssetGroup(
+            slug=key,
+            display_name=labels[key],
+            directory='',
+            entries=members,
+            is_family=True,
+        ))
+    return sorted(result, key=lambda group: group.display_name.casefold())
 
 
 def filter_groups(groups: list[AssetGroup], text: str, ext_filter: Optional[str] = None,

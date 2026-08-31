@@ -145,3 +145,28 @@ def make_fake_toc_dat1() -> bytes:
     dat1[ids_off:ids_off+len(ids_data)]     = ids_data
     dat1[sizes_off:sizes_off+len(sizes_data)] = sizes_data
     return bytes(dat1)
+
+
+def make_actor_asset(model_path: str | None = None) -> bytes:
+    """Build a minimal actor DAT1 with an optional linked model path."""
+    from core.actor import ACTOR_TYPE
+    from core.archive import DAT1_MAGIC
+
+    strings = [b"Actor Built File"]
+    if model_path:
+        strings.append(model_path.encode("utf-8"))
+    pool = b"\x00".join(strings) + b"\x00"
+
+    section_count = 1
+    header_size = 16 + section_count * 12
+    section_offset = (header_size + len(pool) + 15) & ~15
+    section_data = b"\x00\x00\x00\x00"
+    total_size = section_offset + len(section_data)
+
+    data = bytearray(total_size)
+    header = struct.pack('<IIIHH', DAT1_MAGIC, ACTOR_TYPE, total_size, section_count, 0)
+    header += struct.pack('<III', 0x12345678, section_offset, len(section_data))
+    data[:len(header)] = header
+    data[header_size:header_size + len(pool)] = pool
+    data[section_offset:section_offset + len(section_data)] = section_data
+    return bytes(data)

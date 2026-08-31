@@ -65,6 +65,7 @@ ASSET_TYPE_NAMES = {
     0xDB40514C: 'model',       # MM/Miles Morales
     0x9D2C0FA9: 'model',       # RCRA/Rift Apart ← ModelRcra
     0x5C4580B9: 'texture',
+    0x8F53A199: 'texture',     # RCRA PC streaming texture container
     0x8A0B1487: 'zone',        # Zone container type
     0x1F390AA0: 'zone',        # ZoneDef (tile/gp zones) ← confirmed from binary
     0x2AFE7495: 'level',
