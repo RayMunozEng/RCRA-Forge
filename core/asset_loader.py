@@ -308,6 +308,7 @@ def load_model_textures(model, entry, toc_parser, lookup, on_texture=None) -> di
                     'effect_mask': 3,
                     'noise': 4,
                     'normal': 5,
+                    'fur_control': 1,
                     'retail_lava_color_a': 0,
                     'retail_lava_color_b': 1,
                     'retail_lava_mask_a': 2,

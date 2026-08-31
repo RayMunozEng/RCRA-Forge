@@ -86,6 +86,7 @@ _BLIZAR_LAVA_GRAPH_DEFAULTS = (
 # ── DAT1 section tags ─────────────────────────────────────────────────────────
 TAG_MATERIAL_HEADER  = 0xE1275683   # float params / built data
 TAG_TEXTURE_TABLE    = 0xF5260180   # texture slot table + string table (from RE)
+TAG_FUR_MATERIAL     = 0xD9B12454   # composite-fur settings + DAT1 string offsets
 
 # Texture slot role inferred from path suffix.
 # Channel breakdowns confirmed from Blender RE by community (Fanis + N7Lombax57):
@@ -139,6 +140,12 @@ def _infer_role(path: str) -> str:
     """Infer texture slot role from path prefix or suffix before .texture."""
     stem = path.rsplit('.', 1)[0].lower()   # strip .texture
     filename = stem.rsplit('/', 1)[-1]  # just the filename
+
+    # Composite-fur materials use a dedicated control texture rather than the
+    # ordinary serialized texture table.  Match this before the generic
+    # suffixes so ``*_fur_control`` cannot fall through to ``unknown``.
+    if filename.endswith('_fur_control'):
+        return 'fur_control'
 
     # Effect graphs use descriptive packed-map suffixes rather than the
     # ordinary character/prop PBR convention. Blizar Prime lava is one such
@@ -219,7 +226,8 @@ class MaterialAsset:
                 return s
         # Priority 3: first non-utility slot
         _non_albedo = {'normal', 'mask', 'specular_color', 'specular_ior',
-                       'specular', 'detail', 'detail_normal', 'ambient_occlusion', 'unknown'}
+                       'specular', 'detail', 'detail_normal', 'ambient_occlusion',
+                       'fur_control', 'unknown'}
         for s in self.slots:
             if s.role not in _non_albedo:
                 return s
@@ -445,7 +453,7 @@ class MaterialParser:
         tagged = self.dat1.sections.get(TAG_TEXTURE_TABLE)
         sec = bytes(tagged) if tagged is not None else None
         if sec is None or len(sec) < 32:
-            return slots
+            return self._parse_fur_texture_slots()
 
         try:
             # Confirmed RCRA header layout:
@@ -487,6 +495,42 @@ class MaterialParser:
         except Exception as ex:
             print(f"[MaterialParser] slot parse error: {ex}")
 
+        return slots
+
+    def _parse_fur_texture_slots(self) -> list:
+        """Parse the compact texture list used by shipped fur materials.
+
+        Unlike ordinary materials, composite-fur instances do not carry the
+        ``TAG_TEXTURE_TABLE`` section.  Their ``TAG_FUR_MATERIAL`` payload has
+        a 36-byte settings header followed by DAT1 string-pool offsets.  The
+        observed Ratchet, Rivet, sheep and critter materials all use this
+        layout for color, normal, specular and fur-control maps.
+        """
+        tagged = self.dat1.sections.get(TAG_FUR_MATERIAL)
+        sec = bytes(tagged) if tagged is not None else None
+        if sec is None or len(sec) < 40:
+            return []
+
+        slots = []
+        try:
+            # Keep the parser conservative: these are string-pool references,
+            # not an inline string table, and every accepted value must name a
+            # cooked texture asset.
+            count = min((len(sec) - 36) // 4, 16)
+            for index in range(count):
+                string_offset = struct.unpack_from('<I', sec, 36 + index * 4)[0]
+                path = self.dat1.get_string(string_offset)
+                if not path or not path.lower().endswith('.texture'):
+                    continue
+                path = re.sub(r'/+', '/', path.replace('\\', '/'))
+                slots.append(TextureSlot(
+                    index=index,
+                    path=path,
+                    asset_id_lo=0,
+                    role=_infer_role(path),
+                ))
+        except Exception as ex:
+            print(f"[MaterialParser] fur slot parse error: {ex}")
         return slots
 
     def _find_entry_array(self, sec: bytes, count: int, str_table_off: int):

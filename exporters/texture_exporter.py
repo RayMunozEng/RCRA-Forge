@@ -64,6 +64,7 @@ EXPORT_ROLES = {
     'specular_color', 'specular_ior',
     'normal', 'mask', 'ambient_occlusion',
     'emissive', 'effect_mask', 'noise',
+    'fur_control',
     'retail_lava_color_a', 'retail_lava_color_b',
     'retail_lava_normal_a', 'retail_lava_normal_b',
     'retail_lava_noise',

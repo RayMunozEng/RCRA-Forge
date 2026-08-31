@@ -5,6 +5,7 @@ from core.hashes import HashLookup
 from core.material import (
     BLIZAR_LAVA_FLOW_GRAPH,
     MaterialParser,
+    TAG_FUR_MATERIAL,
     TAG_TEXTURE_TABLE,
     TextureSlot,
     _base_color_candidates,
@@ -86,6 +87,42 @@ def test_material_parser_uses_tagged_rcra_texture_table_and_correct_count():
     ]
     assert slots[0].path == "characters/hero/hero_ratchet/textures/ratchet_c.texture"
     assert slots[2].path == "textures/shared/paint_003_g.texture"
+
+
+def test_material_parser_reads_shipped_fur_texture_bindings():
+    paths = [
+        "characters\\hero\\ratchet\\textures\\ratchet_head_c.texture",
+        "characters/hero/ratchet/textures/ratchet_head_n.texture",
+        "characters/hero/ratchet/textures/ratchet_head_g.texture",
+        "characters/hero/ratchet/textures/ratchet_head_fur_control.texture",
+    ]
+    offsets = [0x45, 0x87, 0xC9, 0x10B]
+    section = bytearray(52)
+    struct.pack_into("<II7f", section, 0, 32, 0, 0.03, 16.0, 1.0, 1.0, 1.0, 0.1, 0.0)
+    struct.pack_into("<4I", section, 36, *offsets)
+
+    class FakeDat1:
+        sections = {TAG_FUR_MATERIAL: memoryview(section)}
+
+        @staticmethod
+        def get_string(offset):
+            return paths[offsets.index(offset)]
+
+    parser = MaterialParser.__new__(MaterialParser)
+    parser.dat1 = FakeDat1()
+
+    slots = parser._parse_texture_slots()
+
+    assert [slot.role for slot in slots] == [
+        "base_color", "normal", "specular_color", "fur_control",
+    ]
+    assert slots[-1].path.endswith("ratchet_head_fur_control.texture")
+
+
+def test_fur_control_role_is_recognized_before_generic_suffixes():
+    assert _infer_role(
+        "characters/hero/hero_rivet/textures/hero_rivet_head_fur_control.texture"
+    ) == "fur_control"
 
 
 def test_hash_reverse_lookup_normalizes_slashes_and_case():

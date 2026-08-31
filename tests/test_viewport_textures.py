@@ -8,9 +8,14 @@ from ui.model_preview import SoftwareModelPreview
 from ui.viewport import (
     ArcballCamera,
     BASE_COLOR_ROLES,
+    FUR_CONTROL_ROLES,
+    FUR_SHELL_LAYERS,
+    FUR_SHELL_LENGTH,
     NORMAL_ROLES,
     _best_texture_slot,
     _is_alpha_cutout_material,
+    _is_composite_shell_material,
+    _is_fur_material,
     _is_lava_material,
     _is_retail_blizar_lava_material,
     _is_lava_rock_model,
@@ -79,6 +84,28 @@ def test_best_texture_slot_uses_largest_indexed_normal_map():
     slots = {"normal": detail, "normal_5": primary}
 
     assert _best_texture_slot(slots, NORMAL_ROLES) is primary
+
+
+def test_fur_material_classification_excludes_helpers_and_nofur_variants():
+    assert _is_fur_material(
+        "material/characters/hero/hero_ratchet_head/hero_ratchet_head_fur.material"
+    )
+    assert _is_fur_material("material/characters/hero/hero_rivet_head_fur.material")
+    assert not _is_fur_material("material/characters/cat/cat_nofur.material")
+    assert not _is_fur_material("hero_ratchet_compositeshell.material")
+    assert _is_composite_shell_material("hero_ratchet_compositeshell.material")
+
+
+def test_fur_control_selects_largest_matching_map():
+    small = _slot(64, 64, "preview_fur_control")
+    authored = _slot(256, 256, "hero_ratchet_head_fur_control")
+    assert _best_texture_slot(
+        {"fur_control": authored, "fur_control_4": small},
+        FUR_CONTROL_ROLES,
+    ) is authored
+
+    assert FUR_SHELL_LAYERS == 16
+    assert FUR_SHELL_LENGTH == 0.03
 
 
 def test_progressive_texture_batches_merge_without_losing_roles():

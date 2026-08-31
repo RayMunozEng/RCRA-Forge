@@ -32,6 +32,9 @@ from core.mesh import ModelAsset, MeshDefinition, mesh_to_numpy
 
 BASE_COLOR_ROLES = ('base_color', 'color_id', 'albedo', 'diffuse')
 NORMAL_ROLES = ('normal',)
+FUR_CONTROL_ROLES = ('fur_control',)
+FUR_SHELL_LAYERS = 16
+FUR_SHELL_LENGTH = 0.03
 EMISSIVE_ROLES = ('emissive',)
 EFFECT_MASK_ROLES = ('effect_mask', 'mask')
 NOISE_ROLES = ('noise',)
@@ -164,6 +167,21 @@ def _is_alpha_cutout_material(material_name: str) -> bool:
     ))
 
 
+def _is_fur_material(material_name: str) -> bool:
+    """Return whether this is a rendered fur surface, not a helper shell."""
+    name = (material_name or '').replace('\\', '/').lower()
+    if 'nofur' in name or 'no_fur' in name:
+        return False
+    if 'compositeshell' in name or 'composite_shell' in name:
+        return False
+    return 'fur' in name
+
+
+def _is_composite_shell_material(material_name: str) -> bool:
+    name = (material_name or '').replace('\\', '/').lower()
+    return 'compositeshell' in name or 'composite_shell' in name
+
+
 def _role_matches(role_key: str, roles: tuple[str, ...]) -> bool:
     """Match a material role and its indexed variants (for example normal_4)."""
     return any(
@@ -216,17 +234,20 @@ layout(location=2) in vec2 aUV;
 uniform mat4 uMVP;
 uniform mat4 uModel;
 uniform mat3 uNormal;
+uniform float uFurLayer;
+uniform float uFurLength;
 
 out vec3 vNormal;
 out vec3 vWorldPos;
 out vec2 vUV;
 
 void main() {
-    vec4 worldPos = uModel * vec4(aPos, 1.0);
+    vec3 displacedPos = aPos + normalize(aNormal) * uFurLength * uFurLayer;
+    vec4 worldPos = uModel * vec4(displacedPos, 1.0);
     vWorldPos  = worldPos.xyz;
     vNormal    = normalize(uNormal * aNormal);
     vUV        = aUV;
-    gl_Position = uMVP * vec4(aPos, 1.0);
+    gl_Position = uMVP * vec4(displacedPos, 1.0);
 }
 """
 
@@ -249,6 +270,9 @@ uniform bool      uIsLava;
 uniform bool      uIsLavaRock;
 uniform bool      uIsLavaFall;
 uniform bool      uIsRetailBlizarLava;
+uniform bool      uIsFur;
+uniform bool      uHasFurControl;
+uniform float     uFurLayer;
 uniform bool      uAlphaCutout;
 uniform float     uTime;
 uniform sampler2D uAlbedo;
@@ -263,6 +287,7 @@ uniform sampler2D uRetailLavaNormalB;
 uniform sampler2D uRetailLavaNoise;
 uniform sampler2D uRetailLavaMaskA;
 uniform sampler2D uRetailLavaMaskB;
+uniform sampler2D uFurControlMap;
 uniform vec2      uLavaFlowA;
 uniform vec2      uLavaFlowB;
 
@@ -302,6 +327,23 @@ void main() {
     vec2 effectUV = length(vUV) > 0.0001 ? vUV : vWorldPos.xz * 0.08;
     vec3 n = normalize(vNormal);
     vec4 albedoSample = uHasTexture ? texture(uAlbedo, vUV) : vec4(1.0);
+    vec4 furControl = uHasFurControl ? texture(uFurControlMap, vUV) : vec4(1.0);
+    if (uIsFur && uHasFurControl) {
+        // B controls local fiber length and A controls density.  Cull shells
+        // past the authored length, then progressively thin the remaining
+        // layers toward their tips.  Without this pass the fur mesh becomes
+        // an opaque shell that hides the textured skin below it.
+        float localLength = clamp(furControl.b * 1.25, 0.02, 1.0);
+        if (uFurLayer > localLength) {
+            discard;
+        }
+        float dither = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233)))
+                             * 43758.5453);
+        float densityCutoff = mix(0.06, 0.78, uFurLayer) + dither * 0.16;
+        if (furControl.a < densityCutoff) {
+            discard;
+        }
+    }
     if (uAlphaCutout && uHasTexture && albedoSample.a < 0.45) {
         discard;
     }
@@ -437,6 +479,13 @@ void main() {
         col = albedoSample.rgb * light;
     } else {
         col = uBaseColor * light;
+    }
+    if (uIsFur && uHasFurControl) {
+        // Soft fiber scattering keeps the surviving cards readable without
+        // turning them emissive or feeding them into bloom.
+        float fiber = smoothstep(0.05, 0.85, furControl.g);
+        float grazing = pow(1.0 - abs(dot(n, normalize(uLightDir))), 3.0);
+        col += albedoSample.rgb * grazing * mix(0.04, 0.16, fiber);
     }
     if (!uIsLava && !uIsRetailBlizarLava && uHasEmissive) {
         vec3 emission = texture(uEmissiveMap, vUV).rgb;
@@ -727,6 +776,7 @@ class GpuSubMesh:
         self.color: tuple = (0.75, 0.75, 0.75)
         self.texture_id:    int = 0   # OpenGL texture object, 0 = no texture
         self.normal_tex_id: int = 0   # OpenGL normal map texture, 0 = none
+        self.fur_control_tex_id: int = 0
         self.emissive_tex_id: int = 0
         self.effect_mask_tex_id: int = 0
         self.noise_tex_id: int = 0
@@ -747,6 +797,8 @@ class GpuSubMesh:
         self.lava_flow_b: tuple[float, float] = (-0.017, 0.029)
         self.is_alpha_cutout: bool = False
         self.is_fur: bool = False     # fur/composite shell mesh — can be toggled
+        self.is_fur_surface: bool = False
+        self.is_composite_shell: bool = False
 
     def upload(self, positions: np.ndarray, normals: np.ndarray,
                uvs: np.ndarray, indices: np.ndarray):
@@ -818,6 +870,7 @@ class GpuSubMesh:
             'retail_lava_normal_a_tex_id', 'retail_lava_normal_b_tex_id',
             'retail_lava_noise_tex_id',
             'retail_lava_mask_a_tex_id', 'retail_lava_mask_b_tex_id',
+            'fur_control_tex_id',
         ):
             tex_id = getattr(self, attr, 0)
             if tex_id:
@@ -939,6 +992,7 @@ class Viewport3D(QOpenGLWidget):
         uploaded = {
             'texture_id': {},
             'normal_tex_id': {},
+            'fur_control_tex_id': {},
             'emissive_tex_id': {},
             'effect_mask_tex_id': {},
             'noise_tex_id': {},
@@ -1016,6 +1070,7 @@ class Viewport3D(QOpenGLWidget):
                 slots_by_attr = {
                     'texture_id': _best_texture_slot(data, BASE_COLOR_ROLES),
                     'normal_tex_id': _best_texture_slot(data, NORMAL_ROLES),
+                    'fur_control_tex_id': _best_texture_slot(data, FUR_CONTROL_ROLES),
                     'emissive_tex_id': _best_texture_slot(data, EMISSIVE_ROLES),
                     'effect_mask_tex_id': _best_texture_slot(data, EFFECT_MASK_ROLES),
                     'noise_tex_id': _best_texture_slot(data, NOISE_ROLES),
@@ -1045,6 +1100,7 @@ class Viewport3D(QOpenGLWidget):
                 slots_by_attr = {
                     'texture_id': data,
                     'normal_tex_id': None,
+                    'fur_control_tex_id': None,
                     'emissive_tex_id': None,
                     'effect_mask_tex_id': None,
                     'noise_tex_id': None,
@@ -1060,6 +1116,7 @@ class Viewport3D(QOpenGLWidget):
             role_by_attr = {
                 'texture_id': 'base',
                 'normal_tex_id': 'normal',
+                'fur_control_tex_id': 'fur_control',
                 'emissive_tex_id': 'emissive',
                 'effect_mask_tex_id': 'effect_mask',
                 'noise_tex_id': 'noise',
@@ -1087,6 +1144,12 @@ class Viewport3D(QOpenGLWidget):
                 if old_id and old_id != new_id:
                     replaced_ids.add(int(old_id))
                 setattr(gm, attr, new_id)
+                if attr == 'fur_control_tex_id':
+                    # Some shipped fur materials (Ratchet's limbs and tail)
+                    # do not contain the word "fur" in their path.  The
+                    # dedicated control binding is the authoritative signal.
+                    gm.is_fur_surface = True
+                    gm.is_fur = True
         for tex_id in replaced_ids:
             glDeleteTextures(1, [tex_id])
 
@@ -1132,9 +1195,6 @@ class Viewport3D(QOpenGLWidget):
         all_positions = []
         skipped = 0
 
-        # Fur/composite shell material name patterns
-        FUR_KEYWORDS = ('fur', 'compositeshell', 'composite_shell')
-
         for i, mesh in enumerate(primary_meshes):
             # Filter by look 0 + LOD level — avoids bundled props from other looks
             if mesh.lod_level != active_lod:
@@ -1169,7 +1229,9 @@ class Viewport3D(QOpenGLWidget):
                 getattr(model, 'source_path', ''),
             )
             gpu.is_alpha_cutout = _is_alpha_cutout_material(mat_name)
-            gpu.is_fur = any(kw in mat_name for kw in FUR_KEYWORDS)
+            gpu.is_fur_surface = _is_fur_material(mat_name)
+            gpu.is_composite_shell = _is_composite_shell_material(mat_name)
+            gpu.is_fur = gpu.is_fur_surface or gpu.is_composite_shell
 
             try:
                 resolved_uvs, generated_uvs = _resolved_mesh_uvs(
@@ -1535,6 +1597,8 @@ class Viewport3D(QOpenGLWidget):
             _set_uniform_3f(self._shader_prog, 'uFillDir',  *fill_dir)
             _set_uniform_bool(self._shader_prog, 'uWireframe', self._wireframe)
             _set_uniform_1f(self._shader_prog, 'uTime', time.monotonic())
+            _set_uniform_1f(self._shader_prog, 'uFurLayer', 0.0)
+            _set_uniform_1f(self._shader_prog, 'uFurLength', 0.0)
 
             # Bind texture samplers
             for sampler, unit in (
@@ -1544,6 +1608,7 @@ class Viewport3D(QOpenGLWidget):
                 ('uRetailLavaNormalA', 7), ('uRetailLavaNormalB', 8),
                 ('uRetailLavaNoise', 9),
                 ('uRetailLavaMaskA', 10), ('uRetailLavaMaskB', 11),
+                ('uFurControlMap', 12),
             ):
                 loc = glGetUniformLocation(self._shader_prog, sampler)
                 if loc >= 0:
@@ -1562,6 +1627,7 @@ class Viewport3D(QOpenGLWidget):
                 has_emissive = gm.emissive_tex_id > 0 and not self._wireframe
                 has_effect_mask = gm.effect_mask_tex_id > 0 and not self._wireframe
                 has_noise = gm.noise_tex_id > 0 and not self._wireframe
+                has_fur_control = gm.fur_control_tex_id > 0 and not self._wireframe
                 retail_lava_ids = (
                     gm.retail_lava_color_a_tex_id,
                     gm.retail_lava_color_b_tex_id,
@@ -1581,6 +1647,11 @@ class Viewport3D(QOpenGLWidget):
                 _set_uniform_bool(self._shader_prog, 'uHasEmissive', has_emissive)
                 _set_uniform_bool(self._shader_prog, 'uHasEffectMask', has_effect_mask)
                 _set_uniform_bool(self._shader_prog, 'uHasNoise', has_noise)
+                is_fur_surface = gm.is_fur_surface or has_fur_control
+                _set_uniform_bool(self._shader_prog, 'uIsFur', is_fur_surface)
+                _set_uniform_bool(
+                    self._shader_prog, 'uHasFurControl', has_fur_control,
+                )
                 _set_uniform_bool(self._shader_prog, 'uIsLava', gm.is_lava)
                 _set_uniform_bool(self._shader_prog, 'uIsLavaRock', gm.is_lava_rock)
                 _set_uniform_bool(self._shader_prog, 'uIsLavaFall', gm.is_lavafall)
@@ -1604,12 +1675,21 @@ class Viewport3D(QOpenGLWidget):
                     (has_retail_lava, GL_TEXTURE9, gm.retail_lava_noise_tex_id),
                     (has_retail_lava, GL_TEXTURE10, gm.retail_lava_mask_a_tex_id),
                     (has_retail_lava, GL_TEXTURE11, gm.retail_lava_mask_b_tex_id),
+                    (has_fur_control, GL_TEXTURE12, gm.fur_control_tex_id),
                 )
                 for enabled, unit, tex_id in texture_bindings:
                     if enabled:
                         glActiveTexture(unit)
                         glBindTexture(GL_TEXTURE_2D, tex_id)
-                gm.draw()
+                shell_count = FUR_SHELL_LAYERS if has_fur_control else 1
+                for shell_index in range(shell_count):
+                    fur_layer = shell_index / max(shell_count - 1, 1)
+                    _set_uniform_1f(self._shader_prog, 'uFurLayer', fur_layer)
+                    _set_uniform_1f(
+                        self._shader_prog, 'uFurLength',
+                        FUR_SHELL_LENGTH if has_fur_control else 0.0,
+                    )
+                    gm.draw()
                 for enabled, unit, _tex_id in texture_bindings:
                     if enabled:
                         glActiveTexture(unit)
