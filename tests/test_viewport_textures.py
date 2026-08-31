@@ -11,6 +11,7 @@ from ui.viewport import (
     FUR_CONTROL_ROLES,
     NORMAL_ROLES,
     _best_texture_slot,
+    _can_draw_fur_strands,
     _is_alpha_cutout_material,
     _is_composite_shell_material,
     _is_fur_material,
@@ -101,6 +102,37 @@ def test_fur_control_selects_largest_matching_map():
         {"fur_control": authored, "fur_control_4": small},
         FUR_CONTROL_ROLES,
     ) is authored
+
+
+def test_geometric_fur_requires_surface_and_control_textures():
+    assert _can_draw_fur_strands(
+        show_fur=True,
+        wireframe=False,
+        is_composite_shell=False,
+        albedo_tex_id=7,
+        control_tex_id=9,
+    )
+    assert not _can_draw_fur_strands(
+        show_fur=True,
+        wireframe=False,
+        is_composite_shell=True,
+        albedo_tex_id=7,
+        control_tex_id=9,
+    )
+    assert not _can_draw_fur_strands(
+        show_fur=True,
+        wireframe=True,
+        is_composite_shell=False,
+        albedo_tex_id=7,
+        control_tex_id=9,
+    )
+    assert not _can_draw_fur_strands(
+        show_fur=False,
+        wireframe=False,
+        is_composite_shell=False,
+        albedo_tex_id=7,
+        control_tex_id=9,
+    )
 
 def test_progressive_texture_batches_merge_without_losing_roles():
     base = _slot(2048, 2048, "hero_ratchet_boots_c")

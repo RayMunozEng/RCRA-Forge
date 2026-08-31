@@ -180,6 +180,16 @@ def _is_composite_shell_material(material_name: str) -> bool:
     return 'compositeshell' in name or 'composite_shell' in name
 
 
+def _can_draw_fur_strands(*, show_fur: bool, wireframe: bool,
+                          is_composite_shell: bool, albedo_tex_id: int,
+                          control_tex_id: int) -> bool:
+    """Return whether a mesh has the inputs required for geometric fibers."""
+    return bool(
+        show_fur and not wireframe and not is_composite_shell
+        and albedo_tex_id > 0 and control_tex_id > 0
+    )
+
+
 def _role_matches(role_key: str, roles: tuple[str, ...]) -> bool:
     """Match a material role and its indexed variants (for example normal_4)."""
     return any(
@@ -507,6 +517,170 @@ void main() {
         float bloomWeight = smoothstep(0.82, 1.45, luminance);
         BrightColor = vec4(col * bloomWeight, 1.0);
     }
+}
+"""
+
+
+# Fur materials carry a tessellated root surface plus a control map, not
+# individual polygon hairs.  This geometry stage emits three narrow tapered
+# ribbons per source triangle.  The shipped control texture supplies comb
+# direction (RG), fiber length (B), and density (A).
+FUR_VERT_SRC = """
+#version 330 core
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec3 aNormal;
+layout(location=2) in vec2 aUV;
+
+out FurVertex {
+    vec3 position;
+    vec3 normal;
+    vec2 uv;
+} furVertex;
+
+void main() {
+    furVertex.position = aPos;
+    furVertex.normal = aNormal;
+    furVertex.uv = aUV;
+    gl_Position = vec4(aPos, 1.0);
+}
+"""
+
+FUR_GEOM_SRC = """
+#version 330 core
+layout(triangles) in;
+layout(triangle_strip, max_vertices=24) out;
+
+in FurVertex {
+    vec3 position;
+    vec3 normal;
+    vec2 uv;
+} furVertex[];
+
+uniform mat4 uMVP;
+uniform mat4 uModel;
+uniform mat3 uNormal;
+uniform vec3 uEye;
+uniform vec3 uLightDir;
+uniform vec3 uFillDir;
+uniform sampler2D uFurAlbedo;
+uniform sampler2D uFurControl;
+
+out vec3 gColor;
+out float gAlong;
+out float gLighting;
+
+float hash31(vec3 value) {
+    return fract(sin(dot(value, vec3(12.9898, 78.233, 37.719))) * 43758.5453);
+}
+
+vec3 bary3(vec3 a, vec3 b, vec3 c, vec3 weights) {
+    return a * weights.x + b * weights.y + c * weights.z;
+}
+
+vec2 bary2(vec2 a, vec2 b, vec2 c, vec3 weights) {
+    return a * weights.x + b * weights.y + c * weights.z;
+}
+
+void emitFiber(vec3 weights, float seed, vec3 tangent, vec3 bitangent) {
+    vec3 localRoot = bary3(
+        furVertex[0].position, furVertex[1].position, furVertex[2].position,
+        weights
+    );
+    vec3 root = (uModel * vec4(localRoot, 1.0)).xyz;
+    vec3 normal = normalize(uNormal * bary3(
+        furVertex[0].normal, furVertex[1].normal, furVertex[2].normal,
+        weights
+    ));
+    vec2 uv = bary2(furVertex[0].uv, furVertex[1].uv, furVertex[2].uv, weights);
+    vec4 control = textureLod(uFurControl, uv, 0.0);
+    float randomValue = hash31(root * 173.0 + vec3(seed));
+    if (randomValue > control.a) {
+        return;
+    }
+
+    vec2 flow = control.rg * 2.0 - 1.0;
+    vec3 comb = tangent * flow.x + bitangent * flow.y;
+    vec3 direction = normalize(normal + comb * 0.28);
+    float length = (0.0012 + control.b * 0.028) * mix(0.78, 1.18, randomValue);
+    float rootWidth = mix(0.00038, 0.00068, hash31(root * 91.0 + vec3(seed)));
+    vec3 baseColor = textureLod(uFurAlbedo, uv, 0.0).rgb;
+    baseColor *= mix(0.88, 1.08, hash31(root * 53.0 + vec3(seed)));
+    float primary = abs(dot(normal, normalize(uLightDir)));
+    float fill = abs(dot(normal, normalize(uFillDir)));
+    float lighting = primary * 0.72 + fill * 0.28 + 0.30;
+
+    for (int segment = 0; segment <= 3; ++segment) {
+        float along = float(segment) / 3.0;
+        vec3 center = root + normal * 0.00020
+            + direction * length * along
+            + comb * length * 0.16 * along * along;
+        vec3 viewDirection = normalize(uEye - center);
+        vec3 side = cross(direction, viewDirection);
+        if (dot(side, side) < 0.00001) {
+            side = cross(direction, tangent);
+        }
+        side = normalize(side);
+        float halfWidth = rootWidth * mix(1.0, 0.08, along);
+        gColor = baseColor;
+        gAlong = along;
+        gLighting = lighting;
+        gl_Position = uMVP * vec4(center - side * halfWidth, 1.0);
+        EmitVertex();
+        gl_Position = uMVP * vec4(center + side * halfWidth, 1.0);
+        EmitVertex();
+    }
+    EndPrimitive();
+}
+
+void main() {
+    vec3 world0 = (uModel * vec4(furVertex[0].position, 1.0)).xyz;
+    vec3 world1 = (uModel * vec4(furVertex[1].position, 1.0)).xyz;
+    vec3 world2 = (uModel * vec4(furVertex[2].position, 1.0)).xyz;
+    vec2 edgeUV1 = furVertex[1].uv - furVertex[0].uv;
+    vec2 edgeUV2 = furVertex[2].uv - furVertex[0].uv;
+    vec3 averageNormal = normalize(uNormal * (
+        furVertex[0].normal + furVertex[1].normal + furVertex[2].normal
+    ));
+    float determinant = edgeUV1.x * edgeUV2.y - edgeUV1.y * edgeUV2.x;
+    vec3 tangent;
+    if (abs(determinant) > 0.000001) {
+        tangent = normalize(
+            ((world1 - world0) * edgeUV2.y - (world2 - world0) * edgeUV1.y)
+            / determinant
+        );
+    } else {
+        vec3 axis = abs(averageNormal.y) < 0.95 ? vec3(0.0, 1.0, 0.0)
+                                                 : vec3(1.0, 0.0, 0.0);
+        tangent = normalize(cross(axis, averageNormal));
+    }
+    tangent = normalize(tangent - averageNormal * dot(tangent, averageNormal));
+    vec3 bitangent = normalize(cross(averageNormal, tangent));
+
+    emitFiber(vec3(0.60, 0.20, 0.20), 0.17, tangent, bitangent);
+    emitFiber(vec3(0.20, 0.60, 0.20), 0.53, tangent, bitangent);
+    emitFiber(vec3(0.20, 0.20, 0.60), 0.89, tangent, bitangent);
+}
+"""
+
+FUR_FRAG_SRC = """
+#version 330 core
+in vec3 gColor;
+in float gAlong;
+in float gLighting;
+
+layout(location = 0) out vec4 FragColor;
+layout(location = 1) out vec4 BrightColor;
+
+void main() {
+    float rootFade = smoothstep(0.0, 0.12, gAlong);
+    float tipFade = 1.0 - smoothstep(0.68, 1.0, gAlong);
+    float alpha = mix(0.72, 0.92, rootFade) * tipFade;
+    if (alpha < 0.025) {
+        discard;
+    }
+    vec3 color = gColor * gLighting;
+    FragColor = vec4(color, alpha);
+    BrightColor = vec4(0.0);
 }
 """
 
@@ -866,6 +1040,7 @@ class Viewport3D(QOpenGLWidget):
         self.camera     = ArcballCamera()
         self._gpu_meshes: list[GpuSubMesh] = []
         self._shader_prog: int = 0
+        self._fur_shader_prog: int = 0
         self._grid_prog:   int = 0
         self._blur_prog:   int = 0
         self._composite_prog: int = 0
@@ -1319,6 +1494,12 @@ class Viewport3D(QOpenGLWidget):
         frag = compileShader(FRAG_SRC, GL_FRAGMENT_SHADER)
         self._shader_prog = compileProgram(vert, frag)
 
+        self._fur_shader_prog = compileProgram(
+            compileShader(FUR_VERT_SRC, GL_VERTEX_SHADER),
+            compileShader(FUR_GEOM_SRC, GL_GEOMETRY_SHADER),
+            compileShader(FUR_FRAG_SRC, GL_FRAGMENT_SHADER),
+        )
+
         gv = compileShader(GRID_VERT, GL_VERTEX_SHADER)
         gf = compileShader(GRID_FRAG, GL_FRAGMENT_SHADER)
         self._grid_prog = compileProgram(gv, gf)
@@ -1478,6 +1659,55 @@ class Viewport3D(QOpenGLWidget):
         glBindTexture(GL_TEXTURE_2D, 0)
         glEnable(GL_BLEND)
         glEnable(GL_DEPTH_TEST)
+
+    def _draw_fur_strands(self, mvp, model, normal_mat, eye,
+                          light_dir, fill_dir):
+        """Render camera-facing geometric fibers over authored fur surfaces."""
+        if not self._fur_shader_prog:
+            return
+        fur_meshes = [
+            mesh for mesh in self._gpu_meshes
+            if _can_draw_fur_strands(
+                show_fur=self._show_fur,
+                wireframe=self._wireframe,
+                is_composite_shell=mesh.is_composite_shell,
+                albedo_tex_id=mesh.texture_id,
+                control_tex_id=mesh.fur_control_tex_id,
+            )
+        ]
+        if not fur_meshes:
+            return
+
+        glUseProgram(self._fur_shader_prog)
+        _set_uniform_mat4(self._fur_shader_prog, 'uMVP', mvp)
+        _set_uniform_mat4(self._fur_shader_prog, 'uModel', model)
+        _set_uniform_mat3(self._fur_shader_prog, 'uNormal', normal_mat)
+        _set_uniform_3f(self._fur_shader_prog, 'uEye', *eye)
+        _set_uniform_3f(self._fur_shader_prog, 'uLightDir', *light_dir)
+        _set_uniform_3f(self._fur_shader_prog, 'uFillDir', *fill_dir)
+        for sampler, unit in (('uFurAlbedo', 0), ('uFurControl', 1)):
+            location = glGetUniformLocation(self._fur_shader_prog, sampler)
+            if location >= 0:
+                glUniform1i(location, unit)
+
+        # Opaque surfaces have already populated depth. Fibers test against
+        # that depth but do not overwrite it, avoiding harsh self-occlusion
+        # between the many translucent ribbons.
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glDepthMask(GL_FALSE)
+        glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
+        for mesh in fur_meshes:
+            glActiveTexture(GL_TEXTURE0)
+            glBindTexture(GL_TEXTURE_2D, mesh.texture_id)
+            glActiveTexture(GL_TEXTURE1)
+            glBindTexture(GL_TEXTURE_2D, mesh.fur_control_tex_id)
+            mesh.draw()
+        glActiveTexture(GL_TEXTURE1)
+        glBindTexture(GL_TEXTURE_2D, 0)
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(GL_TEXTURE_2D, 0)
+        glDepthMask(GL_TRUE)
 
     def paintGL(self):
         if not _HAS_OPENGL:
@@ -1671,6 +1901,10 @@ class Viewport3D(QOpenGLWidget):
                         glBindTexture(GL_TEXTURE_2D, 0)
 
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
+
+            self._draw_fur_strands(
+                mvp, model, normal_mat, eye, light_dir, fill_dir,
+            )
 
         if use_hdr:
             self._composite_bloom()
