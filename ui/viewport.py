@@ -33,8 +33,6 @@ from core.mesh import ModelAsset, MeshDefinition, mesh_to_numpy
 BASE_COLOR_ROLES = ('base_color', 'color_id', 'albedo', 'diffuse')
 NORMAL_ROLES = ('normal',)
 FUR_CONTROL_ROLES = ('fur_control',)
-FUR_SHELL_LAYERS = 16
-FUR_SHELL_LENGTH = 0.03
 EMISSIVE_ROLES = ('emissive',)
 EFFECT_MASK_ROLES = ('effect_mask', 'mask')
 NOISE_ROLES = ('noise',)
@@ -234,20 +232,17 @@ layout(location=2) in vec2 aUV;
 uniform mat4 uMVP;
 uniform mat4 uModel;
 uniform mat3 uNormal;
-uniform float uFurLayer;
-uniform float uFurLength;
 
 out vec3 vNormal;
 out vec3 vWorldPos;
 out vec2 vUV;
 
 void main() {
-    vec3 displacedPos = aPos + normalize(aNormal) * uFurLength * uFurLayer;
-    vec4 worldPos = uModel * vec4(displacedPos, 1.0);
+    vec4 worldPos = uModel * vec4(aPos, 1.0);
     vWorldPos  = worldPos.xyz;
     vNormal    = normalize(uNormal * aNormal);
     vUV        = aUV;
-    gl_Position = uMVP * vec4(displacedPos, 1.0);
+    gl_Position = uMVP * vec4(aPos, 1.0);
 }
 """
 
@@ -272,7 +267,6 @@ uniform bool      uIsLavaFall;
 uniform bool      uIsRetailBlizarLava;
 uniform bool      uIsFur;
 uniform bool      uHasFurControl;
-uniform float     uFurLayer;
 uniform bool      uAlphaCutout;
 uniform float     uTime;
 uniform sampler2D uAlbedo;
@@ -328,22 +322,6 @@ void main() {
     vec3 n = normalize(vNormal);
     vec4 albedoSample = uHasTexture ? texture(uAlbedo, vUV) : vec4(1.0);
     vec4 furControl = uHasFurControl ? texture(uFurControlMap, vUV) : vec4(1.0);
-    if (uIsFur && uHasFurControl) {
-        // B controls local fiber length and A controls density.  Cull shells
-        // past the authored length, then progressively thin the remaining
-        // layers toward their tips.  Without this pass the fur mesh becomes
-        // an opaque shell that hides the textured skin below it.
-        float localLength = clamp(furControl.b * 1.25, 0.02, 1.0);
-        if (uFurLayer > localLength) {
-            discard;
-        }
-        float dither = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233)))
-                             * 43758.5453);
-        float densityCutoff = mix(0.06, 0.78, uFurLayer) + dither * 0.16;
-        if (furControl.a < densityCutoff) {
-            discard;
-        }
-    }
     if (uAlphaCutout && uHasTexture && albedoSample.a < 0.45) {
         discard;
     }
@@ -1597,8 +1575,6 @@ class Viewport3D(QOpenGLWidget):
             _set_uniform_3f(self._shader_prog, 'uFillDir',  *fill_dir)
             _set_uniform_bool(self._shader_prog, 'uWireframe', self._wireframe)
             _set_uniform_1f(self._shader_prog, 'uTime', time.monotonic())
-            _set_uniform_1f(self._shader_prog, 'uFurLayer', 0.0)
-            _set_uniform_1f(self._shader_prog, 'uFurLength', 0.0)
 
             # Bind texture samplers
             for sampler, unit in (
@@ -1621,6 +1597,13 @@ class Viewport3D(QOpenGLWidget):
 
             for gm in self._gpu_meshes:
                 if gm.is_fur and not self._show_fur:
+                    continue
+                # Composite-shell meshes are engine-side fur/RT helpers with
+                # no albedo of their own. Drawing them as ordinary textured
+                # surfaces creates the large flat pink/white patches that
+                # obscure the authored head-fur geometry. Keep them available
+                # in wireframe, but never include them in the shaded pass.
+                if gm.is_composite_shell and not self._wireframe:
                     continue
                 has_tex = gm.texture_id > 0 and not self._wireframe
                 has_nrm = gm.normal_tex_id > 0 and not self._wireframe
@@ -1681,15 +1664,7 @@ class Viewport3D(QOpenGLWidget):
                     if enabled:
                         glActiveTexture(unit)
                         glBindTexture(GL_TEXTURE_2D, tex_id)
-                shell_count = FUR_SHELL_LAYERS if has_fur_control else 1
-                for shell_index in range(shell_count):
-                    fur_layer = shell_index / max(shell_count - 1, 1)
-                    _set_uniform_1f(self._shader_prog, 'uFurLayer', fur_layer)
-                    _set_uniform_1f(
-                        self._shader_prog, 'uFurLength',
-                        FUR_SHELL_LENGTH if has_fur_control else 0.0,
-                    )
-                    gm.draw()
+                gm.draw()
                 for enabled, unit, _tex_id in texture_bindings:
                     if enabled:
                         glActiveTexture(unit)

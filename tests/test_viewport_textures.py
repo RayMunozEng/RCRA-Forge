@@ -9,8 +9,6 @@ from ui.viewport import (
     ArcballCamera,
     BASE_COLOR_ROLES,
     FUR_CONTROL_ROLES,
-    FUR_SHELL_LAYERS,
-    FUR_SHELL_LENGTH,
     NORMAL_ROLES,
     _best_texture_slot,
     _is_alpha_cutout_material,
@@ -103,10 +101,6 @@ def test_fur_control_selects_largest_matching_map():
         {"fur_control": authored, "fur_control_4": small},
         FUR_CONTROL_ROLES,
     ) is authored
-
-    assert FUR_SHELL_LAYERS == 16
-    assert FUR_SHELL_LENGTH == 0.03
-
 
 def test_progressive_texture_batches_merge_without_losing_roles():
     base = _slot(2048, 2048, "hero_ratchet_boots_c")
