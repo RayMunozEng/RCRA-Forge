@@ -12,9 +12,10 @@ Key facts:
   - The asset is a DAT1 container (see core/archive.py)
   - DAT1 unk1 = 0x98906B9F  →  'model'
   - Vertex format for RCRA: 16 bytes per vertex, section 0xA98BE69B
-      <4h I 2h>   X Y Z W(ignored)  NXYZ(packed uint32)  U V
+      <4h I 2h>   X Y Z W  NXYZ(packed R10G10B10A2)  U V
       positions are fixed-point / 4096.0
-      normals are decoded from a 10-10-12 packed uint32 (see _decode_normal)
+      normal XY, tangent X, and both Z signs are packed in NXYZ;
+      tangent Y and handedness are packed in W (see the frame decoders below)
       UVs are int16 / 32768.0
   - Index buffer: uint16 values, section 0x0859863D (NOT delta-encoded for RCRA)
   - Second UV channel: section 0x6B855EED, 2×int16 per vertex / 32768.0
@@ -79,6 +80,39 @@ def _decode_normal(norm: int) -> tuple:
     return (nx, ny, nz)
 
 
+def _decode_tangent(position_w: int, norm: int) -> tuple:
+    """Decode the authored tangent and handedness used by the retail VS.
+
+    The recovered fur vertex shader reads the standard position stream's
+    signed W component and the same R10G10B10A2_UNORM value used for normals:
+    ``NXYZ[20:30]`` is tangent X, ``abs(W) & 0x3ff`` is tangent Y,
+    ``NXYZ[30]`` selects tangent Z's sign, and W's sign is handedness.
+    Tangent XYZ uses the same equal-area sphere reconstruction as the normal.
+    """
+    norm &= 0xFFFFFFFF
+    packed_w = abs(int(position_w))
+    tx = float((norm >> 20) & 0x3FF) * 0.00276483595 - math.sqrt(2)
+    ty = float(packed_w & 0x3FF) * 0.00276483595 - math.sqrt(2)
+
+    txxyy = tx * tx + ty * ty
+    tw = math.sqrt(max(0.0, 1.0 - 0.25 * txxyy))
+    tx *= tw
+    ty *= tw
+    tz = 1.0 - 0.5 * txxyy
+    if ((norm >> 30) & 1) == 0:
+        tz = -tz
+
+    handedness = 1.0 if position_w >= 0 else -1.0
+    return (tx, ty, tz, handedness)
+
+
+def _decode_position_correction(position_w: int) -> float:
+    """Decode the small position-quantization term used by the retail VS."""
+    exponent = abs(int(position_w)) & 0x7C00
+    scaled = float(exponent) * 0.000032
+    return 1.0 / (scaled * scaled) if scaled > 0.0 else 0.0
+
+
 # ── Data classes ──────────────────────────────────────────────────────────────
 
 @dataclass
@@ -86,6 +120,9 @@ class Vertex:
     x: float; y: float; z: float       # world-space position
     nx: float; ny: float; nz: float    # decoded normal
     u: float;  v: float                # UV channel 0
+    tx: float = 1.0; ty: float = 0.0   # decoded authored tangent
+    tz: float = 0.0; tw: float = 1.0   # tangent Z + frame handedness
+    tq: float = 0.0                     # retail position decode correction
     u1: float = 0.0; v1: float = 0.0  # UV channel 1 (if present)
     r: int = 255; g: int = 255         # vertex colour
     b: int = 255; a: int = 255
@@ -222,9 +259,11 @@ class ModelParser:
         n_verts = len(data) // 16
         for i in range(n_verts):
             off = i * 16
-            X, Y, Z, _W = struct.unpack_from('<4h', data, off)
+            X, Y, Z, W = struct.unpack_from('<4h', data, off)
             NXYZ        = struct.unpack_from('<I',  data, off + 8)[0]
             nx, ny, nz  = _decode_normal(NXYZ)
+            tx, ty, tz, tw = _decode_tangent(W, NXYZ)
+            tq = _decode_position_correction(W)
             U, V        = struct.unpack_from('<2h', data, off + 12)
 
             vertexes.append(Vertex(
@@ -232,6 +271,7 @@ class ModelParser:
                 nx = nx,        ny = ny,        nz = nz,
                 u  = U * UV_SCALE,
                 v  = V * UV_SCALE,
+                tx = tx, ty = ty, tz = tz, tw = tw, tq = tq,
             ))
         return vertexes
 
@@ -549,3 +589,25 @@ def mesh_to_numpy(model: ModelAsset, mesh: MeshDefinition):
     indices = np.array([max(0, i - offset) for i in raw_idx], dtype=np.uint32)
 
     return positions, normals, uvs, indices
+
+
+def mesh_tangents_to_numpy(model: ModelAsset, mesh: MeshDefinition):
+    """Return authored tangent XYZ and handedness for one sub-mesh."""
+    vs = mesh.vertex_start
+    vc = mesh.vertex_count
+    verts = model.vertexes[vs:vs + vc]
+    if not verts:
+        return None
+    return np.array(
+        [(v.tx, v.ty, v.tz, v.tw) for v in verts], dtype=np.float32,
+    )
+
+
+def mesh_decode_corrections_to_numpy(model: ModelAsset, mesh: MeshDefinition):
+    """Return the retail position-decode correction for one sub-mesh."""
+    vs = mesh.vertex_start
+    vc = mesh.vertex_count
+    verts = model.vertexes[vs:vs + vc]
+    if not verts:
+        return None
+    return np.array([(v.tq,) for v in verts], dtype=np.float32)

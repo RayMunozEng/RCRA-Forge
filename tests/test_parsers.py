@@ -10,6 +10,33 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 
+def test_retail_packed_frame_decodes_normal_tangent_and_handedness():
+    import numpy as np
+    from core.mesh import (
+        _decode_normal,
+        _decode_position_correction,
+        _decode_tangent,
+    )
+
+    # R10G10B10A2: centered normal XY, positive tangent X, both positive Z.
+    packed = 512 | (512 << 10) | (1023 << 20) | (3 << 30)
+    normal = np.asarray(_decode_normal(packed))
+    tangent = np.asarray(_decode_tangent(512, packed))
+
+    np.testing.assert_allclose(np.linalg.norm(normal), 1.0, atol=1e-6)
+    np.testing.assert_allclose(np.linalg.norm(tangent[:3]), 1.0, atol=1e-6)
+    assert normal[2] > 0.999
+    assert tangent[0] > 0.999
+    assert tangent[2] > -0.01
+    assert tangent[3] == 1.0
+    assert _decode_tangent(-512, packed)[3] == -1.0
+    np.testing.assert_allclose(
+        _decode_position_correction(0x7E00),
+        1.0 / ((0x7C00 * 0.000032) ** 2),
+    )
+    assert _decode_position_correction(0) == 0.0
+
+
 def test_sphere_model():
     from tests.dummy_data import make_sphere_model
     from core.mesh import mesh_to_numpy

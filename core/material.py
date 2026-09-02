@@ -212,6 +212,9 @@ class MaterialAsset:
     graph_path:    str                    # material graph path (shader type)
     slots:         list = field(default_factory=list)  # list[TextureSlot]
     parameters:    dict = field(default_factory=dict)  # graph-input hash -> raw bytes
+    fur_settings:  tuple = field(default_factory=tuple)
+    fur_layer_count: int = 0
+    fur_lod_reduction: float = 0.0
 
     @property
     def albedo_slot(self) -> Optional['TextureSlot']:
@@ -338,11 +341,38 @@ class MaterialParser:
         slots      = self._parse_texture_slots()
         slots      = self._apply_graph_bindings(graph_path, slots)
         parameters = self._parse_parameters()
+        fur_layer_count, fur_lod_reduction = self._parse_fur_header()
+        fur_settings = self._parse_fur_settings()
         return MaterialAsset(
             graph_path=graph_path,
             slots=slots,
             parameters=parameters,
+            fur_settings=fur_settings,
+            fur_layer_count=fur_layer_count,
+            fur_lod_reduction=fur_lod_reduction,
         )
+
+    def _parse_fur_header(self) -> tuple[int, float]:
+        """Return the authored Fur_LayerCount and Fur_LoDReduction fields."""
+        tagged = self.dat1.sections.get(TAG_FUR_MATERIAL)
+        sec = bytes(tagged) if tagged is not None else None
+        if sec is None or len(sec) < 8:
+            return 0, 0.0
+        try:
+            return struct.unpack_from('<If', sec, 0)
+        except struct.error:
+            return 0, 0.0
+
+    def _parse_fur_settings(self) -> tuple:
+        """Return length, density, offset, gloss, specular, transmittance, wind."""
+        tagged = self.dat1.sections.get(TAG_FUR_MATERIAL)
+        sec = bytes(tagged) if tagged is not None else None
+        if sec is None or len(sec) < 36:
+            return ()
+        try:
+            return struct.unpack_from('<7f', sec, 8)
+        except struct.error:
+            return ()
 
     # ── Private ───────────────────────────────────────────────────────────────
 
@@ -523,11 +553,12 @@ class MaterialParser:
                 if not path or not path.lower().endswith('.texture'):
                     continue
                 path = re.sub(r'/+', '/', path.replace('\\', '/'))
+                role = 'fur_control' if index == 3 else _infer_role(path)
                 slots.append(TextureSlot(
                     index=index,
                     path=path,
                     asset_id_lo=0,
-                    role=_infer_role(path),
+                    role=role,
                 ))
         except Exception as ex:
             print(f"[MaterialParser] fur slot parse error: {ex}")

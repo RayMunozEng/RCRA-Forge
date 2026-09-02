@@ -120,6 +120,7 @@ class AssetLoader(QObject):
     texture_ready   = pyqtSignal(object)        # TextureAsset
     materials_ready = pyqtSignal(dict)          # {mat_idx: {role: (rgba, w, h, tex_name)}}
     materials_finished = pyqtSignal(dict)       # complete decoded material map
+    fur_environment_ready = pyqtSignal(object, bytes, object)
     skel_ready      = pyqtSignal(object)        # Skeleton
     zone_ready      = pyqtSignal(object)        # ZoneDef
     level_ready     = pyqtSignal(object, object)
@@ -133,6 +134,33 @@ class AssetLoader(QObject):
         self.entry      = entry
         self.toc_parser = toc_parser
         self.lookup     = lookup
+
+    def _emit_fur_environment(self, tex_data: dict) -> None:
+        """Load recovered Hair defaults only for models that actually use fur."""
+        has_fur = any(
+            isinstance(slots, dict) and 'fur_control' in slots
+            for slots in (tex_data or {}).values()
+        )
+        if not has_fur:
+            return
+        from core.fur_resources import default_hair_brdf_rg_half
+        from core.texture import TextureParser
+
+        # Captured g_EnvProbeDefault at the verified retail Hair dispatch.
+        probe_entry = self.toc_parser.find_entry(0x8F083136CEB5FB07)
+        if probe_entry is None:
+            print("[AssetLoader] recovered Hair environment is absent from TOC")
+            return
+        probe = TextureParser(
+            self.toc_parser.extract_asset(probe_entry)
+        ).parse()
+        cube_mips = probe.decoded_cube_mips_rgb_half()
+        if not cube_mips:
+            print("[AssetLoader] recovered Hair environment failed BC6 decode")
+            return
+        self.fur_environment_ready.emit(
+            cube_mips, default_hair_brdf_rg_half(), (64, 64),
+        )
 
     def run(self):
         try:
@@ -170,6 +198,7 @@ class AssetLoader(QObject):
                 )
                 if tex_data:
                     self.materials_ready.emit(tex_data)
+                    self._emit_fur_environment(tex_data)
                 self.materials_finished.emit(tex_data)
                 return
 
@@ -183,6 +212,7 @@ class AssetLoader(QObject):
                 )
                 if tex_data:
                     self.materials_ready.emit(tex_data)
+                    self._emit_fur_environment(tex_data)
                 self.materials_finished.emit(tex_data)
 
             elif result.texture is not None:
@@ -754,6 +784,9 @@ class MainWindow(QMainWindow):
         self._asset_loader.materials_ready.connect(self._viewport.load_textures)
         self._asset_loader.materials_ready.connect(self._software_preview.load_textures)
         self._asset_loader.materials_ready.connect(self._on_materials_ready)
+        self._asset_loader.fur_environment_ready.connect(
+            self._viewport.set_fur_environment
+        )
         self._asset_loader.materials_finished.connect(self._on_materials_finished)
         self._asset_loader.skel_ready.connect(self._on_skel_ready)
         self._asset_loader.zone_ready.connect(self._on_zone_ready)

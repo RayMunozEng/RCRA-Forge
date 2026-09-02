@@ -293,25 +293,175 @@ class TextureAsset:
         same format decode as the game instead of routing HDR values through
         a CPU image-preview decoder.
         """
+        mip_chain = self.compressed_mips()
+        if mip_chain:
+            return mip_chain[0][2]
         if not self.is_block_compressed:
             return None
         if self.hd_pixel_data and self.hd_width > 0 and self.hd_height > 0:
+            data, width, height = (
+                self.hd_pixel_data, self.hd_width, self.hd_height,
+            )
+        elif self.pixel_data and self.sd_width > 0 and self.sd_height > 0:
+            data, width, height = self.pixel_data, self.sd_width, self.sd_height
+        else:
+            return None
+        eight_byte_formats = (DXGI_DXT1, DXGI_DXT1S, DXGI_ATI1, DXGI_ATI1S)
+        bytes_per_block = 8 if self.fmt in eight_byte_formats else 16
+        byte_count = (
+            max(1, (width + 3) // 4)
+            * max(1, (height + 3) // 4)
+            * bytes_per_block
+        )
+        return bytes(data[:byte_count]) if len(data) >= byte_count else None
+
+    def compressed_mips(self) -> list[tuple[int, int, bytes]]:
+        """Return the authoritative block-compressed mip chain.
+
+        Each item is ``(width, height, blocks)`` in the on-disk top-to-bottom
+        order used by DDS and by the game's texture upload path.  Returning an
+        empty list rather than a partial chain prevents the viewport from
+        silently mixing authored and driver-generated levels.
+        """
+        if not self.is_block_compressed or self.array_size > 1:
+            return []
+        eight_byte_formats = (DXGI_DXT1, DXGI_DXT1S, DXGI_ATI1, DXGI_ATI1S)
+        bytes_per_block = 8 if self.fmt in eight_byte_formats else 16
+
+        def decode_payload(data: bytes, width: int, height: int,
+                           mip_count: int) -> list[tuple[int, int, bytes]]:
+            levels: list[tuple[int, int, bytes]] = []
+            offset = 0
+            for _level in range(max(1, mip_count)):
+                blocks_w = max(1, (width + 3) // 4)
+                blocks_h = max(1, (height + 3) // 4)
+                byte_count = blocks_w * blocks_h * bytes_per_block
+                end = offset + byte_count
+                if end > len(data):
+                    return []
+                levels.append((width, height, bytes(data[offset:end])))
+                offset = end
+                width = max(1, width // 2)
+                height = max(1, height // 2)
+            return levels
+
+        result: list[tuple[int, int, bytes]] = []
+        if self.hd_pixel_data and self.hd_width > 0 and self.hd_height > 0:
+            result = decode_payload(
+                self.hd_pixel_data, self.hd_width, self.hd_height,
+                self.hd_mips,
+            )
+            if not result:
+                return []
+        if self.pixel_data and self.sd_width > 0 and self.sd_height > 0:
+            sd_levels = decode_payload(
+                self.pixel_data, self.sd_width, self.sd_height, self.sd_mips,
+            )
+            if not sd_levels:
+                return []
+            if not result:
+                result = sd_levels
+            elif (
+                sd_levels[0][0] < result[-1][0]
+                and sd_levels[0][1] < result[-1][1]
+            ):
+                # RCRA streams top HD levels separately and stores the tail in
+                # the SD payload. They are one sampler-visible mip chain.
+                result.extend(sd_levels)
+        return result
+
+    def compressed_cube_mips(self) -> list[list[tuple[int, int, bytes]]]:
+        """Return face-major BC mip chains for a cooked cube texture.
+
+        RCRA marks cube resources with ``planes == 4`` and stores six complete
+        face-major mip chains even though ``array_size`` remains one. This is
+        the layout used by the captured 1024x1024 BC6 environment probe: its
+        payload is exactly ``6 * sum(mip_byte_sizes)``.
+        """
+        if not self.is_block_compressed or self.planes != 4:
+            return []
+        if self.hd_pixel_data and self.hd_width > 0 and self.hd_height > 0:
             data = self.hd_pixel_data
             width, height = self.hd_width, self.hd_height
+            mip_count = max(1, self.hd_mips)
         elif self.pixel_data and self.sd_width > 0 and self.sd_height > 0:
             data = self.pixel_data
             width, height = self.sd_width, self.sd_height
+            mip_count = max(1, self.sd_mips)
         else:
-            return None
-
+            return []
         eight_byte_formats = (DXGI_DXT1, DXGI_DXT1S, DXGI_ATI1, DXGI_ATI1S)
         bytes_per_block = 8 if self.fmt in eight_byte_formats else 16
-        blocks_w = max(1, (width + 3) // 4)
-        blocks_h = max(1, (height + 3) // 4)
-        byte_count = blocks_w * blocks_h * bytes_per_block
-        if len(data) < byte_count:
-            return None
-        return bytes(data[:byte_count])
+        face_stride = 0
+        dimensions = []
+        mip_width, mip_height = width, height
+        for _level in range(mip_count):
+            byte_count = (
+                max(1, (mip_width + 3) // 4)
+                * max(1, (mip_height + 3) // 4)
+                * bytes_per_block
+            )
+            dimensions.append((mip_width, mip_height, byte_count))
+            face_stride += byte_count
+            mip_width = max(1, mip_width // 2)
+            mip_height = max(1, mip_height // 2)
+        if len(data) != face_stride * 6:
+            return []
+        result = []
+        for face in range(6):
+            offset = face * face_stride
+            levels = []
+            for mip_width, mip_height, byte_count in dimensions:
+                levels.append((
+                    mip_width, mip_height,
+                    bytes(data[offset:offset + byte_count]),
+                ))
+                offset += byte_count
+            result.append(levels)
+        return result
+
+    def decoded_cube_mips_rgb_half(
+        self,
+    ) -> list[list[tuple[int, int, bytes]]]:
+        """Decode a BC6 cube to face-major linear RGB16F mip chains.
+
+        This is the portable upload representation for OpenGL bindings that
+        cannot marshal compressed 2D-array data.  It preserves the BC6
+        decoder's linear HDR samples; unlike ``decode_to_rgba``, it performs
+        no preview tone mapping or 8-bit conversion.
+        """
+        if self.fmt not in (DXGI_BC6U, DXGI_BC6S):
+            return []
+        cube_mips = self.compressed_cube_mips()
+        if not cube_mips:
+            return []
+        try:
+            import imagecodecs
+            import numpy as np
+
+            result = []
+            for levels in cube_mips:
+                decoded_levels = []
+                for width, height, blocks in levels:
+                    decoded = imagecodecs.bcn_decode(
+                        blocks, format=6, shape=(height, width, 3),
+                    )
+                    values = np.asarray(decoded, dtype=np.float32)
+                    values = np.nan_to_num(
+                        values, nan=0.0, posinf=65504.0,
+                        neginf=-65504.0 if self.fmt == DXGI_BC6S else 0.0,
+                    )
+                    if self.fmt == DXGI_BC6U:
+                        values = np.maximum(values, 0.0)
+                    decoded_levels.append((
+                        width, height,
+                        values.astype(np.float16).tobytes(),
+                    ))
+                result.append(decoded_levels)
+            return result
+        except Exception as ex:
+            print(f"[texture] cube BC6 decode failed fmt={self.fmt:#x}: {ex}")
+            return []
 
     def to_png_bytes(self) -> Optional[bytes]:
         """Decode the active SD/HD texture payload to PNG via Pillow."""

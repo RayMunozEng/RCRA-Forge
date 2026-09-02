@@ -343,6 +343,14 @@ def load_model_textures(model, entry, toc_parser, lookup, on_texture=None) -> di
                         slot, role_key, mat_idx, mat_name,
                         toc_parser, lookup, mat_result,
                     )
+                    if role_key in mat_result and slot.role == 'fur_control' \
+                            and mat_asset.fur_settings:
+                        payload = mat_result[role_key]
+                        metadata = dict(payload[4]) if len(payload) > 4 else {}
+                        metadata['fur_settings'] = tuple(mat_asset.fur_settings)
+                        metadata['fur_layer_count'] = mat_asset.fur_layer_count
+                        metadata['fur_lod_reduction'] = mat_asset.fur_lod_reduction
+                        mat_result[role_key] = (*payload[:4], metadata)
                     if on_texture is not None and role_key in mat_result:
                         try:
                             on_texture(mat_idx, {role_key: mat_result[role_key]})
@@ -419,16 +427,19 @@ def _decode_slot(slot, role_key: str, mat_idx: int, mat_name: str,
                     pass
 
         texture_metadata = {'dxgi_format': tex.fmt}
-        compressed_mip0 = tex.compressed_mip0()
-        use_native_blocks = tex.fmt in (0x5F, 0x60) or (
-            tex.fmt in (0x4F, 0x50, 0x51)
-            and slot.role.startswith('retail_lava_')
-        )
-        if compressed_mip0 and use_native_blocks:
-            # Preserve HDR BC6H and the lava graph's BC4 SRV semantics.  Other
-            # array textures are decoded to RGBA because a Texture2D upload
-            # cannot represent their complete multi-slice compressed layout.
-            texture_metadata['compressed_mip0'] = compressed_mip0
+        compressed_mips = tex.compressed_mips()
+        native_formats = {
+            0x47, 0x48, 0x4A, 0x4B, 0x4D, 0x4E,
+            0x4F, 0x50, 0x51, 0x53, 0x54,
+            0x5F, 0x60, 0x62, 0x63,
+        }
+        use_native_blocks = tex.fmt in native_formats and tex.array_size <= 1
+        if compressed_mips and use_native_blocks:
+            # Preserve every authored BC mip. Regenerating lower levels from
+            # mip 0 changes seam padding and alpha/coverage profiles used by
+            # the fur shell pass.
+            texture_metadata['compressed_mips'] = compressed_mips
+            texture_metadata['compressed_mip0'] = compressed_mips[0][2]
             rgba = b'compressed'
         else:
             rgba = tex.decode_to_rgba()

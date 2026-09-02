@@ -1,5 +1,7 @@
 import struct
 
+import pytest
+
 from core.asset_loader import _resolve_model_material_names
 from core.hashes import HashLookup
 from core.material import (
@@ -118,11 +120,58 @@ def test_material_parser_reads_shipped_fur_texture_bindings():
     ]
     assert slots[-1].path.endswith("ratchet_head_fur_control.texture")
 
+    settings = parser._parse_fur_settings()
+    assert settings == pytest.approx((0.03, 16.0, 1.0, 1.0, 1.0, 0.1, 0.0))
+    assert parser._parse_fur_header() == pytest.approx((32, 0.0))
+
+
+def test_material_parser_reads_fur_lod_reduction_as_float():
+    section = bytearray(36)
+    struct.pack_into(
+        "<If7f", section, 0, 64, 0.25,
+        0.045, 8.985, 2.769, 2.0, 1.0, 0.2, 0.0,
+    )
+
+    class FakeDat1:
+        sections = {TAG_FUR_MATERIAL: memoryview(section)}
+
+    parser = MaterialParser.__new__(MaterialParser)
+    parser.dat1 = FakeDat1()
+
+    layer_count, lod_reduction = parser._parse_fur_header()
+    assert layer_count == 64
+    assert lod_reduction == pytest.approx(0.25)
+
 
 def test_fur_control_role_is_recognized_before_generic_suffixes():
     assert _infer_role(
         "characters/hero/hero_rivet/textures/hero_rivet_head_fur_control.texture"
     ) == "fur_control"
+
+
+def test_fourth_shipped_fur_binding_is_control_without_control_suffix():
+    paths = [
+        "critter_c.texture",
+        "critter_n.texture",
+        "critter_g.texture",
+        "critter_fur.texture",
+    ]
+    offsets = [0x40, 0x60, 0x80, 0xA0]
+    section = bytearray(52)
+    struct.pack_into("<II7f", section, 0, 64, 0, 0.045, 8.985, 2.769, 2.0, 1.0, 0.2, 0.0)
+    struct.pack_into("<4I", section, 36, *offsets)
+
+    class FakeDat1:
+        sections = {TAG_FUR_MATERIAL: memoryview(section)}
+
+        @staticmethod
+        def get_string(offset):
+            return paths[offsets.index(offset)]
+
+    parser = MaterialParser.__new__(MaterialParser)
+    parser.dat1 = FakeDat1()
+
+    assert parser._parse_texture_slots()[-1].role == "fur_control"
 
 
 def test_hash_reverse_lookup_normalizes_slashes_and_case():

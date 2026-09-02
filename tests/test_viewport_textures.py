@@ -1,3 +1,5 @@
+import hashlib
+
 import numpy as np
 from PyQt6.QtCore import QEvent, QPointF, Qt
 from PyQt6.QtGui import QMouseEvent
@@ -12,7 +14,26 @@ from ui.viewport import (
     NORMAL_ROLES,
     _best_texture_slot,
     _can_draw_fur_strands,
+    _fur_density_from_texture_slot,
+    FUR_SHELL_FRAG_SRC,
+    FUR_SHELL_GEOM_SRC,
+    FUR_SHELL_VERT_SRC,
+    FUR_DENOISE_FRAG,
+    TEMPORAL_ACCUM_FRAG,
+    _fur_header_from_texture_slot,
+    _fur_offset_scale_from_texture_slot,
+    _fur_shading_from_texture_slot,
+    _fur_wind_turbulence_from_texture_slot,
+    _build_fur_layer_volume,
+    _build_fur_layer_mips,
+    _fur_adjusted_shell_depth,
+    _fur_round_nearest_even,
+    _fur_shell_availability,
+    _fur_length_from_texture_slot,
+    _fur_root_lod_factor,
+    _fur_tip_width_factors,
     _is_alpha_cutout_material,
+    _is_authored_wool,
     _is_composite_shell_material,
     _is_fur_material,
     _is_lava_material,
@@ -20,8 +41,10 @@ from ui.viewport import (
     _is_lava_rock_model,
     _is_lavafall_model,
     _is_srgb_texture_role,
+    _temporal_current_sample_offset,
     _lava_flow_sample_offsets,
     _merge_material_textures,
+    _mesh_tangents,
     _postprocess_settings,
     _perspective_clip_planes,
     _resolved_mesh_uvs,
@@ -30,10 +53,20 @@ from ui.viewport import (
     Viewport3D,
 )
 from core.texture import TextureAsset
+from core.fur_resources import default_hair_brdf_rg_half
 
 
 def _slot(width: int, height: int, name: str):
     return (b"rgba", width, height, name)
+
+
+def test_recovered_hair_brdf_lookup_is_exact_and_complete():
+    lookup = default_hair_brdf_rg_half()
+
+    assert len(lookup) == 64 * 64 * 2 * 2
+    assert hashlib.sha256(lookup).hexdigest() == (
+        "4fa9755a296ec4c8c11d19e62598217eedd8625814bb75128c947ca325038672"
+    )
 
 
 def test_bc6h_render_payload_preserves_original_top_mip_blocks():
@@ -55,6 +88,86 @@ def test_bc6h_render_payload_preserves_original_top_mip_blocks():
     )
 
     assert texture.compressed_mip0() == top_mip
+
+
+def test_block_compressed_render_payload_preserves_authored_mips():
+    mip0 = bytes(range(64))
+    mip1 = bytes(range(16))
+    texture = TextureAsset(
+        sd_len=len(mip0) + len(mip1),
+        sd_width=8,
+        sd_height=8,
+        sd_mips=2,
+        hd_len=0,
+        hd_width=0,
+        hd_height=0,
+        hd_mips=0,
+        fmt=0x62,
+        array_size=1,
+        planes=1,
+        pixel_data=mip0 + mip1,
+    )
+
+    assert texture.compressed_mips() == [
+        (8, 8, mip0),
+        (4, 4, mip1),
+    ]
+
+
+def test_block_compressed_render_payload_joins_hd_and_sd_mip_tail():
+    hd_8 = bytes(range(32))
+    hd_4 = bytes(range(8))
+    sd_2 = bytes(range(8, 16))
+    sd_1 = bytes(range(16, 24))
+    texture = TextureAsset(
+        sd_len=len(sd_2) + len(sd_1),
+        sd_width=2,
+        sd_height=2,
+        sd_mips=2,
+        hd_len=len(hd_8) + len(hd_4),
+        hd_width=8,
+        hd_height=8,
+        hd_mips=2,
+        fmt=0x48,
+        array_size=1,
+        planes=1,
+        pixel_data=sd_2 + sd_1,
+        hd_pixel_data=hd_8 + hd_4,
+    )
+
+    assert texture.compressed_mips() == [
+        (8, 8, hd_8),
+        (4, 4, hd_4),
+        (2, 2, sd_2),
+        (1, 1, sd_1),
+    ]
+
+
+def test_bc6_cube_payload_splits_six_face_major_mip_chains():
+    faces = []
+    payload = bytearray()
+    for face in range(6):
+        mip0 = bytes([face]) * 64
+        mip1 = bytes([face + 16]) * 16
+        faces.append([(8, 8, mip0), (4, 4, mip1)])
+        payload.extend(mip0)
+        payload.extend(mip1)
+    texture = TextureAsset(
+        sd_len=len(payload),
+        sd_width=8,
+        sd_height=8,
+        sd_mips=2,
+        hd_len=0,
+        hd_width=0,
+        hd_height=0,
+        hd_mips=0,
+        fmt=0x5F,
+        array_size=1,
+        planes=4,
+        pixel_data=bytes(payload),
+    )
+
+    assert texture.compressed_cube_mips() == faces
 
 
 def test_retail_lava_uses_restrained_isolated_preview_postprocess():
@@ -102,6 +215,171 @@ def test_fur_control_selects_largest_matching_map():
         {"fur_control": authored, "fur_control_4": small},
         FUR_CONTROL_ROLES,
     ) is authored
+
+
+def test_fur_length_uses_authored_material_setting():
+    slot = (*_slot(256, 256, "hero_rivet_head_fur_control"), {
+        "fur_settings": (0.012, 16.0, 0.9, 1.0, 1.0, 0.1, 0.0),
+        "fur_layer_count": 32,
+        "fur_lod_reduction": 0.25,
+    })
+    assert _fur_length_from_texture_slot(slot) == 0.012
+    assert _fur_density_from_texture_slot(slot) == 16.0
+    assert _fur_offset_scale_from_texture_slot(slot) == 0.9
+    assert _fur_shading_from_texture_slot(slot) == (1.0, 1.0, 0.1)
+    assert _fur_wind_turbulence_from_texture_slot(slot) == 0.0
+    assert _fur_header_from_texture_slot(slot) == (32, 0.25)
+    assert _fur_length_from_texture_slot(None) == 0.03
+    assert _fur_density_from_texture_slot(None) == 16.0
+    assert _fur_offset_scale_from_texture_slot(None) == 0.0
+    assert _fur_header_from_texture_slot(None) == (0, 0.0)
+
+
+def test_fur_root_lod_is_stable_and_preserves_a_distant_floor():
+    assert _fur_root_lod_factor(0.0) == 0.25
+    assert _fur_root_lod_factor(1.0) == 0.25
+    assert 0.25 < _fur_root_lod_factor(3.5) < 1.0
+    assert _fur_root_lod_factor(6.0) == 1.0
+    assert _fur_root_lod_factor(100.0) == 1.0
+
+
+def test_fur_ribbon_tapers_to_a_true_zero_width_tip():
+    root_width, root_floor = _fur_tip_width_factors(0.0)
+    middle_width, middle_floor = _fur_tip_width_factors(0.5)
+    tip_width, tip_floor = _fur_tip_width_factors(1.0)
+
+    assert root_width == 1.0
+    assert root_floor == 0.65
+    assert 0.0 < middle_width < root_width
+    assert 0.0 < middle_floor < root_floor
+    assert tip_width == tip_floor == 0.0
+
+
+def test_mesh_tangents_follow_indexed_uv_orientation_and_handedness():
+    positions = np.array([
+        [0.0, 0.0, 0.0], [1.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0], [0.0, 1.0, 0.0],
+    ], dtype=np.float32)
+    normals = np.tile([0.0, 0.0, 1.0], (4, 1)).astype(np.float32)
+    uvs = positions[:, :2].copy()
+    indices = np.array([0, 1, 2, 0, 2, 3], dtype=np.uint16)
+
+    tangents = _mesh_tangents(positions, normals, uvs, indices)
+
+    np.testing.assert_allclose(tangents[:, :3], [[1.0, 0.0, 0.0]] * 4)
+    np.testing.assert_allclose(tangents[:, 3], [1.0] * 4)
+
+
+def test_recovered_fur_shell_budget_culls_front_facing_outer_layers():
+    assert _fur_shell_availability(0.0) == 1.0
+    assert 0.10 <= _fur_shell_availability(1.0) < 0.102
+    assert 0.65 <= _fur_shell_availability(0.5) <= 0.652
+    assert _fur_adjusted_shell_depth(0.05, 1.0) is not None
+    assert _fur_adjusted_shell_depth(0.25, 1.0) is None
+    assert _fur_adjusted_shell_depth(0.75, 0.0) == 0.75
+
+
+def test_recovered_fur_shader_keeps_exact_cull_face_and_hash_terms():
+    assert "aDecodeCorrection * 0.0065" in FUR_SHELL_VERT_SRC
+    assert "2.0 * (1.0 - front) * (1.0 - front)" in FUR_SHELL_VERT_SRC
+    assert "return texelFetch(uFurControl, texel, 0).b;" in FUR_SHELL_VERT_SRC
+    assert "controlLength * uFurLength - 0.0075" in FUR_SHELL_VERT_SRC
+    assert "* 50.0, 0.0, 1.0" in FUR_SHELL_VERT_SRC
+    assert "layerDepth * layerDepth + 0.4 * layerDepth" in FUR_SHELL_VERT_SRC
+    assert "const vec4 RETAIL_WIND_RANDOM[64]" in FUR_SHELL_VERT_SRC
+    assert "uFurWindTurbulence * 20.0 + 10.0" in FUR_SHELL_VERT_SRC
+    assert "uFurWindTurbulence * 100.0 + 50.0" in FUR_SHELL_VERT_SRC
+    assert "fract(noiseTime * 0.0163934) * 61.0" in FUR_SHELL_VERT_SRC
+    assert "uFurWindRadius * 0.1" in FUR_SHELL_VERT_SRC
+    assert "inverse(mat3(uModel)) * windDirection" in FUR_SHELL_VERT_SRC
+    assert "cross(localTangent, localNormal)" in FUR_SHELL_VERT_SRC
+    assert "vsShellVisible[0] == 0" in FUR_SHELL_GEOM_SRC
+    assert "vsShellVisible[1] == 0" in FUR_SHELL_GEOM_SRC
+    assert "vsShellVisible[2] == 0" in FUR_SHELL_GEOM_SRC
+    assert "gl_FrontFacing ? 1.0 : -1.0" in FUR_SHELL_FRAG_SRC
+    assert "shifted / max(uViewportSize, vec2(1.0))" in FUR_SHELL_FRAG_SRC
+    assert "vec2 cell = roundNearestEven(shifted)" in FUR_SHELL_FRAG_SRC
+    assert "wetBase + phase * 0.1" in FUR_SHELL_FRAG_SRC
+    assert "layerUV /= layerUvDivisor(gl_FragCoord.xy, wetness)" in FUR_SHELL_FRAG_SRC
+    assert "0.95 * control.b + 0.05" in FUR_SHELL_FRAG_SRC
+    assert "wetness + 0.005" in FUR_SHELL_FRAG_SRC
+    assert "FurGBuffer = vec4(strandTangent" in FUR_SHELL_FRAG_SRC
+    assert "void recoveredHairBasis(" in FUR_SHELL_FRAG_SRC
+    assert "frameSeed = viewDirection * strandNormalSine" in FUR_SHELL_FRAG_SRC
+    assert "0.9725 - 0.7514 * primaryGloss" in FUR_SHELL_FRAG_SRC
+    assert "0.9725 - 0.07514 * secondaryGloss" in FUR_SHELL_FRAG_SRC
+    assert "strandTangent + 0.075 * (-normal - strandTangent)" in FUR_SHELL_FRAG_SRC
+    assert "sqrt(furResponse) * uFurGlossScale" in FUR_SHELL_FRAG_SRC
+    assert "furResponse * uFurSpecularScale" in FUR_SHELL_FRAG_SRC
+    assert "primaryFresnel * primaryDistribution" in FUR_SHELL_FRAG_SRC
+    assert "8.0 - transmissionPhase * 10.5" in FUR_SHELL_FRAG_SRC
+    assert "transmissionPhase * transmissionPhase * 3.17114" in FUR_SHELL_FRAG_SRC
+    assert "(normalLight + transmittance)" in FUR_SHELL_FRAG_SRC
+    assert "0.5 + 0.5 * grazing * grazing" in FUR_SHELL_FRAG_SRC
+    assert "vec3 sampleD3DCube" in FUR_SHELL_FRAG_SRC
+    assert "5.0 - clamp(averageRoughness" in FUR_SHELL_FRAG_SRC
+    assert "environmentBrdf.x * primaryF0 + environmentBrdf.y" in FUR_SHELL_FRAG_SRC
+    assert "0.35 + key * 0.80 + fill * 0.30" not in FUR_SHELL_FRAG_SRC
+    assert "uFurTransmittanceScale * 0.20" not in FUR_SHELL_FRAG_SRC
+    assert "FurNormalMask = vec4(normal, 1.0)" in FUR_SHELL_FRAG_SRC
+    assert "for (int step = 0; step < 3; ++step)" in FUR_DENOISE_FRAG
+    assert "200.0 / centerDepth" in FUR_DENOISE_FRAG
+    assert "sqrt(max(1.0 - tangentAgreement, 0.0)) * 0.05" in FUR_DENOISE_FRAG
+    assert "rayLength = min(" in FUR_DENOISE_FRAG
+    assert "0.0025" in FUR_DENOISE_FRAG
+    assert "depthScale * 0.015" in TEMPORAL_ACCUM_FRAG
+    assert "1000.0 / depthScale" in TEMPORAL_ACCUM_FRAG
+    assert "100.0 / depthScale" in TEMPORAL_ACCUM_FRAG
+    assert "1.0 / rayDepth - sampleReciprocalDepth" in TEMPORAL_ACCUM_FRAG
+    assert "0.75 * grazing * occlusion" in TEMPORAL_ACCUM_FRAG
+
+
+def test_recovered_fur_rounding_matches_dxbc_round_nearest_even():
+    assert _fur_round_nearest_even(0.49) == 0.0
+    assert _fur_round_nearest_even(0.5) == 0.0
+    assert _fur_round_nearest_even(1.5) == 2.0
+    assert _fur_round_nearest_even(2.5) == 2.0
+    assert _fur_round_nearest_even(-0.5) == 0.0
+    assert _fur_round_nearest_even(-1.5) == -2.0
+    assert _fur_round_nearest_even(-2.5) == -2.0
+
+
+def test_recovered_fur_volume_matches_procedural_shape_and_profile():
+    volume = _build_fur_layer_volume(size=128, slices=32)
+    repeated = _build_fur_layer_volume(size=128, slices=32)
+
+    assert volume.shape == (32, 128, 128)
+    assert volume.dtype == np.uint8
+    assert np.array_equal(volume, repeated)
+    assert 217.0 <= float(volume[0].mean()) <= 219.0
+    assert np.all(np.diff(volume.mean(axis=(1, 2))) <= 1e-6)
+    assert np.count_nonzero(volume[-1]) == 271
+    assert 0.85 < np.corrcoef(
+        volume[0].ravel(), volume[1].ravel(),
+    )[0, 1] < 0.88
+
+
+def test_recovered_fur_mips_use_exact_integer_2x2_averages():
+    volume = np.array([[[0, 1, 2, 3],
+                        [4, 5, 6, 7],
+                        [8, 9, 10, 11],
+                        [12, 13, 14, 15]]], dtype=np.uint8)
+
+    mips = _build_fur_layer_mips(volume, levels=3)
+
+    assert [level.shape for level in mips] == [
+        (1, 4, 4), (1, 2, 2), (1, 1, 1),
+    ]
+    np.testing.assert_array_equal(mips[1], [[[2, 4], [10, 12]]])
+    np.testing.assert_array_equal(mips[2], [[[7]]])
+
+
+def test_recovered_retail_fur_mip_chain_has_stored_dimensions():
+    mips = _build_fur_layer_mips()
+
+    assert [level.shape for level in mips] == [
+        (32, 128, 128), (32, 64, 64), (32, 32, 32), (32, 16, 16),
+    ]
 
 
 def test_geometric_fur_requires_surface_and_control_textures():
@@ -168,6 +446,13 @@ def test_only_color_textures_use_srgb_gpu_decoding():
     assert not _is_srgb_texture_role("effect_mask")
     assert not _is_srgb_texture_role("noise")
     assert not _is_srgb_texture_role("emissive")
+
+
+def test_temporal_current_sample_offset_undoes_projection_jitter():
+    assert np.allclose(
+        _temporal_current_sample_offset((0.25, -0.5), (1000, 500)),
+        (-0.00025, 0.001),
+    )
 
 
 def test_blizar_lava_material_uses_animated_effect_path():
@@ -253,6 +538,12 @@ def test_foliage_card_materials_use_alpha_cutout_rendering():
     assert _is_alpha_cutout_material("sar_plant_tree_large_leaves_01")
     assert _is_alpha_cutout_material("amb_sargasso_platformdino_vines")
     assert not _is_alpha_cutout_material("amb_sargasso_platformdino_body")
+
+
+def test_authored_wool_is_distinct_from_groomed_hero_fur():
+    assert _is_authored_wool(density=3.0, offset_scale=0.0)
+    assert not _is_authored_wool(density=16.0, offset_scale=1.0)
+    assert not _is_authored_wool(density=8.985, offset_scale=2.769)
 
 
 def test_adaptive_clip_planes_contain_a_giant_framed_model():
