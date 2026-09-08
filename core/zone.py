@@ -2,34 +2,29 @@
 core/zone.py
 ZoneDef DAT1 parser for RCRA Forge.
 
-Handles two zone entry formats:
-  GP zones  (gameplay tiles): entry_size=0xB0 (176 bytes), section tag 0x06ABCAB2, no header
-  ART zones (art/geometry):   entry_size variable (0x140=320 confirmed for megalopolis),
-                               section tag 0x06ABCAB2, 32-byte section header.
-                               Entry size derived from TAG_MODEL_INDICES count,
-                               rounded to nearest multiple of 4.
+Handles two zone entry paths:
+  Actors: 32-byte instance records select scene offsets, actor references,
+          instance names/IDs and component ranges.
+  ART models: explicit byte offsets in TAG_MODEL_INDICES point into
+              TAG_SCENE_NODES without a section header. Other node types can
+              occur between models and must not be counted as model records.
 
-Confirmed art zone entry field offsets (320-byte / 0x140 entries):
-  +0x00 (12): [cosθ, 0, sinθ] — row 0 of Y-axis rotation matrix (Y-axis rotation only confirmed)
-  +0x04 (4):  always 0.0 (row 0, element 1)
-  +0x10 (12): world position X, Y, Z (3 × f32)
-  +0x30 (12): bounding box half-extents or scale X, Y, Z (3 × f32) — NOT a second position
-  +0x5C (4):  flags word (0x80000140 typical)
-  +0xF0 (4):  model table index (u32) — direct index into TAG_MODEL_ASSETS u64[].
-              Value 0xFFFFFFFF = sentinel (no model, non-renderable node).
+Retail model node fields (see docs/ENVIRONMENT_PROBES.md for executable anchors):
+  +0x00 (64): row-vector affine matrix, including scale; translation at +0x30
+  +0x5C (4): flags, with node type byte at +0x5F (0 for these models)
+  +0x7C (4): serialized byte size, high bit marks a prebuilt renderer node
+  +0x100 (8): scene instance ID, distinct from the model asset ID
+  +0x110 (2): signed model table index
 
 TAG_MODEL_INDICES: u32[] of byte offsets into scene payload, one per model-bearing entry.
-  Used to determine which entries have models (presence set) and to derive entry count.
-  The actual model index is stored in the entry at +0xF0, NOT derived from list position.
+  Each offset is relative to the beginning of TAG_SCENE_NODES.
 
-TAG_MODEL_ASSETS: u64[] of model asset IDs. Indexed directly by +0xF0 value.
-  Section size = n*8 + optional trailing padding bytes.
+TAG_MODEL_ASSETS: n u64 asset IDs followed by n u32 DAT1 string offsets.
+  The section is exactly 12*n bytes; the string offsets are not asset IDs.
 
-GP zones confirmed field offsets:
-  +0x00 (36): rotation matrix (9 × f32)
-  +0x30 (12): world position X, Y, Z (3 × f32)
-  +0x5C (4):  flags word
-  +0x80 (8):  instance_id (u64)
+Matrices remain zone-local. The owning runtime zone matrix is a separate input.
+Actor instances use section 0x70682CB8; models and actors may coexist in a zone.
+Unindexed scene data (lights, volumes and other types) is not guessed to be actors.
 
 Name/string pool: DAT1-internal, pool_base = 0x10 + section_count*12
 Actor/model paths stored as null-terminated strings in pool.
@@ -39,25 +34,24 @@ import struct
 from dataclasses import dataclass, field
 from typing import Optional
 
+from core.scene_components import SceneComponent, parse_component_records
+
 
 ZONE_DEF_TYPE      = 0x1F390AA0
 
 TAG_SCENE_NODES    = 0x06abcab2   # Scene node placement array (both formats)
-TAG_ENTRY_INDEX    = 0xdc625b3d   # Name/index table (gp zones: 4 bytes/entry; art: 72 bytes)
-TAG_MODEL_INDICES  = 0x6987F172   # Byte offsets (u32[]) into scene payload — one per model-bearing entry.
-                                   # Used to derive entry count and presence set.
-                                   # Model index is stored in entry at +0xF0, NOT from list position.
-TAG_MODEL_ASSETS   = 0xC6A5905E   # Model asset ID table u64[] (art zones only)
-
-GP_ENTRY_SIZE      = 0xB0    # 176 bytes
-ART_ENTRY_SIZE     = 0x140   # 320 bytes
-ART_SECTION_HEADER = 32      # bytes before first entry in art zone scene section
+TAG_ENTRY_INDEX    = 0xdc625b3d   # Actor name offsets (indexed by actor instance records)
+TAG_MODEL_INDICES  = 0x6987F172   # u32 byte offsets into TAG_SCENE_NODES
+TAG_MODEL_ASSETS   = 0xC6A5905E   # u64[n] asset IDs then u32[n] string offsets
+TAG_ACTOR_INSTANCES = 0x70682CB8  # 32-byte records
+TAG_ACTOR_ASSETS = 0x78684035     # u64[n] actor IDs then u32[n] string offsets
+TAG_COMPONENTS = 0x50EDC53D       # 32-byte component records; payload offsets are DAT1-relative
 
 
 @dataclass
 class SceneNodeEntry:
     index:      int
-    asset_id:   int       # instance_id (gp) or 0 (art)
+    asset_id:   int       # actor asset ID, or 0 for a direct model
     model_id:   int       # model asset_id (art) or 0 (gp — resolved via actor)
     name:       str
     x:          float
@@ -66,10 +60,27 @@ class SceneNodeEntry:
     rot:        tuple
     flags:      int
     raw:        bytes = field(repr=False, default=b'')
+    matrix:     tuple = ()  # Retail row-vector 4x4, flat; also glTF column-major
+    instance_id: int = 0    # Actor-record ID, or renderer ID for a direct model
+    scene_offset: int = 0  # Byte offset into TAG_SCENE_NODES
+    node_type: int = 0
+    actor_path: str = ''
+    instance_flags: int = 0
+    instance_reserved: int = 0
+    components: tuple[SceneComponent, ...] = ()  # Zone overrides only, not actor defaults
+    renderer_instance_id: int = 0  # Model-definition +0x100, when node_type == 0
 
     @property
     def position(self):
         return (self.x, self.y, self.z)
+
+    @property
+    def scene_light(self):
+        """Parsed native light data for a type-1 entry, otherwise ``None``."""
+        if self.node_type != 1:
+            return None
+        from core.scene_lights import parse_scene_light_definition
+        return parse_scene_light_definition(self.raw)
 
     def __repr__(self):
         return (f"SceneNodeEntry(index={self.index}, "
@@ -86,6 +97,7 @@ class ZoneDef:
     model_paths: list  = None   # .model paths (art zones — direct model refs)
     model_ids:   list  = None   # model asset_id[] from TAG_MODEL_ASSETS (art zones)
     is_art_zone: bool  = False
+    actor_ids: list = None
 
     @property
     def entry_count(self):
@@ -107,23 +119,6 @@ def _read_string(data: bytes, offset: int) -> str:
         return ''
 
 
-def _read_all_strings(pool: bytes) -> list:
-    strings = []
-    i = 0
-    while i < len(pool):
-        end = pool.find(b'\x00', i)
-        if end == -1:
-            end = len(pool)
-        try:
-            text = pool[i:end].decode('utf-8', errors='replace').strip()
-            if text:
-                strings.append(text)
-        except Exception:
-            pass
-        i = end + 1
-    return strings
-
-
 class ZoneParser:
     def __init__(self, data: bytes, lookup=None):
         self._data   = data
@@ -137,151 +132,119 @@ class ZoneParser:
             raise ValueError(f"No DAT1 in zone {name!r}")
 
         section_count, unknown_count = struct.unpack_from('<HH', data, dat1_off + 12)
-        pool_rel  = 0x10 + section_count * 12 + unknown_count * 8
-        pool_abs  = dat1_off + pool_rel
-
         sections  = {}
-        first_off = None
         for i in range(section_count):
             base = dat1_off + 0x10 + i * 12
             tag, sec_off, sec_size = struct.unpack_from('<III', data, base)
             abs_off = dat1_off + sec_off
+            if abs_off + sec_size > len(data):
+                raise ValueError(f'Truncated zone section {tag:08X}')
             sections[tag] = data[abs_off:abs_off + sec_size]
-            if first_off is None or sec_off < first_off:
-                first_off = sec_off
-
-        pool_end    = dat1_off + first_off if first_off else pool_abs
-        string_pool = data[pool_abs:pool_end] if pool_abs < pool_end else b''
-
         # Determine zone type from available sections
         is_art = TAG_MODEL_INDICES in sections or TAG_MODEL_ASSETS in sections
 
-        # Extract actor paths (gp zones) and model paths (art zones)
-        all_strings   = _read_all_strings(string_pool) if string_pool else []
-        actor_paths   = [s.replace('\\', '/').lower() for s in all_strings
-                         if s.lower().endswith('.actor')]
-        model_paths   = [s.replace('\\', '/').lower() for s in all_strings
-                         if s.lower().endswith('.model')]
+        def read_references(tag, label):
+            refs = sections.get(tag, b'')
+            if len(refs) % 12:
+                raise ValueError(f'Malformed zone {label} reference table: expected 12*n bytes')
+            count = len(refs) // 12
+            ids = list(struct.unpack_from(f'<{count}Q', refs))
+            paths = [_read_string(data, dat1_off + offset)
+                     for offset in struct.unpack_from(f'<{count}I', refs, count*8)]
+            return ids, paths
 
-        # Parse model asset IDs from art zone table
-        model_ids = []
-        if TAG_MODEL_ASSETS in sections:
-            ma_data = sections[TAG_MODEL_ASSETS]
-            n_ids   = len(ma_data) // 8
-            model_ids = [struct.unpack_from('<Q', ma_data, i*8)[0] for i in range(n_ids)]
+        model_ids, model_paths = read_references(TAG_MODEL_ASSETS, 'model')
+        actor_ids, actor_paths = read_references(TAG_ACTOR_ASSETS, 'actor')
+        components = parse_component_records(data[dat1_off:], sections.get(TAG_COMPONENTS, b''))
 
         # Parse scene nodes
         entries = []
-        if TAG_SCENE_NODES in sections:
-            scene_data   = sections[TAG_SCENE_NODES]
-            index_data   = sections.get(TAG_ENTRY_INDEX, b'')
-            mi_data      = sections.get(TAG_MODEL_INDICES, b'')
-            entries = self._parse_nodes(scene_data, data, dat1_off,
-                                        index_data, mi_data, model_ids, is_art)
+        scene_data = sections.get(TAG_SCENE_NODES, b'')
+        entries = self._parse_model_nodes(scene_data, sections.get(TAG_MODEL_INDICES, b''),
+                                          model_ids, model_paths)
+        actors = self._parse_actor_nodes(
+            scene_data, sections.get(TAG_ACTOR_INSTANCES, b''),
+            sections.get(TAG_ENTRY_INDEX, b''), actor_ids, actor_paths,
+            components, data, dat1_off)
+        for entry in actors:
+            entry.index += len(entries)
+        entries.extend(actors)
 
         return ZoneDef(
             asset_id=asset_id, name=name, entries=entries,
             actor_paths=actor_paths, model_paths=model_paths,
-            model_ids=model_ids, is_art_zone=is_art,
+            model_ids=model_ids, is_art_zone=is_art, actor_ids=actor_ids,
         )
 
-    def _parse_nodes(self, scene_data, full_data, dat1_off,
-                     index_data, mi_data, model_ids, is_art):
-        header  = ART_SECTION_HEADER if is_art else 0
-        payload = scene_data[header:]
-
-        if is_art:
-            # Derive true entry size from model_indices count.
-            # TAG_MODEL_INDICES has exactly one u32 per scene node, so:
-            #   entry_size = payload_size / model_indices_count
-            # Round to nearest multiple of 4 to handle integer division imprecision
-            # (e.g. 2212736 / 6889 = 321.2 → rounds to 320 = 0x140).
-            if mi_data:
-                mi_count   = len(mi_data) // 4
-                raw_size   = len(payload) / mi_count if mi_count > 0 else ART_ENTRY_SIZE
-                entry_size = int(round(raw_size / 4)) * 4
-            else:
-                entry_size = ART_ENTRY_SIZE
-            print(f"[zone] art zone entry_size={entry_size:#x} "
-                  f"payload={len(payload)} model_indices={len(mi_data)//4 if mi_data else 0}")
-        else:
-            entry_size = GP_ENTRY_SIZE
-
-        n = len(payload) // entry_size
-
-        # Name offsets from index section
-        name_offsets = []
-        if is_art:
-            # Art zones: index section may be 72 bytes of other data
-            # Use string pool positions based on sequential model paths
-            name_offsets = [0] * n
-        else:
-            # GP zones: 4 bytes per entry = pool offset
-            for i in range(n):
-                if i * 4 + 4 <= len(index_data):
-                    name_offsets.append(struct.unpack_from('<I', index_data, i*4)[0])
-                else:
-                    name_offsets.append(0)
-
-        # TAG_MODEL_INDICES: byte offsets marking model-bearing entries (presence set).
-        # Build as a set for O(1) lookup — used only to gate the +0xF0 read.
-        model_bearing_offsets = set()
-        if is_art and mi_data:
-            for k in range(len(mi_data) // 4):
-                model_bearing_offsets.add(struct.unpack_from('<I', mi_data, k * 4)[0])
-
+    def _parse_model_nodes(self, scene_data, offsets, model_ids, model_paths):
+        if len(offsets) % 4:
+            raise ValueError('Malformed zone model offsets: expected u32 entries')
         entries = []
-        for i in range(n):
-            base = i * entry_size
-            raw  = payload[base:base + entry_size]
-            if len(raw) < entry_size:
-                break
-
-            if is_art:
-                # Confirmed field offsets (320-byte art zone entries):
-                #   +0x00 (12): [cosθ, 0, sinθ] — row 0 of Y-axis rotation matrix
-                #   +0x10 (12): world position X, Y, Z (3 × f32)
-                #   +0x5C (4):  flags word
-                #   +0xF0 (4):  model table index (u32) → indexes model_ids[].
-                #               0xFFFFFFFF = sentinel (no model).
-                rot      = struct.unpack_from('<9f', raw, 0x00)
-                x, y, z  = struct.unpack_from('<3f', raw, 0x10)
-                flags    = struct.unpack_from('<I',  raw, 0x5C)[0] if entry_size > 0x5C else 0
-                asset_id = 0
-                model_id = 0
-                if base in model_bearing_offsets and entry_size >= 0xF4:
-                    mi = struct.unpack_from('<I', raw, 0xF0)[0]
-                    if mi < len(model_ids):
-                        model_id = model_ids[mi]
-            else:
-                # GP zone confirmed field offsets:
-                #   +0x00 (36): rotation matrix (9 × f32)
-                #   +0x2C (4):  padding
-                #   +0x30 (12): world position X, Y, Z (3 × f32)
-                #   +0x5C (4):  flags
-                #   +0x80 (8):  instance_id (u64)
-                rot      = struct.unpack_from('<9f', raw, 0x00)
-                x, y, z  = struct.unpack_from('<3f', raw, 0x30)
-                flags    = struct.unpack_from('<I',  raw, 0x5C)[0]
-                asset_id = struct.unpack_from('<Q',  raw, 0x80)[0] if len(raw) >= 0x88 else 0
-                model_id = 0
-
-            # Name lookup
-            if is_art:
-                if model_id and self._lookup:
-                    full = self._lookup.name(model_id)
-                    name = full.split('/')[-1].replace('.model', '') if full else f'node_{i}'
-                else:
-                    name = f'node_{i}'
-            else:
-                name_off = name_offsets[i] if i < len(name_offsets) else 0
-                name = _read_string(full_data, dat1_off + name_off)
-
+        for index, (offset,) in enumerate(struct.iter_unpack('<I', offsets)):
+            if offset + 0x112 > len(scene_data):
+                raise ValueError(f'Truncated model node at scene byte {offset}')
+            if scene_data[offset + 0x5F] != 0:
+                raise ValueError(f'Model offset {offset} points to a different scene node type')
+            size = struct.unpack_from('<I', scene_data, offset + 0x7C)[0] & 0x7FFFFFFF
+            if size < 0x112 or offset + size > len(scene_data):
+                raise ValueError(f'Invalid model node size {size} at scene byte {offset}')
+            model_index = struct.unpack_from('<h', scene_data, offset + 0x110)[0]
+            if not 0 <= model_index < len(model_ids):
+                raise ValueError(f'Invalid model table index {model_index} at scene byte {offset}')
+            raw = scene_data[offset:offset + size]
+            matrix = struct.unpack_from('<16f', raw)
+            model_id = model_ids[model_index]
+            path = model_paths[model_index]
+            if not path and self._lookup:
+                path = self._lookup.name(model_id)
+            name = path.replace('\\', '/').rsplit('/', 1)[-1] if path else f'node_{index}'
             entries.append(SceneNodeEntry(
-                index=i, asset_id=asset_id, model_id=model_id,
-                name=name, x=x, y=y, z=z, rot=rot, flags=flags, raw=raw,
+                index=index, asset_id=0, model_id=model_id,
+                name=name.removesuffix('.model'),
+                x=matrix[12], y=matrix[13], z=matrix[14],
+                rot=matrix[0:3] + matrix[4:7] + matrix[8:11],
+                flags=struct.unpack_from('<I', raw, 0x5C)[0], raw=raw, matrix=matrix,
+                instance_id=struct.unpack_from('<Q', raw, 0x100)[0], scene_offset=offset,
+                renderer_instance_id=struct.unpack_from('<Q', raw, 0x100)[0],
             ))
+        return entries
 
+    def _parse_actor_nodes(self, scene, records, names, actor_ids, actor_paths,
+                           components, full_data, dat1_off):
+        if len(records) % 32 or len(names) % 4:
+            raise ValueError('Malformed actor instance/name table')
+        name_offsets = struct.unpack(f'<{len(names)//4}I', names)
+        entries = []
+        for index, record in enumerate(struct.iter_unpack('<iiIiIHHQ', records)):
+            name_index, actor_index, offset, start, count, flags, reserved, instance_id = record
+            if not 0 <= actor_index < len(actor_ids):
+                raise ValueError(f'Invalid actor asset index {actor_index} in instance {index}')
+            if name_index >= len(name_offsets):
+                raise ValueError(f'Invalid actor name index {name_index} in instance {index}')
+            if count and (start < 0 or start + count > len(components)):
+                raise ValueError(f'Invalid component range in actor instance {index}')
+            if offset + 0x80 > len(scene):
+                raise ValueError(f'Truncated actor scene definition at byte {offset}')
+            size = struct.unpack_from('<I', scene, offset + 0x7C)[0] & 0x7FFFFFFF
+            if size < 0x80 or offset + size > len(scene):
+                raise ValueError(f'Invalid actor scene size {size} at byte {offset}')
+            raw = scene[offset:offset + size]
+            matrix = struct.unpack_from('<16f', raw)
+            node_type = raw[0x5F]
+            if node_type == 0 and size < 0x108:
+                raise ValueError(f'Truncated actor model definition at byte {offset}')
+            name = (_read_string(full_data, dat1_off + name_offsets[name_index])
+                    if name_index >= 0 else '')
+            entries.append(SceneNodeEntry(
+                index=index, asset_id=actor_ids[actor_index], model_id=0, name=name,
+                x=matrix[12], y=matrix[13], z=matrix[14],
+                rot=matrix[:3] + matrix[4:7] + matrix[8:11],
+                flags=struct.unpack_from('<I', raw, 0x5C)[0], raw=raw, matrix=matrix,
+                instance_id=instance_id, scene_offset=offset, node_type=node_type,
+                actor_path=actor_paths[actor_index], instance_flags=flags,
+                instance_reserved=reserved, components=tuple(components[start:start+count]) if count else (),
+                renderer_instance_id=struct.unpack_from('<Q', raw, 0x100)[0] if node_type == 0 else 0,
+            ))
         return entries
 
 

@@ -10,6 +10,7 @@ supports arcball camera navigation.
 import math
 import re
 import time
+from pathlib import Path
 import numpy as np
 from typing import Optional
 
@@ -17,12 +18,24 @@ from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from PyQt6.QtCore import Qt, QPoint
 from PyQt6.QtGui import QMouseEvent, QWheelEvent
 
+from core.cube_texture import validate_cube_mips
+from core.hair_temporal import (
+    TEMPORAL_ACC_ALPHA_MOTION_THRESHOLD,
+    TEMPORAL_DISOCCLUSION_CAPTURE_DEPTH_BASE,
+    TEMPORAL_DISOCCLUSION_CAPTURE_DEPTH_SLOPE,
+    TEMPORAL_DISOCCLUSION_CAPTURE_MOTION_THRESHOLD,
+    temporal_apply_misc,
+    temporal_disocclusion_camera_scale,
+    temporal_dither_constants,
+)
 from ui.camera_controls import AUTODESK_CONTROL_TOOLTIP, autodesk_mouse_mode
 from ui.controls_dialog import load_controls
 
 try:
     from OpenGL.GL import *
     from OpenGL.GL.shaders import compileShader, compileProgram
+    from OpenGL.raw.GL.VERSION.GL_1_1 import glTexImage2D as _raw_tex_image_2d
+    from OpenGL.raw.GL.VERSION.GL_1_3 import glCompressedTexImage2D as _raw_compressed_tex_image_2d
     _HAS_OPENGL = True
 except ImportError:
     _HAS_OPENGL = False
@@ -52,6 +65,32 @@ RETAIL_LAVA_MASK_A_ROLES = ('retail_lava_mask_a',)
 RETAIL_LAVA_MASK_B_ROLES = ('retail_lava_mask_b',)
 
 
+def _supports_native_raster(
+    version: tuple[int, int], extensions,
+) -> bool:
+    """Return whether one context can provide the recovered raster contract."""
+    major, minor = (int(version[0]), int(version[1]))
+    extension_names = {
+        item.encode('ascii') if isinstance(item, str) else bytes(item)
+        for item in extensions
+    }
+    return (major, minor) >= (4, 5) or b'GL_ARB_clip_control' in extension_names
+
+
+def _shader_with_raster_mode(source: str, native_upper_left: bool) -> str:
+    """Inject the viewport raster convention immediately after ``#version``."""
+    if not native_upper_left:
+        return source
+    version = re.search(r'(?m)^#version[^\r\n]*(?:\r?\n|$)', source)
+    if version is None:
+        raise ValueError('viewport shader source is missing #version')
+    return (
+        source[:version.end()]
+        + '#define RCRA_NATIVE_UPPER_LEFT 1\n'
+        + source[version.end():]
+    )
+
+
 def _postprocess_settings(has_retail_lava: bool) -> tuple[float, float]:
     """Return isolated-view exposure and bloom strength."""
     if has_retail_lava:
@@ -63,13 +102,18 @@ def _postprocess_settings(has_retail_lava: bool) -> tuple[float, float]:
 
 
 def _compressed_gl_format(dxgi_format: int, srgb: bool = False):
-    """Map supported DXGI block formats to their identical OpenGL formats."""
+    """Preserve explicit DXGI sRGB formats, including packed response maps.
+
+    The role hint may promote untagged color textures; it must not demote an
+    authored sRGB format. BC7 already observes this rule. Sheep uses BC1 sRGB
+    for gloss/specular, so losing the tag changes the recovered hair response.
+    """
     if dxgi_format in (0x47, 0x48):
-        return 0x8C4D if srgb else 0x83F1  # sRGB/RGBA S3TC DXT1
+        return 0x8C4D if srgb or dxgi_format == 0x48 else 0x83F1  # sRGB/RGBA S3TC DXT1
     if dxgi_format in (0x4A, 0x4B):
-        return 0x8C4E if srgb else 0x83F2  # sRGB/RGBA S3TC DXT3
+        return 0x8C4E if srgb or dxgi_format == 0x4B else 0x83F2  # sRGB/RGBA S3TC DXT3
     if dxgi_format in (0x4D, 0x4E):
-        return 0x8C4F if srgb else 0x83F3  # sRGB/RGBA S3TC DXT5
+        return 0x8C4F if srgb or dxgi_format == 0x4E else 0x83F3  # sRGB/RGBA S3TC DXT5
     return {
         0x4F: GL_COMPRESSED_RED_RGTC1,
         0x50: GL_COMPRESSED_RED_RGTC1,
@@ -271,17 +315,6 @@ def _fur_shell_availability(normal_dot_view: float,
     return min(2.0 * (1.0 - front) ** 2 + 0.1, 1.0)
 
 
-def _fur_round_nearest_even(value: float) -> float:
-    """Match DXBC ``round_ni`` including half-way ties to even."""
-    base = math.floor(float(value))
-    fraction = float(value) - base
-    if fraction < 0.5:
-        return float(base)
-    if fraction > 0.5:
-        return float(base + 1)
-    return float(base if base % 2 == 0 else base + 1)
-
-
 def _fur_adjusted_shell_depth(raw_depth: float, normal_dot_view: float,
                               decode_correction: float = 0.0
                               ) -> Optional[float]:
@@ -324,16 +357,29 @@ def _build_fur_layer_volume(size: int = 128, slices: int = 32,
         return value
 
     height_scale = np.float32(slices) * np.float32(2.0 ** -48)
+    profiles = []
+    for height in range(1, slices + 1):
+        # TextureDefaultsInit computes a float32 reciprocal once, then doubles
+        # each layer index before multiplying. Division or Python float math
+        # changes coverage 203 to 204 for layer 20 of a 28-layer strand.
+        inverse_height = np.float32(1.0) / np.float32(height)
+        layer = np.arange(1, height + 1, dtype=np.float32)
+        profile = np.maximum(
+            (layer + layer) * inverse_height - np.float32(1.0),
+            np.float32(0.0),
+        )
+        coverage = np.clip(
+            np.float32(1.0) - (profile * profile) * np.float32(0.8),
+            np.float32(0.0), np.float32(1.0),
+        )
+        profiles.append((coverage * np.float32(255.0)).astype(np.uint8))
     result = np.zeros((slices, size, size), dtype=np.uint8)
     for y in range(size):
         for x in range(size):
             random24 = np.float32(xorshift128() >> 8)
             height = int(np.float32(random24 * random24) * height_scale) + 1
             height = min(height, slices)
-            for layer in range(height):
-                profile = max(2.0 * (layer + 1) / height - 1.0, 0.0)
-                value = min(max(1.0 - 0.8 * profile * profile, 0.0), 1.0)
-                result[layer, x, y] = int(value * 255.0)
+            result[:height, x, y] = profiles[height - 1]
     return result
 
 
@@ -509,29 +555,35 @@ layout(location=0) in vec3 aPos;
 layout(location=1) in vec3 aNormal;
 layout(location=2) in vec2 aUV;
 layout(location=3) in vec4 aTangent;
+layout(location=5) in vec3 aPreviousPos;
 
 uniform mat4 uMVP;
+uniform mat4 uPreviousMVP;
 uniform mat4 uModel;
 uniform mat3 uNormal;
 
 out vec3 vNormal;
 out vec3 vWorldPos;
 out vec2 vUV;
+out vec4 vPreviousClip;
 
 void main() {
     vec4 worldPos = uModel * vec4(aPos, 1.0);
     vWorldPos  = worldPos.xyz;
     vNormal    = normalize(uNormal * aNormal);
     vUV        = aUV;
+    vPreviousClip = uPreviousMVP * vec4(aPreviousPos, 1.0);
     gl_Position = uMVP * vec4(aPos, 1.0);
 }
 """
 
 FRAG_SRC = """
 #version 330 core
+#extension GL_ARB_gpu_shader5 : enable
 in vec3 vNormal;
 in vec3 vWorldPos;
 in vec2 vUV;
+in vec4 vPreviousClip;
 
 uniform vec3      uLightDir;
 uniform vec3      uFillDir;
@@ -565,10 +617,14 @@ uniform sampler2D uRetailLavaMaskB;
 uniform sampler2D uFurControlMap;
 uniform vec2      uLavaFlowA;
 uniform vec2      uLavaFlowB;
+uniform vec2      uViewportSize;
+uniform float     uMotionNearPlane;
 
 layout(location = 0) out vec4 FragColor;
 layout(location = 1) out vec4 BrightColor;
-layout(location = 2) out vec4 SceneReciprocalDepth;
+layout(location = 2) out vec4 SceneLinearDepth;
+layout(location = 3) out vec2 SceneVelocity;
+layout(location = 4) out uint SceneStencil;
 
 // Simple normal perturbation — offsets vertex normal by normal map XY.
 // More stable than full cotangent TBN at large world scales.
@@ -594,10 +650,32 @@ vec3 perturb_normal_xy(vec3 N, vec2 normalXY) {
 }
 
 void main() {
+    vec2 nativePixel = gl_FragCoord.xy;
+#ifndef RCRA_NATIVE_UPPER_LEFT
+    nativePixel.y = uViewportSize.y - nativePixel.y;
+#endif
+    float inversePrevious = 1.0 / max(vPreviousClip.w, uMotionNearPlane);
+#ifdef GL_ARB_gpu_shader5
+    precise vec2 currentUV = nativePixel / max(uViewportSize, vec2(1.0));
+    precise vec2 currentCentered = currentUV - 0.5;
+    precise vec2 previousHalf = vPreviousClip.xy * 0.5;
+    precise vec2 opaqueMotion = fma(
+        vec2(-1.0, 1.0) * previousHalf,
+        vec2(inversePrevious), currentCentered
+    );
+    SceneVelocity = opaqueMotion * uViewportSize;
+#else
+    vec2 currentCentered = nativePixel / max(uViewportSize, vec2(1.0)) - 0.5;
+    SceneVelocity = (
+        currentCentered
+        + vec2(-1.0, 1.0) * (vPreviousClip.xy * 0.5) * inversePrevious
+    ) * uViewportSize;
+#endif
+    SceneStencil = 0u;
     if (uWireframe) {
         FragColor = vec4(0.2, 0.8, 1.0, 1.0);
         BrightColor = vec4(0.0);
-        SceneReciprocalDepth = vec4(gl_FragCoord.w);
+        SceneLinearDepth = vec4(0.0, 0.0, 0.0, 1.0 / gl_FragCoord.w);
         return;
     }
 
@@ -790,7 +868,7 @@ void main() {
         float bloomWeight = smoothstep(0.82, 1.45, luminance);
         BrightColor = vec4(col * bloomWeight, 1.0);
     }
-    SceneReciprocalDepth = vec4(gl_FragCoord.w);
+    SceneLinearDepth = vec4(0.0, 0.0, 0.0, 1.0 / gl_FragCoord.w);
 }
 """
 
@@ -1078,6 +1156,16 @@ void main() {
         float depthBias = max(fwidth(gl_FragCoord.z) * 2.0, 0.00002);
         float occlusion = 0.0;
         float sampleDepth = texture(uSceneDepth, screenUV + texelStep * 1.5).r;
+#ifdef RCRA_NATIVE_UPPER_LEFT
+        occlusion += sampleDepth > 0.0001
+            && sampleDepth - depthBias > gl_FragCoord.z ? 0.50 : 0.0;
+        sampleDepth = texture(uSceneDepth, screenUV + texelStep * 3.0).r;
+        occlusion += sampleDepth > 0.0001
+            && sampleDepth - depthBias > gl_FragCoord.z ? 0.30 : 0.0;
+        sampleDepth = texture(uSceneDepth, screenUV + texelStep * 5.0).r;
+        occlusion += sampleDepth > 0.0001
+            && sampleDepth - depthBias > gl_FragCoord.z ? 0.20 : 0.0;
+#else
         occlusion += sampleDepth < 0.9999
             && sampleDepth + depthBias < gl_FragCoord.z ? 0.50 : 0.0;
         sampleDepth = texture(uSceneDepth, screenUV + texelStep * 3.0).r;
@@ -1086,11 +1174,16 @@ void main() {
         sampleDepth = texture(uSceneDepth, screenUV + texelStep * 5.0).r;
         occlusion += sampleDepth < 0.9999
             && sampleDepth + depthBias < gl_FragCoord.z ? 0.20 : 0.0;
+#endif
         float strandContact = 1.0 - smoothstep(0.12, 0.82, gAlong);
         color *= 1.0 - occlusion * strandContact * 0.18;
     }
     if (uWeightedOIT) {
+#ifdef RCRA_NATIVE_UPPER_LEFT
+        float depthWeight = pow(0.1 + gl_FragCoord.z * 0.90, 3.0);
+#else
         float depthWeight = pow(1.0 - gl_FragCoord.z * 0.90, 3.0);
+#endif
         float weight = clamp(alpha * 8.0 * depthWeight, 0.01, 3.0);
         FurColor = vec4(color * alpha, alpha) * weight;
         FurReveal = vec4(alpha);
@@ -1117,8 +1210,13 @@ vec3 unproject(float x, float y, float z, mat4 invVP) {
 
 void main() {
     gl_Position = vec4(aPos, 1.0);
+#ifdef RCRA_NATIVE_UPPER_LEFT
+    vNear = unproject(aPos.x, aPos.y, 1.0, uInvVP);
+    vFar  = unproject(aPos.x, aPos.y, 0.0, uInvVP);
+#else
     vNear = unproject(aPos.x, aPos.y, -1.0, uInvVP);
     vFar  = unproject(aPos.x, aPos.y,  1.0, uInvVP);
+#endif
 }
 """
 
@@ -1189,8 +1287,10 @@ layout(location = 1) in vec3 aNormal;
 layout(location = 2) in vec2 aUV;
 layout(location = 3) in vec4 aTangent;
 layout(location = 4) in float aDecodeCorrection;
+layout(location = 5) in vec3 aPreviousPos;
 
 uniform mat4 uMVP;
+uniform mat4 uPreviousMVP;
 uniform mat4 uModel;
 uniform mat3 uNormal;
 uniform sampler2D uFurControl;
@@ -1199,6 +1299,7 @@ uniform float uFurOffsetScale;
 uniform float uFurWindStrength;
 uniform vec3 uFurWindVector;
 uniform float uFurWindTime;
+uniform float uPreviousFurWindTime;
 uniform float uFurWindObjectPhase;
 uniform float uFurWindRadius;
 uniform float uFurWindTurbulence;
@@ -1215,6 +1316,7 @@ out float vsCurvedOffset;
 flat out int vsBaseShell;
 flat out int vsShellVisible;
 out vec4 vsWorldTangent;
+out vec4 vsPreviousClip;
 
 // Exact g_RandomVecs.v table embedded by the captured retail wind VS.
 const vec4 RETAIL_WIND_RANDOM[64] = vec4[64](
@@ -1284,7 +1386,7 @@ const vec4 RETAIL_WIND_RANDOM[64] = vec4[64](
     vec4(0.311328, 0.108150, 0.746691, 0.444973)
 );
 
-vec3 retailWindOffset(vec2 uv, vec3 localWind) {
+vec3 retailWindOffset(vec2 uv, vec3 localWind, float windTime) {
     float lowFrequency = uFurWindTurbulence * 20.0 + 10.0;
     float highFrequency = uFurWindTurbulence * 100.0 + 50.0;
     float spatial = sin(lowFrequency * uv.x) + sin(lowFrequency * uv.y)
@@ -1297,14 +1399,15 @@ vec3 retailWindOffset(vec2 uv, vec3 localWind) {
     float smoothRamp = ramp * ramp * (3.0 - 2.0 * ramp);
     float wave = (
         (1.0 - smoothRamp) * envelope + smoothRamp + 1.0
-    ) * sin((envelope + fract(uFurWindTime * 0.159155)) * 6.28319) - 1.0;
+    ) * sin((envelope + fract(windTime * 0.15915493667125702))
+            * 6.2831854820251465) - 1.0;
     float directionalCap = min(
         smoothRamp * (envelope * 0.0125 + 0.0375),
         uFurWindRadius * 0.1
     );
 
     float speed = uFurWindTurbulence * 10.0 + 5.0;
-    float noiseTime = (uFurWindTime + 0.125 + spatial * 0.125) * speed;
+    float noiseTime = (windTime + 0.125 + spatial * 0.125) * speed;
     float f = fract(noiseTime);
     float f2 = f * f;
     float f3 = f2 * f;
@@ -1314,7 +1417,7 @@ vec3 retailWindOffset(vec2 uv, vec3 localWind) {
         f + f2 - f3,
         -f2 + f3
     );
-    int tableIndex = int(fract(noiseTime * 0.0163934) * 61.0);
+    int tableIndex = int(fract(noiseTime * 0.016393441706895828) * 61.0);
     vec3 randomVector = RETAIL_WIND_RANDOM[tableIndex].xyz * weights.x
         + RETAIL_WIND_RANDOM[tableIndex + 1].xyz * weights.y
         + RETAIL_WIND_RANDOM[tableIndex + 2].xyz * weights.z
@@ -1355,17 +1458,18 @@ void main() {
     float layerDepth = clamp(unboundedDepth, 0.0, 1.0);
     float controlLength = pointWrappedControlLength(aUV);
     vec3 shellLocalNormal = localNormal;
+    vec3 previousShellLocalNormal = localNormal;
     if (uFurWindStrength > 0.0 && uFurLength > 0.0) {
-        float windLength = length(uFurWindVector);
-        vec3 windDirection = windLength > 0.000001
-            ? uFurWindVector / windLength : vec3(0.0);
-        vec3 localWind = inverse(mat3(uModel)) * windDirection;
-        vec3 windOffset = retailWindOffset(aUV, localWind);
+        vec3 localWind = inverse(mat3(uModel)) * uFurWindVector;
+        vec3 windOffset = retailWindOffset(aUV, localWind, uFurWindTime);
+        vec3 previousWindOffset = retailWindOffset(
+            aUV, localWind, uPreviousFurWindTime
+        );
         // The retail shader projects the procedural displacement onto its
-        // normal/bitangent plane before curving the shell frame.
+        // tangent/bitangent plane before curving the shell frame.
         vec3 localBitangent = normalize(cross(localTangent, localNormal))
             * aTangent.w;
-        vec3 frameOffset = localNormal * dot(localNormal, windOffset)
+        vec3 frameOffset = localTangent * dot(localTangent, windOffset)
             + localBitangent * dot(localBitangent, windOffset);
         float windGate = clamp(
             (controlLength * uFurLength - 0.0075) * 50.0, 0.0, 1.0
@@ -1373,10 +1477,20 @@ void main() {
         float bendCurve = layerDepth * layerDepth + 0.4 * layerDepth;
         vec3 bend = frameOffset * windGate * bendCurve
             / max(uFurLength, 0.000001);
+        vec3 previousFrameOffset = localTangent
+            * dot(localTangent, previousWindOffset)
+            + localBitangent * dot(localBitangent, previousWindOffset);
+        vec3 previousBend = previousFrameOffset * windGate * bendCurve
+            / max(uFurLength, 0.000001);
         shellLocalNormal = normalize(localNormal + bend);
-        worldTangent = normalize(uNormal * (localTangent + bend));
+        previousShellLocalNormal = normalize(localNormal + previousBend);
+        // The captured VS preserves the bent tangent's magnitude. Normalize
+        // after raster interpolation in the material pass.
+        worldTangent = uNormal * (localTangent + bend);
     }
     vec3 localPosition = aPos + shellLocalNormal
+        * (uFurLength * controlLength * layerDepth);
+    vec3 previousLocalPosition = aPreviousPos + previousShellLocalNormal
         * (uFurLength * controlLength * layerDepth);
     vec3 worldPosition = (uModel * vec4(localPosition, 1.0)).xyz;
     vsUV = aUV;
@@ -1388,8 +1502,9 @@ void main() {
         * uFurLength * uFurOffsetScale;
     vsBaseShell = reverseLayer == 0 ? 1 : 0;
     vsShellVisible = unboundedDepth <= 1.0 ? 1 : 0;
-    vsWorldTangent = vec4(worldTangent, aTangent.w);
-    gl_Position = uMVP * vec4(worldPosition, 1.0);
+    vsWorldTangent = vec4(worldTangent, aTangent.w * uFurOffsetScale);
+    vsPreviousClip = uPreviousMVP * vec4(previousLocalPosition, 1.0);
+    gl_Position = uMVP * vec4(localPosition, 1.0);
 }
 """
 
@@ -1411,6 +1526,7 @@ in float vsCurvedOffset[];
 flat in int vsBaseShell[];
 flat in int vsShellVisible[];
 in vec4 vsWorldTangent[];
+in vec4 vsPreviousClip[];
 
 out vec2 vUV;
 out vec3 vWorldPosition;
@@ -1420,6 +1536,7 @@ out float vLayerSlice;
 out float vCurvedOffset;
 flat out int vBaseShell;
 out vec4 vWorldTangent;
+out vec4 vPreviousClip;
 
 void main() {
     if (vsShellVisible[0] == 0
@@ -1436,6 +1553,7 @@ void main() {
         vCurvedOffset = vsCurvedOffset[index];
         vBaseShell = vsBaseShell[index];
         vWorldTangent = vsWorldTangent[index];
+        vPreviousClip = vsPreviousClip[index];
         gl_Position = gl_in[index].gl_Position;
         EmitVertex();
     }
@@ -1443,8 +1561,9 @@ void main() {
 }
 """
 
-FUR_SHELL_FRAG_SRC = """
+FUR_SHELL_MATERIAL_COMMON = """
 #version 330 core
+#extension GL_ARB_gpu_shader5 : enable
 in vec2 vUV;
 in vec3 vWorldPosition;
 in vec3 vWorldNormal;
@@ -1453,12 +1572,13 @@ in float vLayerSlice;
 in float vCurvedOffset;
 flat in int vBaseShell;
 in vec4 vWorldTangent;
+in vec4 vPreviousClip;
 
 uniform sampler2D uFurAlbedo;
 uniform sampler2D uFurControl;
 uniform sampler2D uFurSpecular;
 uniform sampler2DArray uFurLayers;
-uniform sampler2DArray uFurEnvironment;
+uniform samplerCube uFurEnvironment;
 uniform sampler2D uFurBrdfLut;
 uniform float uFurDensity;
 uniform float uFurOffsetScale;
@@ -1466,63 +1586,45 @@ uniform float uFurGlossScale;
 uniform float uFurSpecularScale;
 uniform float uFurTransmittanceScale;
 uniform float uFurWetness;
+uniform uint uFurRenderFlags;
 uniform bool uHasFurSpecular;
 uniform bool uHasFurEnvironment;
 uniform vec3 uEye;
 uniform vec3 uLightDir;
 uniform vec3 uFillDir;
-uniform int uFrameIndex;
 uniform float uTemporalIndex;
+uniform float uTemporalPlusCycle;
 uniform vec2 uViewportSize;
+uniform float uMotionNearPlane;
 
-layout(location = 0) out vec4 FragColor;
-layout(location = 1) out vec4 BrightColor;
-layout(location = 2) out vec4 FurGBuffer;
-layout(location = 3) out vec4 FurNormalMask;
+uniform float uFurLength;
 
-float screenHash(vec2 normalizedPosition) {
-    return fract(sin(dot(normalizedPosition, vec2(12.9898, 78.233002)))
-        * 43758.546875 + uTemporalIndex);
-}
+/* HAIR_LIGHTING_NOISE */
+/* FUR_MATERIAL */
+/* FUR_GBUFFER */
 
-float roundNearestEven(float value) {
-    float base = floor(value);
-    float fraction = value - base;
-    if (fraction < 0.5) {
-        return base;
-    }
-    if (fraction > 0.5) {
-        return base + 1.0;
-    }
-    return mod(base, 2.0) == 0.0 ? base : base + 1.0;
-}
 
-vec2 roundNearestEven(vec2 value) {
-    return vec2(roundNearestEven(value.x), roundNearestEven(value.y));
+vec2 furNativePixel(vec2 fragmentPixel) {
+#ifdef RCRA_NATIVE_UPPER_LEFT
+    return fragmentPixel;
+#else
+    return vec2(fragmentPixel.x, uViewportSize.y - fragmentPixel.y);
+#endif
 }
 
 float screenLayerRandom(vec2 pixel, float slice) {
-    vec2 shifted = pixel + vec2(-10.0 * slice, slice);
-    vec2 cell = roundNearestEven(shifted);
-    // Exact PS_FurShellGBufferDeferred sequence: the integer temporal phase
-    // joins x + 2*y before the 0.2 scale, and the spatial hash is scaled by
-    // the same factor.  This produces five stratified threshold bands.
-    return fract(
-        (cell.x + cell.y * 2.0 + float(uFrameIndex)
-            + screenHash(shifted / max(uViewportSize, vec2(1.0)))) * 0.2
-    );
+    // Captured SV_Position is a pixel center with a top-left origin.
+    vec2 nativePixel = furNativePixel(pixel);
+    return hairCoveragePhase(nativePixel, slice, 1.0 / max(uViewportSize, vec2(1.0)),
+                             uTemporalIndex, uTemporalPlusCycle);
 }
 
 float layerUvDivisor(vec2 pixel, float wetness) {
-    // Exact MaterialFur wet-clumping divisor. At m_Wetness=0 this reduces to
-    // round(0.45 + phase*0.1), producing the recovered dry 1/1.375 dither.
-    vec2 roundedPixel = roundNearestEven(pixel);
-    float phase = fract(
-        (roundedPixel.x + roundedPixel.y * 2.0 + float(uFrameIndex)
-            + screenHash(pixel / max(uViewportSize, vec2(1.0)))) * 0.2
-    );
-    float wetBase = (1.0 - (1.0 - wetness) * (1.0 - wetness)) * 8.0 + 0.45;
-    return roundNearestEven(wetBase + phase * 0.1) * 0.375 + 1.0;
+    vec2 nativePixel = furNativePixel(pixel);
+    float phase = hairScreenPhase(nativePixel, 1.0 / max(uViewportSize, vec2(1.0)),
+                                 uTemporalIndex, uTemporalPlusCycle);
+    // Round_ni is floor. Dry fur always has divisor 1; wetness adds eight steps.
+    return hairWetnessStep(wetness, phase) * 3.0 + 1.0;
 }
 
 vec3 fallbackTangent(vec3 normal) {
@@ -1542,312 +1644,262 @@ vec3 surfaceTangent(vec3 normal) {
         ? normalize(candidate) : fallbackTangent(normal);
 }
 
-void recoveredHairBasis(
-        vec3 strandTangent,
-        vec3 geometricNormal,
-        vec3 viewDirection,
-        out vec3 lobeNormal,
-        out vec3 lobeSide) {
-    // CS_ApplyGBufferLighting_Hair instructions 95-129.  GBufExtra is a
-    // strand tangent, not a replacement surface normal.  Retail constructs a
-    // view-oriented frame around that tangent for each of its two lobes.
-    float strandNormalDot = dot(strandTangent, geometricNormal);
-    float strandNormalSine = length(cross(strandTangent, geometricNormal));
-    vec3 frameSeed = viewDirection * strandNormalSine
-        + geometricNormal * strandNormalDot;
-    lobeSide = normalize(cross(frameSeed, strandTangent));
-    lobeNormal = normalize(cross(lobeSide, strandTangent));
-}
+struct FurShellMaterial {
+    uvec4 material;
+    uint strand;
+    vec4 albedo;
+    float depth;
+};
 
-float recoveredHairDistribution(
-        vec3 lobeNormal,
-        vec3 strandTangent,
-        vec3 lobeSide,
-        vec3 lightDirection,
-        vec3 viewDirection,
-        vec3 halfVector,
-        float alphaAlong,
-        float alphaAcross) {
-    // Direct scalar translation of instructions 1229-1258 / 1267-1299.
-    float normalHalf = dot(lobeNormal, halfVector);
-    float tangentHalf = dot(strandTangent, halfVector);
-    float sideHalf = dot(lobeSide, halfVector);
-    float ellipsoid = normalHalf * normalHalf
-        + tangentHalf * tangentHalf / (alphaAlong * alphaAlong)
-        + sideHalf * sideHalf / (alphaAcross * alphaAcross);
-    float normalLight = clamp(dot(lobeNormal, lightDirection), 0.0, 1.0);
-    float normalView = min(abs(dot(lobeNormal, viewDirection)) + 0.00001, 1.0);
-    float averageAlpha = min(alphaAlong, alphaAcross) * 0.75
-        + max(alphaAlong, alphaAcross) * 0.25;
-    float maskingAlpha = averageAlpha * 0.353553 + 0.353553;
-    float maskingAlphaSquared = maskingAlpha * maskingAlpha;
-    float maskingRemainder = 1.0 - maskingAlphaSquared;
-    float lightMask = normalLight * maskingRemainder + maskingAlphaSquared;
-    float viewMask = normalView * maskingRemainder + maskingAlphaSquared;
-    float denominator = ellipsoid * ellipsoid
-        * alphaAlong * alphaAcross * lightMask * viewMask;
-    return normalLight * 0.25 / max(denominator, 0.00001);
-}
-
-vec3 recoveredHairFresnel(vec3 f0, float viewHalf) {
-    float grazing = pow(1.0 - clamp(viewHalf, 0.0, 1.0), 5.0);
-    return f0 + grazing * (vec3(1.0) - f0);
-}
-
-vec3 sampleD3DCube(vec3 direction, float lod) {
-    vec3 absoluteDirection = abs(direction);
-    float face;
-    vec2 coordinate;
-    if (absoluteDirection.x >= absoluteDirection.y
-            && absoluteDirection.x >= absoluteDirection.z) {
-        if (direction.x >= 0.0) {
-            face = 0.0;
-            coordinate = vec2(-direction.z, -direction.y) / absoluteDirection.x;
-        } else {
-            face = 1.0;
-            coordinate = vec2(direction.z, -direction.y) / absoluteDirection.x;
-        }
-    } else if (absoluteDirection.y >= absoluteDirection.z) {
-        if (direction.y >= 0.0) {
-            face = 2.0;
-            coordinate = vec2(direction.x, direction.z) / absoluteDirection.y;
-        } else {
-            face = 3.0;
-            coordinate = vec2(direction.x, -direction.z) / absoluteDirection.y;
-        }
-    } else {
-        if (direction.z >= 0.0) {
-            face = 4.0;
-            coordinate = vec2(direction.x, -direction.y) / absoluteDirection.z;
-        } else {
-            face = 5.0;
-            coordinate = vec2(-direction.x, -direction.y) / absoluteDirection.z;
-        }
-    }
-    return textureLod(
-        uFurEnvironment, vec3(coordinate * 0.5 + 0.5, face), lod
-    ).rgb;
-}
-
-void main() {
+FurShellMaterial evaluateFurShellMaterial() {
     vec4 control = texture(uFurControl, vUV);
     float wetness = clamp(uFurWetness, 0.0, 1.0);
-    vec2 comb = (control.rg * 2.0 - 1.0) * uFurOffsetScale;
-    float combZ = sqrt(1.0 - min(dot(comb, comb), 0.99));
-    vec3 groom = normalize(vec3(comb, combZ));
-    vec2 layerUV = vUV * uFurDensity
-        + groom.xy * vCurvedOffset / max(groom.z, 0.0001);
-    layerUV /= layerUvDivisor(gl_FragCoord.xy, wetness);
+    vec3 groom = furGroom(control.rg, vWorldTangent.w);
+    vec2 layerUV = furLayerUV(
+        vUV, uFurDensity, groom, vCurvedOffset,
+        layerUvDivisor(gl_FragCoord.xy, wetness)
+    );
 
     vec3 viewDirection = normalize(uEye - vWorldPosition);
     // The DXBC applies SV_IsFrontFace before the layer MIP bias and before
     // transforming the groom vector into the packed shading normal.
     float faceSign = gl_FrontFacing ? 1.0 : -1.0;
     vec3 normal = normalize(vWorldNormal) * faceSign;
-    float mipBias = -2.0 * pow(
-        1.0 - clamp(dot(normal, viewDirection), 0.0, 1.0), 2.0
-    );
-    // D3D returns zero for the outer coordinate 32 of the 32-slice array.
-    float layerValue = vLayerSlice >= 32.0 ? 0.0 : texture(
+    float facing = clamp(dot(normal, viewDirection), 0.0, 1.0);
+    float mipBias = -2.0 * (1.0 - facing) * (1.0 - facing);
+    // The captured sample clamps array coordinate 32 to the final slice.
+    float layerValue = texture(
         uFurLayers, vec3(layerUV, vLayerSlice), mipBias
     ).r;
     // MaterialFur rounds out the recovered shell field as strands clump wet.
-    float expandedLayer = clamp(layerValue + 0.1, 0.0, 1.0);
-    expandedLayer = pow(expandedLayer, 5.0) - layerValue;
-    layerValue += wetness * expandedLayer;
+    layerValue = furWetLayerValue(layerValue, wetness);
     vec4 albedo = texture(uFurAlbedo, vUV);
-    albedo *= 1.0 - 0.2 * wetness * sqrt(clamp(vLayerSlice / 32.0, 0.0, 1.0));
+    albedo = furWetAlbedo(albedo, wetness, vLayerSlice / 32.0);
     float coverage = clamp(
         layerValue * albedo.a + float(vBaseShell), 0.0, 1.0
     ) * clamp(1.0 - vLayerSlice / 64.0, 0.0, 1.0);
-    if (coverage <= (1.0 / 255.0)) {
-        discard;
-    }
-
-    vec3 tangent = normalize(
-        vWorldTangent.xyz - normal * dot(normal, vWorldTangent.xyz)
+    vec3 strandTangent = furStrandDirection(
+        normal, vWorldTangent, groom, (uFurRenderFlags & 65536u) != 0u);
+    // Contact depth uses authored fur length and the unshifted material phase.
+    vec2 materialPixel = furNativePixel(gl_FragCoord.xy);
+    float materialPhase = hairScreenPhase(
+        materialPixel, 1.0 / max(uViewportSize, vec2(1.0)),
+        uTemporalIndex, uTemporalPlusCycle
     );
-    vec3 bitangent = normalize(cross(normal, tangent)) * vWorldTangent.w;
-    vec3 strandTangent = normalize(
-        -tangent * groom.x + bitangent * groom.y + normal * groom.z
+    float customViewDepth = furContactDepth(
+        1.0 / gl_FragCoord.w, control.b, layerValue, materialPhase,
+        vLayerSlice / 32.0, uFurLength
     );
-    // Unit-radiance direct-light evaluation from CS_ApplyGBufferLighting_Hair.
-    // Environment probes and the scene light grid are unavailable in an asset
-    // viewport, but the lobe, diffuse, and transmission equations below are
-    // the retail equations rather than fitted display-light multipliers.
-    vec3 lightDirection = normalize(uLightDir);
-    float normalLight = clamp(dot(normal, lightDirection), 0.0, 1.0);
-    float normalView = dot(normal, viewDirection);
-    float transmittance = max(uFurTransmittanceScale, 0.0);
-    float diffuseResponse = clamp(
-        (normalLight + transmittance)
-            / ((transmittance + 1.0) * (transmittance + 1.0)),
-        0.0, 1.0
+    vec2 materialResponse = uHasFurSpecular
+        ? furGlossSpecular(texture(uFurSpecular, vUV).rg,
+                           uFurGlossScale, uFurSpecularScale,
+                           wetness, vLayerSlice / 32.0)
+        : vec2(0.0);
+    uvec4 packedMaterial = furPackGBuffer(
+        normal, materialResponse.x, materialResponse.y, uFurRenderFlags
     );
-    vec3 wrappedLight = lightDirection * 0.75 + normal * 0.25;
-    float transmissionPhase = dot(-viewDirection, wrappedLight);
-    float transmissionDenominator = (
-        8.0 - transmissionPhase * 10.5
-            + transmissionPhase * transmissionPhase * 3.17114
-    ) * (clamp(normalLight * normalView, 0.0, 1.0) + 0.1);
-    float transmissionResponse = 1.0 / max(
-        transmissionDenominator, 0.00001
-    );
-    float grazing = clamp(1.0 - normalView * 2.0, 0.0, 1.0);
-    float transmissionMix = transmittance
-        * (0.5 + 0.5 * grazing * grazing);
-    vec3 primarySpecular = vec3(0.0);
-    vec3 secondarySpecular = vec3(0.0);
-    vec3 indirectDiffuse = vec3(0.0);
-    if (uHasFurSpecular) {
-        float furResponse = max(texture(uFurSpecular, vUV).r, 0.0);
-        // Exact PS_FurShellGBufferDeferred packing order: gloss receives
-        // sqrt(texture) before its authored scale; specular receives its
-        // authored scale before sqrt.
-        float glossResponse = clamp(
-            sqrt(furResponse) * uFurGlossScale, 0.0, 1.0
-        );
-        float specularResponse = sqrt(clamp(
-            furResponse * uFurSpecularScale, 0.0, 1.0
-        ));
-        float shellGlossFade = 1.0 - clamp(
-            vLayerSlice * 0.125 - 0.25, 0.0, 1.0
-        ) * 0.333;
-        float adjustedGloss = glossResponse * shellGlossFade;
-        float primaryGloss = adjustedGloss * 0.6 + 0.1;
-        float secondaryGloss = primaryGloss
-            * (1.0 - adjustedGloss * 0.3 - 0.05);
-
-        float primaryAlong = pow(
-            0.9725 - 0.7514 * primaryGloss, 4.0
-        );
-        float primaryAcross = pow(
-            0.9725 - 0.07514 * primaryGloss, 4.0
-        );
-        float secondaryAlong = pow(min(
-            0.9725 - 0.7514 * secondaryGloss, 1.0
-        ), 4.0);
-        float secondaryAcross = pow(
-            0.9725 - 0.07514 * secondaryGloss, 4.0
-        );
-
-        // The installed PS leaves GBufExtra bits 26-31 clear, making the
-        // second retail tangent shift exactly 0.075 for this material path.
-        vec3 secondaryTangent = normalize(
-            strandTangent + 0.075 * (-normal - strandTangent)
-        );
-        vec3 primaryNormal;
-        vec3 primarySide;
-        vec3 secondaryNormal;
-        vec3 secondarySide;
-        recoveredHairBasis(
-            strandTangent, normal, viewDirection,
-            primaryNormal, primarySide
-        );
-        recoveredHairBasis(
-            secondaryTangent, normal, viewDirection,
-            secondaryNormal, secondarySide
-        );
-        vec3 halfVector = normalize(lightDirection + viewDirection);
-        float primaryDistribution = recoveredHairDistribution(
-            primaryNormal, strandTangent, primarySide,
-            lightDirection, viewDirection, halfVector,
-            primaryAlong, primaryAcross
-        );
-        float secondaryDistribution = recoveredHairDistribution(
-            secondaryNormal, secondaryTangent, secondarySide,
-            lightDirection, viewDirection, halfVector,
-            secondaryAlong, secondaryAcross
-        );
-        vec3 primaryF0 = vec3(specularResponse * specularResponse);
-        vec3 secondaryF0 = clamp(
-            vec3(specularResponse * 5.0), 0.0, 1.0
-        ) / (sqrt(max(albedo.rgb, vec3(0.0))) + vec3(0.75));
-        vec3 primaryFresnel = recoveredHairFresnel(
-            primaryF0, dot(viewDirection, halfVector)
-        );
-        vec3 secondaryFresnel = recoveredHairFresnel(
-            secondaryF0, dot(viewDirection, halfVector)
-        );
-        primarySpecular = primaryFresnel * primaryDistribution;
-        secondarySpecular = secondaryFresnel * secondaryDistribution;
-        if (uHasFurEnvironment) {
-            // Captured default-probe Hair path: construct the anisotropic
-            // reflection frame, sample BC6 at 5-5*roughness, then apply slice
-            // zero of Default Brdf Lookup. LightGridIntensity was 0.6.
-            vec3 chosenAxis = primaryAcross >= secondaryAcross
-                ? primarySide : strandTangent;
-            vec3 viewPerpendicular = cross(
-                cross(chosenAxis, viewDirection), chosenAxis
-            );
-            float environmentBlend = clamp(
-                (1.0 - dot(normal, strandTangent)) * 1.5
-                    * max(primaryAcross, secondaryAcross),
-                0.0, 1.0
-            );
-            vec3 environmentBase = mix(
-                normal, viewPerpendicular, environmentBlend
-            );
-            float environmentAngle = screenLayerRandom(
-                gl_FragCoord.xy, vLayerSlice
-            ) * 18.8496;
-            float sine = sin(environmentAngle);
-            float cosine = cos(environmentAngle);
-            vec3 environmentTarget = primaryNormal
-                + primaryAcross * strandTangent * sine * sine * sine
-                + secondaryAcross * primarySide * cosine * cosine * cosine;
-            float averageRoughness = (primaryGloss + secondaryGloss) * 0.5;
-            vec3 environmentNormal = normalize(mix(
-                environmentTarget, environmentBase,
-                averageRoughness * 0.25 + 0.5
-            ));
-            vec3 reflectionDirection = reflect(-viewDirection, environmentNormal);
-            vec3 environmentSpecular = sampleD3DCube(
-                reflectionDirection,
-                5.0 - clamp(averageRoughness, 0.0, 1.0) * 5.0
-            ) * 0.6;
-            vec2 environmentBrdf = textureLod(
-                uFurBrdfLut,
-                vec2(abs(dot(environmentNormal, viewDirection)), averageRoughness),
-                0.0
-            ).rg;
-            primarySpecular += environmentSpecular
-                * (environmentBrdf.x * primaryF0 + environmentBrdf.y);
-            secondarySpecular += environmentSpecular * secondaryF0;
-            indirectDiffuse = sampleD3DCube(normal, 5.0) * 0.6;
-        }
-    }
-    vec3 diffuseAndSecondary = vec3(diffuseResponse)
-        + indirectDiffuse + secondarySpecular;
-    vec3 color = albedo.rgb * mix(
-        diffuseAndSecondary, vec3(transmissionResponse), transmissionMix
-    ) + primarySpecular;
-    // Recovered retail behavior: opaque stochastic coverage. Temporal offsets
-    // are accumulated by the viewport history pass below.
-    if (coverage < screenLayerRandom(gl_FragCoord.xy, vLayerSlice)) {
-        discard;
-    }
-    // PS_FurShellGBufferDeferred writes a control-blue, wetness, shell-field
-    // offset from reciprocal view depth. Hair deferred lighting consumes this
-    // value for the strand-scale contact-shadow ray.
-    float customReciprocalDepth = gl_FragCoord.w
-        - (0.95 * control.b + 0.05)
-        * (wetness + 0.005)
-        * layerValue
-        * (1.0 - vLayerSlice / 32.0);
-    FragColor = vec4(color, 1.0);
-    BrightColor = vec4(0.0);
-    FurGBuffer = vec4(strandTangent, max(customReciprocalDepth, 0.000001));
-    FurNormalMask = vec4(normal, 1.0);
+    uint packedStrand = furPackExtra(strandTangent, uFurTransmittanceScale);
+    if (coverage < screenLayerRandom(gl_FragCoord.xy, vLayerSlice)) discard;
+    // Native target alpha carries material occlusion, independently of coverage.
+    float occlusion = clamp(vLayerSlice * 0.015625, 0.0, 1.0)
+        * (1.0 - control.a) + control.a;
+    return FurShellMaterial(packedMaterial, packedStrand, vec4(albedo.rgb, occlusion), customViewDepth);
 }
 """
+for _marker, _filename in (
+    ('/* HAIR_LIGHTING_NOISE */', 'hair_lighting_noise.glsl'),
+    ('/* FUR_MATERIAL */', 'fur_material.glsl'),
+    ('/* FUR_GBUFFER */', 'fur_gbuffer.glsl'),
+):
+    FUR_SHELL_MATERIAL_COMMON = FUR_SHELL_MATERIAL_COMMON.replace(
+        _marker, (Path(__file__).resolve().parents[1] / 'core' / _filename).read_text(encoding='utf-8'),
+    )
+
+_HAIR_PREVIEW_LIGHTING = '\n'.join(
+    (Path(__file__).resolve().parents[1] / 'core' / filename).read_text(encoding='utf-8')
+    for filename in ('hair_frame.glsl', 'hair_lobes.glsl', 'hair_response.glsl',
+                     'hair_environment_frame.glsl')
+)
+_HAIR_PREVIEW_LIGHTING += '\n#ifdef HAIR_SCENE_LIGHTING\n' + '\n'.join(
+    (Path(__file__).resolve().parents[1] / 'core' / filename).read_text(encoding='utf-8')
+    for filename in ('hair_light_grid.glsl', 'hair_probe_lighting.glsl', 'hair_key_shadow.glsl', 'hair_history.glsl', 'hair_scene.glsl', 'hair_key_modulation.glsl', 'hair_local_lights.glsl')
+) + '\n#endif\n' + (Path(__file__).resolve().parents[1] / 'core' / 'hair_preview_lighting.glsl').read_text(encoding='utf-8')
+
+# Native deferred material targets, including the previous-frame motion written
+# by PS_FurShellGBufferDeferred. The current lighting stages consume the first
+# four; temporal reconstruction will consume Motion in a later parity slice.
+FUR_MATERIAL_FRAG_SRC = FUR_SHELL_MATERIAL_COMMON + """
+layout(location = 0) out uvec4 Material;
+layout(location = 1) out vec4 AlbedoOcclusion;
+layout(location = 2) out float LinearDepth;
+layout(location = 3) out uint Strand;
+layout(location = 4) out vec2 Motion;
+layout(location = 5) out uint Stencil;
+void main() {
+    FurShellMaterial surface = evaluateFurShellMaterial();
+    Material = surface.material;
+    AlbedoOcclusion = surface.albedo;
+    LinearDepth = surface.depth;
+    Strand = surface.strand;
+    vec2 pixel = furNativePixel(gl_FragCoord.xy);
+    Motion = furMotionVector(
+        pixel, 1.0 / max(uViewportSize, vec2(1.0)), vPreviousClip,
+        uMotionNearPlane, uViewportSize
+    );
+    Stencil = 128u;
+}
+"""
+
+FUR_SHELL_FRAG_SRC = FUR_SHELL_MATERIAL_COMMON + _HAIR_PREVIEW_LIGHTING + """
+layout(location = 0) out vec4 FragColor;
+layout(location = 1) out vec4 BrightColor;
+layout(location = 2) out vec4 FurGBuffer;
+layout(location = 3) out vec4 FurNormalMask;
+layout(location = 4) out vec4 FurKeyLight;
+void main() {
+    FurShellMaterial surface = evaluateFurShellMaterial();
+    vec3 normal = furUnpackNormal(surface.material);
+    vec3 strandTangent = furUnpackStrand(surface.strand);
+    vec2 pixel = floor(furNativePixel(gl_FragCoord.xy));
+    vec3 directColor, indirectColor;
+    evaluatePreviewHairLighting(surface.material, surface.strand, normal, strandTangent,
+        surface.albedo, surface.depth, normalize(uEye - vWorldPosition), pixel, vWorldPosition, 1.0,
+        directColor, indirectColor);
+    FragColor = vec4(indirectColor + directColor, 1.0);
+    BrightColor = vec4(0.0);
+    FurGBuffer = vec4(strandTangent, surface.depth);
+    FurNormalMask = vec4(normal, 1.0);
+    FurKeyLight = vec4(directColor, float((surface.strand >> 19u) & 127u));
+}
+"""
+
+# A separate vector pass prevents precise lighting expressions from changing the
+# native packed-vector decode. Every pixel is written, including opaque depth.
+FUR_DECODE_FRAG = """
+#version 330 core
+#extension GL_ARB_gpu_shader5 : enable
+uniform usampler2D uMaterial;
+uniform usampler2D uStrand;
+uniform sampler2D uLinearDepth;
+uniform sampler2D uOpaqueDepth;
+layout(location = 0) out vec4 FurGBuffer;
+layout(location = 1) out vec4 FurNormalMask;
+/* FUR_GBUFFER */
+void main() {
+    ivec2 pixel = ivec2(gl_FragCoord.xy);
+    uvec4 material = texelFetch(uMaterial, pixel, 0);
+    bool hair = ((material.x >> 13u) & 7u) == 3u && (material.x & 4096u) == 0u;
+    if (!hair) {
+        FurGBuffer = vec4(0.0, 0.0, 0.0, texelFetch(uOpaqueDepth, pixel, 0).a);
+        FurNormalMask = vec4(0.0);
+        return;
+    }
+    uint strand = texelFetch(uStrand, pixel, 0).r;
+    FurGBuffer = vec4(furUnpackStrand(strand), texelFetch(uLinearDepth, pixel, 0).r);
+    FurNormalMask = vec4(furUnpackNormal(material), 1.0);
+}
+""".replace('/* FUR_GBUFFER */',
+    (Path(__file__).resolve().parents[1] / 'core/fur_gbuffer.glsl').read_text(encoding='utf-8'))
+
+FUR_LIGHTING_FRAG = """
+#version 330 core
+#extension GL_ARB_gpu_shader5 : enable
+uniform usampler2D uMaterial;
+uniform usampler2D uStrand;
+uniform sampler2D uAlbedoOcclusion;
+uniform sampler2D uFurGBuffer;
+uniform sampler2D uFurNormalMask;
+uniform samplerCube uFurEnvironment;
+uniform sampler2D uFurBrdfLut;
+uniform bool uHasFurEnvironment;
+uniform vec3 uLightDir;
+uniform vec2 uViewportSize;
+uniform vec4 uScreenToView;
+uniform mat3 uViewToWorld;
+uniform vec3 uCameraPosition;
+uniform float uTemporalIndex;
+uniform float uTemporalPlusCycle;
+layout(location = 0) out vec4 IndirectColor;
+layout(location = 1) out vec4 KeyLight;
+/* HAIR_LIGHTING_NOISE */
+/* HAIR_SURFACE */
+/* HAIR_PREVIEW_LIGHTING */
+#ifdef HAIR_SCENE_LIGHTING
+/* HAIR_CONTACT */
+float hairHistoryDepth(ivec2 pixel) {
+    ivec2 dimensions = textureSize(uFurGBuffer, 0);
+    if (any(lessThan(pixel, ivec2(0))) || any(greaterThanEqual(pixel, dimensions))) return 0.0;
+#ifndef RCRA_NATIVE_UPPER_LEFT
+    return texelFetch(uFurGBuffer, ivec2(pixel.x, dimensions.y - 1 - pixel.y), 0).a;
+#else
+    return texelFetch(uFurGBuffer, pixel, 0).a;
+#endif
+}
+float hairContactLoadDepth(ivec2 pixel) { return hairHistoryDepth(pixel); }
+#endif
+void main() {
+    ivec2 center = ivec2(gl_FragCoord.xy);
+    vec4 normalMask = texelFetch(uFurNormalMask, center, 0);
+    if (normalMask.a <= 0.0) discard;
+    vec4 fur = texelFetch(uFurGBuffer, center, 0);
+    uvec4 material = texelFetch(uMaterial, center, 0);
+    uint strand = texelFetch(uStrand, center, 0).r;
+    vec4 albedo = texelFetch(uAlbedoOcclusion, center, 0);
+#ifdef RCRA_NATIVE_UPPER_LEFT
+    vec2 pixel = vec2(center);
+#else
+    vec2 pixel = vec2(center.x, int(uViewportSize.y) - 1 - center.y);
+#endif
+    vec3 position = hairViewPosition(pixel, fur.a, 1.0 / uViewportSize,
+                                     uScreenToView, vec2(1.0, 0.0));
+    vec3 relative = hairRelativeWorldPosition(position, uViewToWorld);
+    float keyVisibility = 1.0;
+#ifdef HAIR_SCENE_LIGHTING
+    vec3 noise = hairLightingNoise(pixel, 1.0 / uViewportSize, uTemporalIndex, uTemporalPlusCycle);
+    keyVisibility = hairSceneKeyVisibility(relative, strand, noise.xz);
+    if (keyVisibility <= 0.0001) keyVisibility = 0.0;
+    else if (uFurContactEnabled && (uHairSceneFlags & 2u) != 0u) {
+        vec3 viewLight = vec3(dot(uViewToWorld[0], uLightDir),
+            dot(uViewToWorld[1], uLightDir), dot(uViewToWorld[2], uLightDir));
+        float radius = fma(float((strand >> 19u) & 127u), uintBitsToFloat(0x39041aa4u), uintBitsToFloat(0x3b03126fu));
+        float contact = hairContactVisibility(pixel, fur.a, normalMask.xyz, uLightDir, viewLight,
+            1.0 / uViewportSize, uScreenToView, vec2(1.0, 0.0), uHairViewToScreen,
+            uViewportSize, noise.xz, radius);
+        keyVisibility = min(keyVisibility, contact);
+    }
+#endif
+    vec3 directColor, indirectColor;
+    evaluatePreviewHairLighting(material, strand, normalMask.xyz, fur.xyz,
+        albedo, fur.a, hairViewDirection(relative), pixel, relative + uCameraPosition, keyVisibility,
+        directColor, indirectColor);
+    // Scene lighting already combines visibility and history before material resolve.
+    IndirectColor = vec4(indirectColor, 1.0);
+    KeyLight = vec4(directColor, float((strand >> 19u) & 127u));
+}
+"""
+for _marker, _code in (
+    ('/* HAIR_LIGHTING_NOISE */', (Path(__file__).resolve().parents[1] / 'core/hair_lighting_noise.glsl').read_text(encoding='utf-8')),
+    ('/* HAIR_SURFACE */', (Path(__file__).resolve().parents[1] / 'core/hair_surface.glsl').read_text(encoding='utf-8')),
+    ('/* HAIR_CONTACT */', (Path(__file__).resolve().parents[1] / 'core/hair_contact_shadow.glsl').read_text(encoding='utf-8')),
+    ('/* HAIR_PREVIEW_LIGHTING */', _HAIR_PREVIEW_LIGHTING),
+):
+    FUR_LIGHTING_FRAG = FUR_LIGHTING_FRAG.replace(_marker, _code)
+
+FUR_SCENE_LIGHTING_FRAG = FUR_LIGHTING_FRAG.replace(
+    '#version 330 core', '#version 430 core\n#define HAIR_SCENE_LIGHTING', 1,
+)
+
 
 POST_VERT = """
 #version 330 core
 layout(location=0) in vec3 aPos;
 out vec2 vTexCoord;
 void main() {
+#ifdef RCRA_NATIVE_UPPER_LEFT
+    vTexCoord = vec2(aPos.x * 0.5 + 0.5, 0.5 - aPos.y * 0.5);
+#else
     vTexCoord = aPos.xy * 0.5 + 0.5;
+#endif
     gl_Position = vec4(aPos, 1.0);
 }
 """
@@ -1900,261 +1952,1045 @@ void main() {
 }
 """
 
-TEMPORAL_ACCUM_FRAG = """
+MOTION_BLUR_DOWNSAMPLE_FRAG = """
 #version 330 core
-in vec2 vTexCoord;
-uniform sampler2D uCurrent;
-uniform sampler2D uHistory;
-uniform sampler2D uFurGBuffer;
-uniform float uHistoryWeight;
-uniform vec2 uCurrentUvOffset;
-uniform vec2 uProjectionScale;
-uniform float uScreenToViewScaleX;
-uniform vec3 uWorldLightDir;
-uniform vec3 uViewLightDir;
-uniform bool uFurContactEnabled;
-out vec4 FragColor;
-
-// CS_TemporalAaApply stores neighborhood colors as normalized luma/chroma
-// before it constrains reprojected history.  The production shader also
-// applies a cbuffer-controlled HDR luma compression term; its runtime value is
-// not present in the DXBC, so the isolated preview intentionally omits only
-// that unproven scale while preserving the recovered color axes and clamp.
-vec3 encodeTemporalColor(vec3 rgb) {
-    float luma = max(dot(rgb, vec3(0.25, 0.5, 0.25)), 0.000001);
-    float chromaGreen = (0.5 * rgb.g - 0.25 * rgb.r - 0.25 * rgb.b) / luma;
-    float chromaOrange = 0.5 * (rgb.r - rgb.b) / luma;
-    return vec3(luma, chromaGreen, chromaOrange);
-}
-
-vec3 decodeTemporalColor(vec3 encoded) {
-    float luma = encoded.x;
-    return vec3(
-        luma * (1.0 - encoded.y + encoded.z),
-        luma * (1.0 + encoded.y),
-        luma * (1.0 - encoded.y - encoded.z)
-    );
-}
-
-vec3 sampleCurrentWithFurContact(vec2 uv) {
-    vec3 color = texture(uCurrent, uv).rgb;
-    vec4 fur = texture(uFurGBuffer, uv);
-    if (fur.a <= 0.0) {
-        return color;
-    }
-    if (!uFurContactEnabled) {
-        return color;
-    }
-
-    float viewDepth = 1.0 / max(fur.a, 0.000001);
-    vec2 ndc = uv * 2.0 - 1.0;
-    vec3 viewPosition = vec3(
-        ndc.x * viewDepth / uProjectionScale.x,
-        ndc.y * viewDepth / uProjectionScale.y,
-        -viewDepth
-    );
-    float depthScale = max(
-        viewDepth * uScreenToViewScaleX * 0.137644, 1.0
-    );
-    vec3 rayEnd = viewPosition
-        + normalize(uViewLightDir) * (depthScale * 0.015);
-    vec2 rayEndNdc = vec2(
-        rayEnd.x * uProjectionScale.x,
-        rayEnd.y * uProjectionScale.y
-    ) / max(-rayEnd.z, 0.000001);
-    vec2 rayUv = rayEndNdc * 0.5 + 0.5 - uv;
-
-    float occlusion = 0.0;
-    for (int tap = 1; tap <= 4; ++tap) {
-        float rayFraction = float(tap) * 0.25;
-        vec2 sampleUv = clamp(
-            uv + rayUv * rayFraction,
-            vec2(0.0), vec2(1.0)
-        );
-        float sampleReciprocalDepth = texture(uFurGBuffer, sampleUv).a;
-        if (sampleReciprocalDepth <= 0.0) {
-            continue;
-        }
-        // Recovered DXBC: rcp(ray depth) - g_ViewDepthBuffer.  Keeping this
-        // in reciprocal-depth units is essential; converting to linear depth
-        // turns tiny strand offsets into broad false occlusion bands.
-        float rayDepth = mix(viewDepth, max(-rayEnd.z, 0.000001), rayFraction);
-        float separation = 1.0 / rayDepth - sampleReciprocalDepth;
-        float contactBegins = clamp(
-            separation * (1000.0 / depthScale), 0.0, 1.0
-        );
-        float contactEnds = clamp(
-            2.0 - separation * (100.0 / depthScale), 0.0, 1.0
-        );
-        occlusion += contactBegins * contactEnds * 0.25;
-    }
-    float grazing = 1.0 - clamp(
-        dot(normalize(fur.xyz), normalize(uWorldLightDir)), 0.0, 1.0
-    );
-    return color * (1.0 - 0.75 * grazing * occlusion);
-}
+#extension GL_ARB_gpu_shader5 : require
+uniform sampler2D uMotion;
+uniform sampler2D uOpaqueMotion;
+uniform sampler2D uFurMask;
+uniform sampler2D uFurDepth;
+uniform sampler2D uSceneDepth;
+uniform vec2 uOutputInvSize;
+uniform float uShutterScale;
+layout(location = 0) out vec2 DepthVelocity;
+layout(location = 1) out vec2 HalfVelocity;
 
 void main() {
-    vec2 texel = 1.0 / vec2(textureSize(uCurrent, 0));
-    vec2 currentUV = clamp(
-        vTexCoord + uCurrentUvOffset, texel * 0.5, vec2(1.0) - texel * 0.5
+    ivec2 pixel = ivec2(gl_FragCoord.xy);
+    vec2 uv = (vec2(pixel) + 0.5) * uOutputInvSize;
+    vec4 furMask = textureGather(uFurMask, uv, 3);
+    vec4 furDepth = textureGather(uFurDepth, uv, 0);
+    vec4 sceneDepth = textureGather(uSceneDepth, uv, 3);
+    vec4 depth = mix(sceneDepth, furDepth, greaterThan(furMask, vec4(0.0)));
+    vec4 velocityX = mix(
+        textureGather(uOpaqueMotion, uv, 0),
+        textureGather(uMotion, uv, 0),
+        greaterThan(furMask, vec4(0.0))
     );
-    vec4 current = vec4(
-        sampleCurrentWithFurContact(currentUV),
-        texture(uCurrent, currentUV).a
+    vec4 velocityY = -mix(
+        textureGather(uOpaqueMotion, uv, 1),
+        textureGather(uMotion, uv, 1),
+        greaterThan(furMask, vec4(0.0))
     );
-    vec3 neighborhoodMin = vec3(1.0e30);
-    vec3 neighborhoodMax = vec3(-1.0e30);
-    for (int y = -1; y <= 1; ++y) {
-        for (int x = -1; x <= 1; ++x) {
-            vec3 sampleColor = sampleCurrentWithFurContact(
-                currentUV + vec2(x, y) * texel
-            );
-            vec3 encoded = encodeTemporalColor(sampleColor);
-            neighborhoodMin = min(neighborhoodMin, encoded);
-            neighborhoodMax = max(neighborhoodMax, encoded);
-        }
-    }
-    vec3 history = encodeTemporalColor(texture(uHistory, vTexCoord).rgb);
-    history = clamp(history, neighborhoodMin, neighborhoodMax);
-    vec3 constrainedHistory = max(decodeTemporalColor(history), vec3(0.0));
-    FragColor = vec4(
-        mix(current.rgb, constrainedHistory, uHistoryWeight), current.a
-    );
+    float minimumDepth = min(min(depth.x, depth.y), min(depth.z, depth.w));
+    vec2 selected = vec2(velocityX.x, velocityY.x);
+    if (depth.y == minimumDepth) selected = vec2(velocityX.y, velocityY.y);
+    if (depth.z == minimumDepth) selected = vec2(velocityX.z, velocityY.z);
+    if (depth.w == minimumDepth) selected = vec2(velocityX.w, velocityY.w);
+    HalfVelocity = selected;
+
+    vec2 adjusted = selected * uShutterScale;
+    float maximumComponent = max(abs(adjusted.x), abs(adjusted.y));
+    float ramp = clamp(0.25 * maximumComponent - 0.6000000238418579, 0.0, 1.0);
+    // Captured m_RampConsts.z is exactly zero, so the native smooth-ramp
+    // multiplier is the identity for this frame configuration.
+    adjusted *= 20.0 / max(max(abs(adjusted.x), abs(adjusted.y)), 20.0);
+    DepthVelocity = vec2(minimumDepth, length(adjusted));
 }
 """
 
-# Direct translation of the captured CS_HairDenoise sampling structure. The
-# retail pass follows the projected groom tangent for three gathers, accepts
-# only masked fur samples, and rejects depth discontinuities with 200/depth.
-# The viewport stores decoded float vectors instead of retail's packed GBuffer,
-# so only the packing/unpacking instructions are intentionally absent here.
+MOTION_BLUR_NEIGHBORHOOD_HALF_FRAG = """
+#version 330 core
+#extension GL_ARB_gpu_shader5 : require
+uniform sampler2D uVelocity;
+uniform vec2 uOutputInvSize;
+uniform float uVelocityScale;
+out vec2 NeighborhoodVelocity;
+void main() {
+    ivec2 pixel = ivec2(gl_FragCoord.xy);
+    vec2 uv = (vec2(pixel) + 0.5) * uOutputInvSize;
+    vec4 velocityX = textureGather(uVelocity, uv, 0);
+    vec4 velocityY = textureGather(uVelocity, uv, 1);
+    vec2 velocity[4] = vec2[4](
+        vec2(velocityX.x, velocityY.x), vec2(velocityX.y, velocityY.y),
+        vec2(velocityX.z, velocityY.z), vec2(velocityX.w, velocityY.w)
+    );
+    float maximumMagnitude = max(
+        max(dot(velocity[0], velocity[0]), dot(velocity[1], velocity[1])),
+        max(dot(velocity[2], velocity[2]), dot(velocity[3], velocity[3]))
+    );
+    vec2 selected = velocity[0];
+    if (dot(velocity[1], velocity[1]) == maximumMagnitude) selected = velocity[1];
+    if (dot(velocity[2], velocity[2]) == maximumMagnitude) selected = velocity[2];
+    if (dot(velocity[3], velocity[3]) == maximumMagnitude) selected = velocity[3];
+    NeighborhoodVelocity = selected * uVelocityScale;
+}
+"""
+
+MOTION_BLUR_NEIGHBORHOOD_QUARTER_FRAG = """
+#version 330 core
+#extension GL_ARB_gpu_shader5 : require
+uniform sampler2D uVelocity;
+uniform vec2 uOutputInvSize;
+out vec2 NeighborhoodVelocity;
+
+void appendGather(inout vec2 velocity[16], int base, vec2 uv, ivec2 offset) {
+    vec4 x = textureGatherOffset(uVelocity, uv, offset, 0);
+    vec4 y = textureGatherOffset(uVelocity, uv, offset, 1);
+    velocity[base + 0] = vec2(x.x, y.x);
+    velocity[base + 1] = vec2(x.y, y.y);
+    velocity[base + 2] = vec2(x.z, y.z);
+    velocity[base + 3] = vec2(x.w, y.w);
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_FragCoord.xy);
+    vec2 uv = (vec2(pixel) + 0.5) * uOutputInvSize;
+    vec2 velocity[16];
+    appendGather(velocity, 0, uv, ivec2(-1, -1));
+    appendGather(velocity, 4, uv, ivec2(1, -1));
+    appendGather(velocity, 8, uv, ivec2(-1, 1));
+    appendGather(velocity, 12, uv, ivec2(1, 1));
+    float maximumMagnitude = 0.0;
+    for (int index = 0; index < 16; ++index) {
+        maximumMagnitude = max(maximumMagnitude, dot(velocity[index], velocity[index]));
+    }
+    vec2 selected = velocity[0];
+    for (int index = 1; index < 16; ++index) {
+        if (dot(velocity[index], velocity[index]) == maximumMagnitude) selected = velocity[index];
+    }
+    NeighborhoodVelocity = selected;
+}
+"""
+
+MOTION_BLUR_GATHER_NEIGHBORHOOD_FRAG = """
+#version 330 core
+uniform sampler2D uVelocity;
+out vec2 GatheredVelocity;
+vec2 loadClamped(ivec2 pixel) {
+    ivec2 dimensions = textureSize(uVelocity, 0);
+    return texelFetch(uVelocity, clamp(pixel, ivec2(0), dimensions - 1), 0).xy;
+}
+void main() {
+    ivec2 pixel = ivec2(gl_FragCoord.xy);
+    vec2 velocity[25];
+    float magnitude[25];
+    int index = 0;
+    float maximumMagnitude = 0.0;
+    vec2 reference = vec2(0.0);
+    for (int y = -2; y <= 2; ++y) {
+        for (int x = -2; x <= 2; ++x) {
+            velocity[index] = loadClamped(pixel + ivec2(x, y));
+            magnitude[index] = dot(velocity[index], velocity[index]);
+            if (magnitude[index] > 0.0 && magnitude[index] >= maximumMagnitude) {
+                maximumMagnitude = magnitude[index];
+                reference = velocity[index];
+            }
+            ++index;
+        }
+    }
+    vec2 weightedVelocity = vec2(0.0);
+    float totalMagnitude = 0.0;
+    for (index = 0; index < 25; ++index) {
+        vec2 aligned = dot(velocity[index], reference) >= 0.0
+            ? velocity[index] : -velocity[index];
+        float alignedMagnitude = dot(aligned, aligned);
+        weightedVelocity += aligned * alignedMagnitude;
+        totalMagnitude += alignedMagnitude;
+    }
+    vec2 result = weightedVelocity / max(totalMagnitude, 0.0010000000474974513);
+    float ramp = clamp(0.25 * length(result) - 0.6000000238418579, 0.0, 1.0);
+    GatheredVelocity = result;
+}
+"""
+
+MOTION_BLUR_SCATTER_FRAG = """
+#version 330 core
+#extension GL_ARB_gpu_shader5 : require
+uniform sampler2D uDepthVelocity;
+uniform sampler2D uNeighborhoodVelocity;
+uniform vec2 uOutputInvSize;
+out float Scatter;
+
+vec2 alignVelocity(vec2 reference, vec2 candidate) {
+    return dot(reference, candidate) >= 0.0 ? candidate : -candidate;
+}
+
+vec2 gatherNeighborhoodVelocity(ivec2 pixel) {
+    vec2 velocityUv = (vec2(pixel) + 0.5) * uOutputInvSize;
+    vec4 velocityX = textureGather(uNeighborhoodVelocity, velocityUv, 0);
+    vec4 velocityY = textureGather(uNeighborhoodVelocity, velocityUv, 1);
+    vec2 dither = vec2((pixel + ivec2(4)) & ivec2(7)) * 0.125;
+    vec2 lowWeight = vec2(0.9375) - dither;
+    vec2 highWeight = dither + vec2(0.0625);
+    float weights[4] = float[4](
+        highWeight.y * lowWeight.x, highWeight.y * highWeight.x,
+        lowWeight.y * highWeight.x, lowWeight.y * lowWeight.x
+    );
+    vec2 velocity[4] = vec2[4](
+        vec2(velocityX.x, velocityY.x) * weights[0],
+        vec2(velocityX.y, velocityY.y) * weights[1],
+        vec2(velocityX.z, velocityY.z) * weights[2],
+        vec2(velocityX.w, velocityY.w) * weights[3]
+    );
+    vec2 reference = velocity[3];
+    vec2 result = reference;
+    result += alignVelocity(reference, velocity[2]);
+    result += alignVelocity(reference, velocity[1]);
+    result += alignVelocity(reference, velocity[0]);
+    return result;
+}
+
+vec2 directionalCrossings(
+    vec2 centerUv, vec2 uvDirection, float pathLength,
+    float centerInverseDepth, float tapFraction
+) {
+    vec2 offset = uvDirection * tapFraction;
+    vec2 positive = textureLod(uDepthVelocity, centerUv + offset, 0.0).xy;
+    vec2 negative = textureLod(uDepthVelocity, centerUv - offset, 0.0).xy;
+    float ramp = pathLength * tapFraction - 0.5;
+    float centerDepthScale = 16.0 * centerInverseDepth;
+    float positiveHit = clamp(positive.y - ramp, 0.0, 1.0)
+        * clamp(16.5 - centerDepthScale * positive.x, 0.0, 1.0)
+        / max(positive.y, 1.0);
+    float negativeHit = clamp(negative.y - ramp, 0.0, 1.0)
+        * clamp(16.5 - centerDepthScale * negative.x, 0.0, 1.0)
+        / max(negative.y, 1.0);
+    float crossingScale = 4.0 * centerInverseDepth;
+    return vec2(
+        clamp(crossingScale * (negative.x - positive.x), 0.0, 1.0) * positiveHit,
+        clamp(crossingScale * (positive.x - negative.x), 0.0, 1.0) * negativeHit
+    );
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_FragCoord.xy);
+    vec2 velocity = gatherNeighborhoodVelocity(pixel);
+    float velocityMagnitude = length(velocity);
+    if (velocityMagnitude < 0.800000011920929) {
+        Scatter = 0.0;
+        return;
+    }
+    float sampleScale = 20.0 / max(abs(velocity.x), abs(velocity.y));
+    vec2 centerUv = (vec2(pixel) + 0.5) * uOutputInvSize;
+    vec2 uvDirection = velocity * sampleScale * uOutputInvSize;
+    float pathLength = sampleScale * velocityMagnitude;
+    float centerInverseDepth = 1.0 / texelFetch(uDepthVelocity, pixel, 0).x;
+    vec2 crossing[20];
+    crossing[0] = directionalCrossings(centerUv, uvDirection, pathLength, centerInverseDepth, 0.05000000074505806);
+    crossing[1] = directionalCrossings(centerUv, uvDirection, pathLength, centerInverseDepth, 0.10000000149011612);
+    crossing[2] = directionalCrossings(centerUv, uvDirection, pathLength, centerInverseDepth, 0.15000000596046448);
+    crossing[3] = directionalCrossings(centerUv, uvDirection, pathLength, centerInverseDepth, 0.20000000298023224);
+    crossing[4] = directionalCrossings(centerUv, uvDirection, pathLength, centerInverseDepth, 0.25);
+    crossing[5] = directionalCrossings(centerUv, uvDirection, pathLength, centerInverseDepth, 0.30000001192092896);
+    crossing[6] = directionalCrossings(centerUv, uvDirection, pathLength, centerInverseDepth, 0.3499999940395355);
+    crossing[7] = directionalCrossings(centerUv, uvDirection, pathLength, centerInverseDepth, 0.4000000059604645);
+    crossing[8] = directionalCrossings(centerUv, uvDirection, pathLength, centerInverseDepth, 0.44999998807907104);
+    crossing[9] = directionalCrossings(centerUv, uvDirection, pathLength, centerInverseDepth, 0.5);
+    crossing[10] = directionalCrossings(centerUv, uvDirection, pathLength, centerInverseDepth, 0.550000011920929);
+    crossing[11] = directionalCrossings(centerUv, uvDirection, pathLength, centerInverseDepth, 0.6000000238418579);
+    crossing[12] = directionalCrossings(centerUv, uvDirection, pathLength, centerInverseDepth, 0.6499999761581421);
+    crossing[13] = directionalCrossings(centerUv, uvDirection, pathLength, centerInverseDepth, 0.699999988079071);
+    crossing[14] = directionalCrossings(centerUv, uvDirection, pathLength, centerInverseDepth, 0.75);
+    crossing[15] = directionalCrossings(centerUv, uvDirection, pathLength, centerInverseDepth, 0.800000011920929);
+    crossing[16] = directionalCrossings(centerUv, uvDirection, pathLength, centerInverseDepth, 0.8500000238418579);
+    crossing[17] = directionalCrossings(centerUv, uvDirection, pathLength, centerInverseDepth, 0.8999999761581421);
+    crossing[18] = directionalCrossings(centerUv, uvDirection, pathLength, centerInverseDepth, 0.949999988079071);
+    crossing[19] = directionalCrossings(centerUv, uvDirection, pathLength, centerInverseDepth, 1.0);
+    float orderedSum = crossing[0].y + crossing[0].x;
+    for (int index = 1; index < 20; ++index) {
+        orderedSum += crossing[index].x;
+        orderedSum += crossing[index].y;
+    }
+    Scatter = clamp(orderedSum * 2.5, 0.0, 1.0);
+}
+"""
+
+TEMPORAL_LINEAR_DEPTH_FRAG = """
+#version 330 core
+uniform sampler2D uFurMask;
+uniform sampler2D uFurDepth;
+uniform sampler2D uSceneDepth;
+uniform bool uHasFurDepth;
+layout(location = 0) out float OpaqueDepth;
+layout(location = 1) out float ComposedDepth;
+
+void main() {
+    ivec2 pixel = ivec2(gl_FragCoord.xy);
+    float opaqueDepth = texelFetch(uSceneDepth, pixel, 0).a;
+    float furDepth = uHasFurDepth ? texelFetch(uFurDepth, pixel, 0).r : 0.0;
+    bool hasFur = uHasFurDepth
+        && texelFetch(uFurMask, pixel, 0).a > 0.0
+        && furDepth > 0.0;
+    OpaqueDepth = opaqueDepth;
+    ComposedDepth = hasFur ? furDepth : opaqueDepth;
+}
+"""
+
+TEMPORAL_HALF_BASE_FRAG = """
+#version 330 core
+uniform sampler2D uFullDisocclusion;
+uniform sampler2D uOpaqueDepth;
+uniform vec2 uFullDimensions;
+layout(location = 0) out float HalfDisocclusion;
+layout(location = 1) out vec2 HalfVelocity;
+layout(location = 2) out float MaximumDepth;
+layout(location = 3) out float MinimumDepth;
+
+ivec2 clampFullPixel(ivec2 pixel) {
+    return clamp(pixel, ivec2(0), ivec2(uFullDimensions) - ivec2(1));
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_FragCoord.xy);
+    ivec2 base = pixel * 2;
+    float depth00 = texelFetch(uOpaqueDepth, clampFullPixel(base), 0).r;
+    float depth10 = texelFetch(
+        uOpaqueDepth, clampFullPixel(base + ivec2(1, 0)), 0
+    ).r;
+    float depth01 = texelFetch(
+        uOpaqueDepth, clampFullPixel(base + ivec2(0, 1)), 0
+    ).r;
+    float depth11 = texelFetch(
+        uOpaqueDepth, clampFullPixel(base + ivec2(1, 1)), 0
+    ).r;
+    vec2 uv = (vec2(base) + 1.0) / uFullDimensions;
+    HalfDisocclusion = textureLod(uFullDisocclusion, uv, 0.0).r;
+    HalfVelocity = vec2(0.0);
+    MaximumDepth = max(max(depth00, depth10), max(depth01, depth11));
+    MinimumDepth = min(min(depth00, depth10), min(depth01, depth11));
+}
+"""
+
+TEMPORAL_ALPHA_MASK_FRAG = """
+#version 330 core
+uniform sampler2D uComposedDepth;
+uniform sampler2D uOpaqueMinimumDepth;
+uniform vec2 uFullDimensions;
+layout(location = 0) out float AlphaMask;
+
+void main() {
+    ivec2 pixel = ivec2(gl_FragCoord.xy);
+    vec2 uv = (vec2(pixel * 2) + 1.0) / uFullDimensions;
+    float fullDepth = textureLod(uComposedDepth, uv, 0.0).r;
+    float halfDepth = texelFetch(uOpaqueMinimumDepth, pixel, 0).r;
+    AlphaMask = float(fullDepth < halfDepth * 0.9980000257492065);
+}
+"""
+
+TEMPORAL_ALPHA_HALF_FRAG = """
+#version 330 core
+#extension GL_ARB_gpu_shader5 : require
+uniform sampler2D uFullDisocclusion;
+uniform sampler2D uComposedDepth;
+uniform sampler2D uFurVelocity;
+uniform sampler2D uOpaqueVelocity;
+uniform sampler2D uFurMask;
+uniform sampler2D uAlphaMask;
+uniform vec2 uFullDimensions;
+layout(location = 0) out float HalfDisocclusion;
+layout(location = 1) out vec2 HalfVelocity;
+layout(location = 2) out float MaximumDepth;
+layout(location = 3) out float MinimumDepth;
+
+void main() {
+    ivec2 pixel = ivec2(gl_FragCoord.xy);
+    if (texelFetch(uAlphaMask, pixel, 0).r == 0.0) {
+        discard;
+    }
+    vec2 uv = (vec2(pixel * 2) + 1.0) / uFullDimensions;
+    vec4 depths = textureGather(uComposedDepth, uv, 0);
+    float maximumDepth = max(max(depths.x, depths.y), depths.z);
+    float minimumDepth = min(min(depths.x, depths.y), depths.z);
+    vec4 furMask = textureGather(uFurMask, uv, 3);
+    vec4 velocityX = mix(
+        textureGather(uOpaqueVelocity, uv, 0),
+        textureGather(uFurVelocity, uv, 0),
+        greaterThan(furMask, vec4(0.0))
+    );
+    vec4 velocityY = mix(
+        textureGather(uOpaqueVelocity, uv, 1),
+        textureGather(uFurVelocity, uv, 1),
+        greaterThan(furMask, vec4(0.0))
+    );
+    vec2 selectedVelocity = vec2(velocityX.x, velocityY.x);
+    if (depths.y == maximumDepth) {
+        selectedVelocity = vec2(velocityX.y, velocityY.y);
+    }
+    if (depths.z == maximumDepth) {
+        selectedVelocity = vec2(velocityX.z, velocityY.z);
+    }
+    if (depths.w == maximumDepth) {
+        selectedVelocity = vec2(velocityX.w, velocityY.w);
+    }
+    HalfDisocclusion = textureLod(uFullDisocclusion, uv, 0.0).r;
+    HalfVelocity = selectedVelocity;
+    MaximumDepth = maximumDepth;
+    MinimumDepth = minimumDepth;
+}
+"""
+
+TEMPORAL_DISOCCLUSION_FRAG = """
+#version 330 core
+#extension GL_ARB_gpu_shader5 : require
+uniform sampler2D uMotion;
+uniform sampler2D uOpaqueMotion;
+uniform sampler2D uFurMask;
+uniform sampler2D uLinearDepth;
+uniform sampler2D uHistoryDepthMotion;
+uniform sampler2D uMotionBlurScatter;
+uniform sampler2D uAccAlphaFlags;
+uniform mat4 uCurrentToPreviousView;
+uniform mat3 uCurrentToPreviousRotation;
+uniform mat4 uPreviousProjection;
+uniform vec4 uCurrentProjection;
+uniform vec2 uDimensions;
+uniform float uDepthBase;
+uniform float uDepthSlope;
+uniform float uMotionThreshold;
+uniform float uCameraMotionScale;
+uniform bool uHasFurMotion;
+uniform bool uHasOpaqueMotion;
+uniform bool uHasHistory;
+uniform bool uRequireAccAlphaFlag;
+layout(location = 0) out vec2 FullDisocclusion;
+layout(location = 1) out vec2 DepthMotion;
+
+ivec2 clampPixel(ivec2 pixel, ivec2 dimensions) {
+    return clamp(pixel, ivec2(0), dimensions - ivec2(1));
+}
+
+float loadDepth(ivec2 pixel, ivec2 dimensions) {
+    pixel = clampPixel(pixel, dimensions);
+    return texelFetch(uLinearDepth, pixel, 0).r;
+}
+
+vec2 loadVelocity(ivec2 pixel, ivec2 dimensions) {
+    pixel = clampPixel(pixel, dimensions);
+    bool useFurMotion = uHasFurMotion
+        && texelFetch(uFurMask, pixel, 0).a > 0.0;
+    if (!useFurMotion && !uHasOpaqueMotion) {
+        return vec2(0.0);
+    }
+    vec2 nativeVelocity = useFurMotion
+        ? texelFetch(uMotion, pixel, 0).xy
+        : texelFetch(uOpaqueMotion, pixel, 0).xy;
+#ifdef RCRA_NATIVE_UPPER_LEFT
+    return nativeVelocity;
+#else
+    return vec2(nativeVelocity.x, -nativeVelocity.y);
+#endif
+}
+
+vec3 reconstructViewPosition(vec2 uv, float depth) {
+    vec2 ndc = uv * 2.0 - 1.0;
+#ifdef RCRA_NATIVE_UPPER_LEFT
+    ndc.y = -ndc.y;
+#endif
+    vec2 viewXY = (ndc + uCurrentProjection.zw) * depth
+        / uCurrentProjection.xy;
+    return vec3(viewXY, -depth);
+}
+
+vec2 projectedCenteredUv(mat4 projection, vec3 viewPosition) {
+    vec4 clip = projection * vec4(viewPosition, 1.0);
+    vec2 centered = clip.xy / max(clip.w, 0.000001) * 0.5;
+#ifdef RCRA_NATIVE_UPPER_LEFT
+    centered.y = -centered.y;
+#endif
+    return centered;
+}
+
+void main() {
+    ivec2 dimensions = ivec2(uDimensions);
+    ivec2 pixel = clampPixel(ivec2(gl_FragCoord.xy), dimensions);
+    if (uRequireAccAlphaFlag
+            && texelFetch(uAccAlphaFlags, pixel >> 1, 0).r == 0.0) {
+        discard;
+    }
+    vec2 pixelCenter = vec2(pixel) + 0.5;
+    vec2 inverseDimensions = 1.0 / uDimensions;
+
+    float centerDepth = loadDepth(pixel, dimensions);
+    float depth00 = loadDepth(pixel + ivec2(-1, -1), dimensions);
+    float depth20 = loadDepth(pixel + ivec2(1, -1), dimensions);
+    float depth02 = loadDepth(pixel + ivec2(-1, 1), dimensions);
+    float depth22 = loadDepth(pixel + ivec2(1, 1), dimensions);
+    float diagonalDepth = min(min(depth00, depth20), min(depth02, depth22));
+    bool centerWins = centerDepth <= 1.025 * diagonalDepth;
+    float selectedDepth = centerWins ? centerDepth : diagonalDepth;
+    ivec2 selectedOffset = ivec2(0);
+    if (!centerWins) {
+        selectedOffset.x = min(depth00, depth02) == selectedDepth ? -1 : 1;
+        selectedOffset.y = min(depth00, depth20) == selectedDepth ? -1 : 1;
+    }
+
+    // The isolated preview clears uncovered linear depth to zero, whereas the
+    // retail frame supplies a valid sky/background depth. Keep those pixels
+    // inert instead of projecting the zero-depth sentinel through the camera.
+    if (selectedDepth <= 0.0) {
+        FullDisocclusion = vec2(0.0);
+        DepthMotion = vec2(0.0);
+        return;
+    }
+
+    vec2 selectedUv = (pixelCenter + vec2(selectedOffset)) * inverseDimensions;
+    vec2 velocity = loadVelocity(pixel + selectedOffset, dimensions);
+    vec2 historyPixel = pixelCenter - velocity;
+    vec2 historyUv = historyPixel * inverseDimensions;
+    float outsideHistory = float(
+        max(abs(0.5 - historyUv.x), abs(0.5 - historyUv.y)) > 0.5
+    );
+
+    if (!uHasHistory) {
+        FullDisocclusion = vec2(1.0, 0.0);
+        DepthMotion = vec2(selectedDepth, 0.0);
+        return;
+    }
+
+    float historyConfidence = textureLod(
+        uMotionBlurScatter, historyUv, 0.0
+    ).r * clamp(2.0 - 0.125 * max(abs(velocity.x), abs(velocity.y)), 0.0, 1.0);
+    float relativeDepth = ((selectedDepth - uDepthBase) * uDepthSlope)
+        / max(selectedDepth, 0.000001);
+    float localDepthReject = clamp(relativeDepth * 0.25 - 1.0, 0.0, 1.0);
+    historyConfidence = max(historyConfidence, localDepthReject);
+
+    vec3 viewPosition = reconstructViewPosition(selectedUv, selectedDepth);
+    vec3 previousViewPosition = (uCurrentToPreviousView
+        * vec4(viewPosition, 1.0)).xyz;
+    float previousViewDepth = max(-previousViewPosition.z, 0.1);
+    vec2 historyProjectionBase = (
+        historyPixel + vec2(selectedOffset)
+    ) * inverseDimensions - 0.5;
+    vec2 previousProjection = projectedCenteredUv(
+        uPreviousProjection, previousViewPosition
+    );
+    vec2 translationDiscrepancy = (
+        historyProjectionBase - previousProjection
+    ) * uDimensions;
+    float translationOutside = clamp(
+        max(abs(translationDiscrepancy.x), abs(translationDiscrepancy.y)) - 1.0,
+        0.0, 1.0
+    );
+
+    vec3 rotatedViewPosition = uCurrentToPreviousRotation * viewPosition;
+    vec2 rotatedProjection = projectedCenteredUv(
+        uPreviousProjection, rotatedViewPosition
+    );
+    vec2 cameraDiscrepancy = (
+        historyProjectionBase - rotatedProjection
+    ) * uDimensions;
+    float cameraMotion = uCameraMotionScale * length(cameraDiscrepancy);
+    DepthMotion = vec2(selectedDepth, cameraMotion);
+
+    vec2 scatterDelta = 1.5 * inverseDimensions;
+    vec2 scatterTopLeft = textureLod(
+        uHistoryDepthMotion, historyUv - scatterDelta, 0.0
+    ).xy;
+    vec2 scatterTopRight = textureLod(
+        uHistoryDepthMotion,
+        historyUv + vec2(scatterDelta.x, -scatterDelta.y), 0.0
+    ).xy;
+    vec2 scatterBottom = textureLod(
+        uHistoryDepthMotion, historyUv + vec2(0.0, scatterDelta.y), 0.0
+    ).xy;
+    float scatterDepth = min(
+        min(scatterTopLeft.x, scatterTopRight.x), scatterBottom.x
+    );
+    float scatterMotion = scatterTopLeft.x == scatterDepth
+        ? scatterTopLeft.y
+        : (scatterTopRight.x == scatterDepth
+            ? scatterTopRight.y : scatterBottom.y);
+
+    float rejectionRate = translationOutside != 0.0 ? 24.0 : 120.0;
+    float translatedDepthAdjustment = (
+        min(previousViewDepth, selectedDepth) - previousViewDepth
+    ) * translationOutside;
+    float depthEdgeLimit = centerDepth * 0.075;
+    float depthEdge = 0.0;
+    float edgeDelta = abs(centerDepth - depth00);
+    depthEdge = max(depthEdge, edgeDelta < depthEdgeLimit ? edgeDelta : 0.0);
+    edgeDelta = abs(centerDepth - depth20);
+    depthEdge = max(depthEdge, edgeDelta < depthEdgeLimit ? edgeDelta : 0.0);
+    edgeDelta = abs(centerDepth - depth02);
+    depthEdge = max(depthEdge, edgeDelta < depthEdgeLimit ? edgeDelta : 0.0);
+    edgeDelta = abs(centerDepth - depth22);
+    depthEdge = max(depthEdge, edgeDelta < depthEdgeLimit ? edgeDelta : 0.0);
+
+    float relativeHistoryDepth = (
+        previousViewDepth - scatterDepth + translatedDepthAdjustment
+    ) / max(scatterDepth, 0.000001);
+    float depthReject = clamp(
+        (relativeHistoryDepth - depthEdge) * rejectionRate - 1.0,
+        0.0, 1.0
+    );
+    float motionConfidence = clamp(
+        max(scatterMotion, cameraMotion) - uMotionThreshold, 0.0, 1.0
+    );
+    float smallCameraReject = clamp(
+        cameraMotion * 0.125 - 0.5, 0.0, 1.0
+    ) * 0.125;
+    float baseReject = max(outsideHistory, smallCameraReject);
+    float disocclusion = clamp(
+        depthReject * motionConfidence + baseReject, 0.0, 1.0
+    );
+    FullDisocclusion = vec2(disocclusion, historyConfidence);
+}
+"""
+
+TEMPORAL_ACCUM_FRAG = """
+#version 330 core
+#extension GL_ARB_gpu_shader5 : require
+#extension GL_ARB_shading_language_packing : require
+/* HAIR_TEMPORAL */
+in vec2 vTexCoord;
+uniform sampler2D uCurrent;
+uniform sampler2D uHistory;
+uniform sampler2D uMotion;
+uniform sampler2D uOpaqueMotion;
+uniform sampler2D uFurMask;
+uniform sampler2D uLinearDepth;
+uniform sampler2D uAlphaMask;
+uniform sampler2D uDisocclusion;
+uniform usampler2D uStencil;
+uniform float uHistoryWarmup;
+uniform float uTemporalMinimumRejection;
+uniform vec2 uHistoryJitterOffset;
+uniform vec2 uTemporalFilterOffsetPixels;
+uniform bool uHasFurMotion;
+uniform bool uHasOpaqueMotion;
+uniform bool uHasStencil;
+uniform bool uHasTemporalHistory;
+uniform bool uHasAlphaMask;
+uniform bool uHasDisocclusion;
+uniform float uNonopaqueStencilRejection;
+uniform float uTemporalHdrScale;
+uniform vec4 uTemporalDither;
+layout(location = 0) out vec4 FragColor;
+
+ivec2 clampTemporalPixel(ivec2 pixel, ivec2 dimensions) {
+    return clamp(pixel, ivec2(0), dimensions - ivec2(1));
+}
+
+vec3 sampleCurrentColor(ivec2 pixel, ivec2 dimensions) {
+    return texelFetch(uCurrent, clampTemporalPixel(pixel, dimensions), 0).rgb;
+}
+
+void main() {
+    ivec2 dimensions = textureSize(uCurrent, 0);
+    vec2 texel = 1.0 / vec2(dimensions);
+    ivec2 currentPixel = clampTemporalPixel(
+        ivec2(floor(vTexCoord * vec2(dimensions))), dimensions
+    );
+    vec2 currentUV = (vec2(currentPixel) + 0.5) * texel;
+    vec4 current = vec4(
+        sampleCurrentColor(currentPixel, dimensions),
+        texelFetch(uCurrent, currentPixel, 0).a
+    );
+    vec2 historyPixel = vec2(currentPixel) + 0.5;
+    vec2 motionPixels = vec2(0.0);
+    float centerDepth = texelFetch(uLinearDepth, currentPixel, 0).r;
+    float depth00 = texelFetch(
+        uLinearDepth, clampTemporalPixel(currentPixel + ivec2(-1, -1), dimensions), 0
+    ).r;
+    float depth20 = texelFetch(
+        uLinearDepth, clampTemporalPixel(currentPixel + ivec2(1, -1), dimensions), 0
+    ).r;
+    float depth02 = texelFetch(
+        uLinearDepth, clampTemporalPixel(currentPixel + ivec2(-1, 1), dimensions), 0
+    ).r;
+    float depth22 = texelFetch(
+        uLinearDepth, clampTemporalPixel(currentPixel + ivec2(1, 1), dimensions), 0
+    ).r;
+    float diagonalDepth = min(min(depth00, depth20), min(depth02, depth22));
+    bool centerWins = centerDepth <= 1.025 * diagonalDepth;
+    ivec2 velocityOffset = ivec2(0);
+    if (!centerWins) {
+        velocityOffset.x = min(depth00, depth02) == diagonalDepth ? -1 : 1;
+        velocityOffset.y = min(depth00, depth20) == diagonalDepth ? -1 : 1;
+    }
+    ivec2 velocityPixel = clampTemporalPixel(
+        currentPixel + velocityOffset, dimensions
+    );
+    bool useFurMotion = uHasFurMotion
+        && texelFetch(uFurMask, velocityPixel, 0).a > 0.0;
+    if (useFurMotion || uHasOpaqueMotion) {
+        // Native velocity is current-minus-previous in top-left pixel space.
+        // Convert its Y component to this lower-left texture convention.  The
+        // preview resolves jitter onto a stable grid, so remove the previous
+        // frame's raster offset as well.
+        motionPixels = useFurMotion
+            ? texelFetch(uMotion, velocityPixel, 0).xy
+            : texelFetch(uOpaqueMotion, velocityPixel, 0).xy;
+#ifdef RCRA_NATIVE_UPPER_LEFT
+        vec2 motionToPreviousPixels = -motionPixels;
+#else
+        vec2 motionToPreviousPixels = vec2(-motionPixels.x, motionPixels.y);
+#endif
+        historyPixel += motionToPreviousPixels;
+    }
+    vec2 historyUV = historyPixel * texel + uHistoryJitterOffset;
+    historyUV = clamp(historyUV, texel * 0.5, vec2(1.0) - texel * 0.5);
+    // Native apply keeps its measured/history rejection separate from the
+    // global response floor. The floor affects only the final history blend.
+    float rejection = uHistoryWarmup;
+    if (uHasDisocclusion) {
+        vec2 disocclusion = texelFetch(uDisocclusion, currentPixel, 0).rg;
+        rejection = max(rejection, disocclusion.r);
+        rejection = max(rejection, 0.5 * disocclusion.g);
+    }
+    if (uHasAlphaMask) {
+        float alphaMask = textureLod(uAlphaMask, currentUV, 0.0).r;
+        rejection = max(rejection, 0.5 * alphaMask);
+    }
+    if (uHasStencil) {
+        uint category = texelFetch(uStencil, velocityPixel, 0).r & 128u;
+        rejection = max(
+            rejection, float(category) * uNonopaqueStencilRejection
+        );
+    }
+    float blendFactor = max(rejection, uTemporalMinimumRejection);
+    vec3 historyRgb;
+    if (!uHasTemporalHistory) {
+        // D3D null-history reads are defined as zero. The OpenGL texture's
+        // initial contents are undefined, so use an inert finite input while
+        // rejection is one on a new or reset history.
+        historyRgb = current.rgb;
+    } else if (rejection <= 0.125
+            && dot(motionPixels, motionPixels) >= 0.015625) {
+        historyRgb = hairTemporalHistoryCatmullRom(
+            uHistory, historyUV / texel, texel
+        );
+    } else {
+        historyRgb = textureLod(uHistory, historyUV, 0.0).rgb;
+    }
+
+    vec3 samples[9];
+    int sampleIndex = 0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            vec3 sampleColor = sampleCurrentColor(
+                currentPixel + ivec2(x, y), dimensions
+            );
+            samples[sampleIndex++] = hairTemporalRoundCurrentChroma(
+                hairTemporalEncode(sampleColor, uTemporalHdrScale)
+            );
+        }
+    }
+
+    // The executable's cbuffer builder normalizes a Gaussian and separable
+    // Catmull kernel, then mixes 80 percent toward Catmull. Rejection broadens
+    // those weights toward the shader's fixed 3x3 limit.
+    float broadening = clamp(rejection * 4.0 - 1.0, 0.0, 1.0);
+    float weights[9];
+    hairTemporalFilterWeights(uTemporalFilterOffsetPixels, weights);
+    weights[0] = (0.05 - weights[0]) * broadening + weights[0];
+    weights[1] = (0.10 - weights[1]) * broadening + weights[1];
+    weights[2] = (0.05 - weights[2]) * broadening + weights[2];
+    weights[3] = (0.10 - weights[3]) * broadening + weights[3];
+    weights[4] = (0.40 - weights[4]) * broadening + weights[4];
+    weights[5] = (0.10 - weights[5]) * broadening + weights[5];
+    weights[6] = (0.05 - weights[6]) * broadening + weights[6];
+    weights[7] = (0.10 - weights[7]) * broadening + weights[7];
+    weights[8] = (0.05 - weights[8]) * broadening + weights[8];
+    const int accumulationOrder[9] = int[9](1, 3, 4, 5, 7, 0, 2, 6, 8);
+    int firstIndex = accumulationOrder[0];
+    vec3 filteredCurrent = hairTemporalPremultiply(samples[firstIndex])
+        * weights[firstIndex];
+    for (int i = 1; i < 9; ++i) {
+        int index = accumulationOrder[i];
+        filteredCurrent += hairTemporalPremultiply(samples[index]) * weights[index];
+    }
+    filteredCurrent.x = max(filteredCurrent.x, HAIR_TEMPORAL_MIN_LUMA);
+    vec3 currentRgb = hairTemporalDecodePremultiplied(filteredCurrent);
+
+    vec3 neighborhoodMin = min(
+        min(samples[1], samples[3]), min(samples[5], samples[7])
+    );
+    neighborhoodMin = min(neighborhoodMin, samples[4]);
+    vec3 neighborhoodMax = max(
+        max(samples[1], samples[3]), max(samples[5], samples[7])
+    );
+    neighborhoodMax = max(neighborhoodMax, samples[4]);
+    vec3 fullMin = min(
+        neighborhoodMin, min(min(samples[0], samples[2]), min(samples[6], samples[8]))
+    );
+    vec3 fullMax = max(
+        neighborhoodMax, max(max(samples[0], samples[2]), max(samples[6], samples[8]))
+    );
+    float diagonalConfidence = clamp(1.0 - rejection * 20.0, 0.0, 1.0);
+    neighborhoodMin = (fullMin - neighborhoodMin) * diagonalConfidence
+        + neighborhoodMin;
+    neighborhoodMax = (fullMax - neighborhoodMax) * diagonalConfidence
+        + neighborhoodMax;
+
+    vec3 history = hairTemporalEncode(historyRgb, uTemporalHdrScale);
+    history = clamp(history, neighborhoodMin, neighborhoodMax);
+    vec3 constrainedHistory = hairTemporalDecode(history);
+    vec3 compressedResult = (currentRgb - constrainedHistory) * blendFactor
+        + constrainedHistory;
+    vec3 outputRgb = hairTemporalUndoHdrCompression(
+        compressedResult, uTemporalHdrScale
+    );
+    ivec2 ditherPixel = currentPixel;
+#ifndef RCRA_NATIVE_UPPER_LEFT
+    ditherPixel.y = dimensions.y - 1 - ditherPixel.y;
+#endif
+    float noise = fract(
+        (float(ditherPixel.x + 2 * ditherPixel.y) + uTemporalDither.z) * 0.2
+    );
+    noise += uTemporalDither.w * 0.2;
+    outputRgb.rg *= 1.0 + noise * uTemporalDither.x;
+    outputRgb.b *= 1.0 + noise * uTemporalDither.y;
+    FragColor = vec4(outputRgb, current.a);
+}
+"""
+TEMPORAL_ACCUM_FRAG = TEMPORAL_ACCUM_FRAG.replace(
+    '/* HAIR_TEMPORAL */',
+    (Path(__file__).resolve().parents[1] / 'core/hair_temporal.glsl')
+    .read_text(encoding='utf-8'),
+)
+
+# Contact visibility is evaluated on the key-light contribution before denoise.
+FUR_CONTACT_FRAG = """
+#version 330 core
+#extension GL_ARB_gpu_shader5 : enable
+uniform sampler2D uScene;
+uniform sampler2D uFurKeyLight;
+uniform sampler2D uFurGBuffer;
+uniform sampler2D uFurNormalMask;
+uniform vec2 uViewportSize;
+uniform vec2 uProjectionScale;
+uniform vec2 uProjectionOffset;
+uniform mat3 uViewRotation;
+uniform vec3 uWorldLightDir;
+uniform float uTemporalIndex;
+uniform float uTemporalPlusCycle;
+uniform bool uFurContactEnabled;
+layout(location = 0) out vec4 FragColor;
+layout(location = 1) out vec4 BrightColor;
+/* HAIR_LIGHTING_NOISE */
+/* HAIR_SURFACE */
+/* HAIR_CONTACT */
+/* HAIR_COLOR_STORE */
+float hairContactLoadDepth(ivec2 pixel) {
+    ivec2 dimensions = textureSize(uFurGBuffer, 0);
+    if (any(lessThan(pixel, ivec2(0))) || any(greaterThanEqual(pixel, dimensions))) return 0.0;
+#ifndef RCRA_NATIVE_UPPER_LEFT
+    pixel.y = dimensions.y - 1 - pixel.y;
+#endif
+    return texelFetch(uFurGBuffer, pixel, 0).a;
+}
+void main() {
+    ivec2 center = ivec2(gl_FragCoord.xy);
+    vec4 normalMask = texelFetch(uFurNormalMask, center, 0);
+    if (normalMask.a <= 0.0) discard;
+    vec4 indirect = texelFetch(uScene, center, 0);
+    vec4 key = texelFetch(uFurKeyLight, center, 0);
+    float visibility = indirect.a;
+    if (visibility <= 0.0001) visibility = 0.0;
+    if (uFurContactEnabled) {
+        float depth = texelFetch(uFurGBuffer, center, 0).a;
+#ifdef RCRA_NATIVE_UPPER_LEFT
+        vec2 pixel = vec2(center);
+#else
+        vec2 pixel = vec2(center.x, int(uViewportSize.y) - 1 - center.y);
+#endif
+        vec2 inverseDimensions = 1.0 / uViewportSize;
+        vec3 noise = hairLightingNoise(pixel, inverseDimensions, uTemporalIndex, uTemporalPlusCycle);
+        vec3 light = normalize(uWorldLightDir);
+        vec3 viewLight = (uViewRotation * light) * vec3(1.0, -1.0, -1.0);
+#ifdef GL_ARB_gpu_shader5
+        float radius = fma(key.a, uintBitsToFloat(0x39041aa4u), uintBitsToFloat(0x3b03126fu));
+#else
+        float radius = key.a * uintBitsToFloat(0x39041aa4u) + uintBitsToFloat(0x3b03126fu);
+#endif
+        float contact = hairContactVisibility(pixel, depth, normalMask.xyz, light, viewLight,
+            inverseDimensions, vec4(2.0 / uProjectionScale, (uProjectionOffset - 1.0) / uProjectionScale),
+            vec2(1.0, 0.0), vec4(uProjectionScale * 0.5, (1.0 - uProjectionOffset) * 0.5),
+            uViewportSize, noise.xz, radius);
+        visibility = min(visibility, contact);
+    }
+    FragColor = vec4(hairStoreColor(indirect.rgb + key.rgb * visibility), 1.0);
+    BrightColor = vec4(0.0);
+}
+"""
+for _marker, _filename in (
+    ('/* HAIR_LIGHTING_NOISE */', 'hair_lighting_noise.glsl'),
+    ('/* HAIR_SURFACE */', 'hair_surface.glsl'),
+    ('/* HAIR_CONTACT */', 'hair_contact_shadow.glsl'),
+    ('/* HAIR_COLOR_STORE */', 'hair_color_store.glsl'),
+):
+    FUR_CONTACT_FRAG = FUR_CONTACT_FRAG.replace(
+        _marker, (Path(__file__).resolve().parents[1] / 'core' / _filename).read_text(encoding='utf-8'),
+    )
+
+# Shared captured HairDenoise geometry and gather kernel. The preview derives
+# Hair tile occupancy from its fur buffer; its lighting mask remains the
+# isolated renderer's input until full deferred Hair lighting is connected.
 FUR_DENOISE_FRAG = """
 #version 330 core
+#extension GL_ARB_gpu_shader5 : enable
 in vec2 vTexCoord;
 uniform sampler2D uScene;
 uniform sampler2D uFurGBuffer;
 uniform sampler2D uFurNormalMask;
+uniform sampler2D uSceneDenoiseMask;
+uniform usampler2D uGatherAddress;
+uniform bool uHasGatherAddress;
+uniform bool uHasSceneDenoiseMask;
+uniform bool uHasSceneProjection;
+uniform vec4 uSceneScreenToView;
+uniform vec4 uSceneViewToScreen;
 uniform mat3 uViewRotation;
 uniform vec2 uProjectionScale;
+uniform vec2 uProjectionOffset;
 uniform vec2 uViewportSize;
-uniform int uFrameIndex;
 uniform float uTemporalIndex;
+uniform float uTemporalPlusCycle;
 out vec4 FragColor;
 
-float screenHash(vec2 normalizedPosition) {
-    return fract(sin(dot(normalizedPosition, vec2(12.9898, 78.233002)))
-        * 43758.546875 + uTemporalIndex);
+/* HAIR_LIGHTING_NOISE */
+/* HAIR_SURFACE */
+/* HAIR_DENOISE */
+/* HAIR_COLOR_STORE */
+
+vec4 previewDenoiseGather(sampler2D source, vec2 d3dUV, int component) {
+#ifdef GL_ARB_gpu_shader5
+    if (uHasGatherAddress) {
+        // Let the sampler choose addresses in native top-left coordinates.
+        // Flipping UV before the gather changes subtexel boundary rounding.
+        uvec4 addresses = textureGather(uGatherAddress, d3dUV, 0);
+        ivec2 dimensions = textureSize(source, 0);
+        vec4 values;
+        for (int i = 0; i < 4; ++i) {
+            ivec2 pixel = ivec2(addresses[i] % uint(dimensions.x),
+                                addresses[i] / uint(dimensions.x));
+#ifndef RCRA_NATIVE_UPPER_LEFT
+            values[i] = texelFetch(source,
+                ivec2(pixel.x, dimensions.y - 1 - pixel.y), 0)[component];
+#else
+            values[i] = texelFetch(source, pixel, 0)[component];
+#endif
+        }
+        return values;
+    }
+#ifdef RCRA_NATIVE_UPPER_LEFT
+    // Use explicit native addresses here. This avoids depending on OpenGL's
+    // implementation-facing textureGather component order during migration.
+    ivec2 dimensions = textureSize(source, 0);
+    ivec2 base = ivec2(floor(d3dUV * vec2(dimensions) - 0.5));
+    ivec2 offsets[4] = ivec2[](ivec2(0, 1), ivec2(1, 1), ivec2(1, 0), ivec2(0, 0));
+    vec4 values;
+    for (int i = 0; i < 4; ++i) {
+        ivec2 pixel = clamp(base + offsets[i], ivec2(0), dimensions - 1);
+        values[i] = texelFetch(source, pixel, 0)[component];
+    }
+    return values;
+#else
+    vec2 uv = vec2(d3dUV.x, 1.0 - d3dUV.y);
+    // Vertical texture orientation reverses the native gather component order.
+    if (component == 0) return textureGather(source, uv, 0).wzyx;
+    if (component == 1) return textureGather(source, uv, 1).wzyx;
+    if (component == 2) return textureGather(source, uv, 2).wzyx;
+    return textureGather(source, uv, 3).wzyx;
+#endif
+#else
+    ivec2 dimensions = textureSize(source, 0);
+    ivec2 base = ivec2(floor(d3dUV * vec2(dimensions) - 0.5));
+    ivec2 offsets[4] = ivec2[](ivec2(0, 1), ivec2(1, 1), ivec2(1, 0), ivec2(0, 0));
+    vec4 values;
+    for (int i = 0; i < 4; ++i) {
+        ivec2 pixel = clamp(base + offsets[i], ivec2(0), dimensions - 1);
+#ifndef RCRA_NATIVE_UPPER_LEFT
+        pixel.y = dimensions.y - 1 - pixel.y;
+#endif
+        values[i] = texelFetch(source, pixel, 0)[component];
+    }
+    return values;
+#endif
 }
 
-float roundNearestEven(float value) {
-    float base = floor(value);
-    float fraction = value - base;
-    if (fraction < 0.5) return base;
-    if (fraction > 0.5) return base + 1.0;
-    return mod(base, 2.0) == 0.0 ? base : base + 1.0;
+vec4 hairDenoiseGatherDepth(vec2 uv) {
+    vec4 depth = previewDenoiseGather(uFurGBuffer, uv, 3);
+    return vec4(hairDenoiseHalfDepth(depth.x), hairDenoiseHalfDepth(depth.y),
+                hairDenoiseHalfDepth(depth.z), hairDenoiseHalfDepth(depth.w));
 }
 
-float denoisePhase(vec2 pixel) {
-    vec2 rounded = vec2(
-        roundNearestEven(pixel.x), roundNearestEven(pixel.y)
-    );
-    return fract(
-        (rounded.x + rounded.y * 2.0 + float(uFrameIndex)
-            + screenHash(pixel / max(uViewportSize, vec2(1.0)))) * 0.2
-    );
+vec4 hairDenoiseGatherMask(vec2 uv) {
+    vec4 hair = previewDenoiseGather(uFurNormalMask, uv, 3);
+    return uHasSceneDenoiseMask
+        ? max(hair, previewDenoiseGather(uSceneDenoiseMask, uv, 0)) : hair;
 }
 
-vec2 projectViewPosition(vec3 position) {
-    float reciprocalDepth = 1.0 / max(-position.z, 0.000001);
-    vec2 ndc = position.xy * uProjectionScale * reciprocalDepth;
-    return ndc * 0.5 + 0.5;
+vec4 hairDenoiseGatherColor(vec2 uv, int component) {
+    return previewDenoiseGather(uScene, uv, component);
 }
 
-void gatherFurSample(
-        ivec2 pixel, float projectedDepth, float centerDepth,
-        inout vec3 colorSum, inout float weightSum) {
-    ivec2 dimensions = textureSize(uScene, 0);
-    ivec2 clampedPixel = clamp(pixel, ivec2(0), dimensions - ivec2(1));
-    vec4 fur = texelFetch(uFurGBuffer, clampedPixel, 0);
-    float mask = fur.a > 0.0 ? 1.0 : 0.0;
-    if (mask <= 0.0) return;
-    float sampleDepth = 1.0 / max(fur.a, 0.000001);
-    float depthWeight = clamp(
-        (sampleDepth - projectedDepth) * (200.0 / centerDepth) + 1.0,
-        0.0, 1.0
-    );
-    float weight = depthWeight * mask;
-    colorSum += texelFetch(uScene, clampedPixel, 0).rgb * weight;
-    weightSum += weight;
+bool hairDenoiseTileActive(vec2 uv) {
+    ivec2 dimensions = textureSize(uFurGBuffer, 0);
+    ivec2 tile = ivec2(uv * uViewportSize) >> 3;
+    if (any(lessThan(tile, ivec2(0)))) return false;
+    ivec2 origin = tile * 8;
+    if (any(greaterThanEqual(origin, dimensions))) return false;
+    // Equivalent to the Hair bit for this preview's isolated material buffer.
+    // Return early for occupied tiles; masked gather weights handle boundaries.
+    for (int y = 0; y < 8; ++y) {
+        for (int x = 0; x < 8; ++x) {
+            ivec2 pixel = origin + ivec2(x, y);
+            if (any(greaterThanEqual(pixel, dimensions))) continue;
+#ifndef RCRA_NATIVE_UPPER_LEFT
+            pixel.y = dimensions.y - 1 - pixel.y;
+#endif
+            if (texelFetch(uFurNormalMask, pixel, 0).a > 0.0) return true;
+        }
+    }
+    return false;
 }
 
 void main() {
     ivec2 centerPixel = ivec2(gl_FragCoord.xy);
-    vec4 centerFur = texelFetch(uFurGBuffer, centerPixel, 0);
-    if (centerFur.a <= 0.0) {
-        discard;
-    }
+    vec4 fur = texelFetch(uFurGBuffer, centerPixel, 0);
+    vec4 normalMask = texelFetch(uFurNormalMask, centerPixel, 0);
+    if (normalMask.a <= 0.0) discard;
     vec4 centerColor = texelFetch(uScene, centerPixel, 0);
-
-    vec3 geometricNormal = normalize(
-        texelFetch(uFurNormalMask, centerPixel, 0).xyz
-    );
-    vec3 strandTangent = normalize(centerFur.xyz);
-    float centerDepth = 1.0 / max(centerFur.a, 0.000001);
-    float tangentAgreement = abs(dot(geometricNormal, strandTangent));
-    float rayLength = min(
-        0.0025,
-        sqrt(max(1.0 - tangentAgreement, 0.0)) * 0.05
-    );
-    vec3 viewTangent = normalize(uViewRotation * strandTangent);
-    vec2 ndc = vTexCoord * 2.0 - 1.0;
-    vec3 viewPosition = vec3(
-        ndc.x * centerDepth / uProjectionScale.x,
-        ndc.y * centerDepth / uProjectionScale.y,
-        -centerDepth
-    );
-    vec3 rayStart = viewPosition - viewTangent * (rayLength * 0.5);
-    vec3 rayEnd = viewPosition + viewTangent * (rayLength * 0.5);
-    vec2 startUv = projectViewPosition(rayStart);
-    vec2 endUv = projectViewPosition(rayEnd);
-    float startReciprocalDepth = 1.0 / max(-rayStart.z, 0.000001);
-    float endReciprocalDepth = 1.0 / max(-rayEnd.z, 0.000001);
-    float phase = denoisePhase(gl_FragCoord.xy);
-
-    vec3 colorSum = centerColor.rgb;
-    float weightSum = 1.0;
-    ivec2 dimensions = textureSize(uScene, 0);
-    for (int step = 0; step < 3; ++step) {
-        float along = (phase + float(step)) / 3.0;
-        vec2 sampleUv = mix(startUv, endUv, along);
-        float sampleReciprocalDepth = mix(
-            startReciprocalDepth, endReciprocalDepth, along
-        );
-        float projectedDepth = 1.0 / max(
-            sampleReciprocalDepth, 0.000001
-        );
-        vec2 gatherPosition = sampleUv * vec2(dimensions) - 0.5;
-        ivec2 basePixel = ivec2(floor(gatherPosition));
-        gatherFurSample(
-            basePixel, projectedDepth, centerDepth, colorSum, weightSum
-        );
-        gatherFurSample(
-            basePixel + ivec2(1, 0), projectedDepth, centerDepth,
-            colorSum, weightSum
-        );
-        gatherFurSample(
-            basePixel + ivec2(0, 1), projectedDepth, centerDepth,
-            colorSum, weightSum
-        );
-        gatherFurSample(
-            basePixel + ivec2(1, 1), projectedDepth, centerDepth,
-            colorSum, weightSum
-        );
+    vec3 normal = normalMask.xyz;
+    vec3 strand = fur.xyz;
+    float depth = hairDenoiseHalfDepth(fur.a);
+#ifdef RCRA_NATIVE_UPPER_LEFT
+    vec2 pixel = vec2(centerPixel);
+#else
+    vec2 pixel = vec2(centerPixel.x, int(uViewportSize.y) - 1 - centerPixel.y);
+#endif
+    vec2 inverseDimensions = 1.0 / uViewportSize;
+    float phase = hairScreenPhase(pixel, inverseDimensions, uTemporalIndex, uTemporalPlusCycle);
+    vec3 viewTangent = (uViewRotation * strand) * vec3(1.0, -1.0, -1.0);
+    vec4 screenToView = vec4(2.0 / uProjectionScale, (uProjectionOffset - 1.0) / uProjectionScale);
+    vec4 viewToScreen = vec4(uProjectionScale * 0.5, (1.0 - uProjectionOffset) * 0.5);
+    if (uHasSceneProjection) {
+        screenToView = uSceneScreenToView;
+        viewToScreen = uSceneViewToScreen;
     }
-    FragColor = vec4(colorSum / max(weightSum, 0.000001), centerColor.a);
+    HairDenoiseRay ray = hairDenoiseBuildRay(
+        pixel, depth, normal, strand, viewTangent, inverseDimensions,
+        screenToView, vec2(1.0, 0.0), viewToScreen, phase
+    );
+    FragColor = vec4(hairStoreColor(hairDenoiseFilter(ray, centerColor.rgb, depth)), centerColor.a);
 }
 """
+
+for _marker, _filename in (
+    ('/* HAIR_LIGHTING_NOISE */', 'hair_lighting_noise.glsl'),
+    ('/* HAIR_SURFACE */', 'hair_surface.glsl'),
+    ('/* HAIR_DENOISE */', 'hair_denoise.glsl'),
+    ('/* HAIR_COLOR_STORE */', 'hair_color_store.glsl'),
+):
+    FUR_DENOISE_FRAG = FUR_DENOISE_FRAG.replace(
+        _marker,
+        (Path(__file__).resolve().parents[1] / 'core' / _filename)
+        .read_text(encoding='utf-8'),
+    )
 
 FUR_OIT_COMPOSITE_FRAG = """
 #version 330 core
@@ -2286,6 +3122,7 @@ def _halton(index: int, base: int) -> float:
 def _temporal_current_sample_offset(
     jitter_pixels: tuple[float, float],
     framebuffer_size: tuple[int, int],
+    *, upper_left: bool = False,
 ) -> tuple[float, float]:
     """Undo projection jitter when sampling the current temporal-AA frame.
 
@@ -2296,9 +3133,36 @@ def _temporal_current_sample_offset(
     """
     width = max(int(framebuffer_size[0]), 1)
     height = max(int(framebuffer_size[1]), 1)
+    y_sign = 1.0 if upper_left else -1.0
     return (
         -float(jitter_pixels[0]) / float(width),
-        -float(jitter_pixels[1]) / float(height),
+        y_sign * float(jitter_pixels[1]) / float(height),
+    )
+
+
+def _temporal_history_jitter_offset(
+    current_jitter_pixels: tuple[float, float],
+    previous_jitter_pixels: tuple[float, float],
+    framebuffer_size: tuple[int, int],
+    *, upper_left: bool = False,
+) -> tuple[float, float]:
+    """Map native jittered velocity onto the preview's stable history grid."""
+    current = _temporal_current_sample_offset(
+        current_jitter_pixels, framebuffer_size, upper_left=upper_left,
+    )
+    previous = _temporal_current_sample_offset(
+        previous_jitter_pixels, framebuffer_size, upper_left=upper_left,
+    )
+    return current[0] - previous[0], current[1] - previous[1]
+
+
+def _temporal_filter_offset_pixels(
+    jitter_pixels: tuple[float, float], *, upper_left: bool = False,
+) -> tuple[float, float]:
+    """Map projection jitter to the recovered 3x3 filter's pixel frame."""
+    return (
+        float(jitter_pixels[0]),
+        -float(jitter_pixels[1]) if upper_left else float(jitter_pixels[1]),
     )
 
 
@@ -2309,6 +3173,8 @@ class GpuSubMesh:
         self.vao: int = 0
         self.vbo: int = 0
         self.ebo: int = 0
+        self._pose_vertices = None
+        self._pose_history_dirty = False
         self.index_count: int = 0
         self.index_type: int = 0   # GL_UNSIGNED_SHORT or GL_UNSIGNED_INT
         self.color: tuple = (0.75, 0.75, 0.75)
@@ -2380,7 +3246,9 @@ class GpuSubMesh:
             uv.astype(np.float32),
             tangents,
             corrections.astype(np.float32),
+            positions.astype(np.float32),
         ], axis=1).astype(np.float32)
+        self._pose_vertices = interleaved.copy()
 
         self.vao = glGenVertexArrays(1)
         self.vbo = glGenBuffers(1)
@@ -2390,7 +3258,7 @@ class GpuSubMesh:
         glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
         glBufferData(GL_ARRAY_BUFFER, interleaved.nbytes, interleaved, GL_STATIC_DRAW)
 
-        stride = 13 * 4
+        stride = 16 * 4
         glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(0))
         glEnableVertexAttribArray(0)
         glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(12))
@@ -2401,6 +3269,8 @@ class GpuSubMesh:
         glEnableVertexAttribArray(3)
         glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(48))
         glEnableVertexAttribArray(4)
+        glVertexAttribPointer(5, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(52))
+        glEnableVertexAttribArray(5)
 
         if indices.max() < 65536:
             idx = indices.astype(np.uint16)
@@ -2429,12 +3299,46 @@ class GpuSubMesh:
             )
             glBindVertexArray(0)
 
+    def update_pose(self, positions, normals, tangents, *, previous_positions=None):
+        """Update a deformed mesh on the current GL context, preserving its topology.
+
+        Inputs use this submesh's existing vertex order. The producer supplies
+        current deformed normals/tangents; previous positions default to the
+        last rendered pose. This does not decode animation clips or skin weights.
+        """
+        if self._pose_vertices is None:
+            raise ValueError('Upload the mesh before setting a pose')
+        n = len(self._pose_vertices)
+        arrays = [np.asarray(x, dtype=np.float32) for x in (positions, normals, tangents)]
+        previous = (self._pose_vertices[:, :3].copy() if previous_positions is None
+                    else np.asarray(previous_positions, dtype=np.float32))
+        for array, shape in zip([*arrays, previous], [(n, 3), (n, 3), (n, 4), (n, 3)]):
+            if array.shape != shape or not np.isfinite(array).all():
+                raise ValueError('Pose streams must be finite and preserve vertex count')
+        updated = self._pose_vertices.copy()
+        updated[:, :3], updated[:, 3:6], updated[:, 8:12] = arrays
+        updated[:, 13:16] = previous
+        glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
+        glBufferSubData(GL_ARRAY_BUFFER, 0, updated.nbytes, updated)
+        self._pose_vertices = updated
+        self._pose_history_dirty = True
+
+    def settle_pose_history(self):
+        """After a rendered frame, stationary repaint motion must return to zero."""
+        if self._pose_history_dirty:
+            self._pose_vertices[:, 13:16] = self._pose_vertices[:, :3]
+            glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
+            glBufferSubData(GL_ARRAY_BUFFER, 0, self._pose_vertices.nbytes, self._pose_vertices)
+            self._pose_history_dirty = False
+
     def free(self):
         if self.vao:
             glDeleteVertexArrays(1, [self.vao])
             glDeleteBuffers(1, [self.vbo])
             glDeleteBuffers(1, [self.ebo])
             self.vao = 0
+        self._pose_vertices = None
+        self._pose_history_dirty = False
         if self.texture_id:
             glDeleteTextures(1, [self.texture_id])
             self.texture_id = 0
@@ -2465,16 +3369,36 @@ class Viewport3D(QOpenGLWidget):
         self.camera     = ArcballCamera()
         self._gpu_meshes: list[GpuSubMesh] = []
         self._shader_prog: int = 0
+        self._native_raster_active = False
         self._fur_shader_prog: int = 0
+        self._fur_material_prog: int = 0
+        self._fur_decode_prog: int = 0
+        self._fur_lighting_prog: int = 0
         self._fur_layer_texture: int = 0
         self._fur_environment_texture: int = 0
         self._fur_brdf_texture: int = 0
         self._pending_fur_environment = None
+        self._pending_fur_scene = None
+        self._fur_scene_gpu = None
+        self._fur_scene_program = 0
+        self._fur_scene_view = None
         self._grid_prog:   int = 0
         self._blur_prog:   int = 0
         self._composite_prog: int = 0
         self._temporal_accum_prog: int = 0
+        self._temporal_disocclusion_prog: int = 0
+        self._temporal_linear_depth_prog: int = 0
+        self._temporal_half_base_prog: int = 0
+        self._temporal_alpha_mask_prog: int = 0
+        self._temporal_alpha_half_prog: int = 0
+        self._motion_blur_downsample_prog: int = 0
+        self._motion_blur_neighborhood_half_prog: int = 0
+        self._motion_blur_neighborhood_quarter_prog: int = 0
+        self._motion_blur_gather_neighborhood_prog: int = 0
+        self._motion_blur_scatter_prog: int = 0
         self._fur_denoise_prog: int = 0
+        self._fur_contact_prog: int = 0
+        self._fur_deferred_active = False
         self._fur_oit_composite_prog: int = 0
         self._fur_oit_supported: bool = False
         self._grid_vao:    int = 0
@@ -2487,27 +3411,42 @@ class Viewport3D(QOpenGLWidget):
         self._wireframe:   bool = False
         self._show_fur:    bool = True    # toggle fur/composite shell meshes
         self._pending_model  = None
+        self._pending_poses = {}
+        self._reset_pose_history = False
         self._redraw_pending = False
         self._grid_y         = 0.0
         self._grid_fade_r    = 2.0
         self._cached_material_textures: dict = {}   # persists across LOD switches
         self._uploaded_texture_signatures: dict = {}
+        self._max_texture_anisotropy = 1.0
         self._animated_materials = False
         self._bloom_enabled = True
         self._bloom_supported = True
         self._hdr_fbo = 0
         self._hdr_color_buffers: list[int] = []
+        self._fur_material_fbo = 0
+        self._fur_material_textures = []
+        self._fur_decode_fbo = 0
+        self._fur_lighting_fbo = 0
+        self._fur_indirect_texture = 0
+        self._scene_linear_depth_texture = 0
+        self._scene_velocity_texture = 0
+        self._scene_stencil_texture = 0
         self._fur_gbuffer_texture = 0
         self._fur_normal_texture = 0
         self._fur_denoise_fbo = 0
+        self._fur_key_texture = 0
+        self._fur_contact_fbo = 0
+        self._fur_contact_texture = 0
         self._fur_denoise_texture = 0
-        # Recovered Hair contact uses the complete reciprocal-depth buffer and
-        # compares each ray tap in reciprocal (not linear) depth units.
+        self._fur_gather_address_texture = 0
+        # Native contact marches reciprocal ray depth against linear scene depth.
         self._fur_contact_enabled = True
         self._fur_denoise_enabled = True
         # MaterialFur wetness and ModelFur wind strength are runtime state in
         # retail, not constants in the static material payload.
         self._fur_wetness = 0.0
+        self._preview_light_direction = (0.6, 1.0, 0.8)
         self._fur_wind_strength = 0.0
         self._fur_wind_vector = np.asarray((1.0, 0.0, 0.0), dtype=np.float32)
         self._fur_wind_object_phase = 0.0
@@ -2522,11 +3461,43 @@ class Viewport3D(QOpenGLWidget):
         self._pingpong_textures: list[int] = []
         self._temporal_fbos: list[int] = []
         self._temporal_textures: list[int] = []
+        self._temporal_depth_textures: list[int] = []
+        self._temporal_disocclusion_fbos: list[int] = []
+        self._temporal_disocclusion_textures: list[int] = []
+        self._temporal_disocclusion_valid = [False, False]
+        self._temporal_linear_depth_fbo = 0
+        self._temporal_linear_depth_textures: list[int] = []
+        self._temporal_half_fbo = 0
+        self._temporal_half_textures: list[int] = []
+        self._temporal_alpha_mask_fbo = 0
+        self._temporal_alpha_mask_texture = 0
+        self._temporal_alpha_valid = False
+        self._motion_blur_downsample_fbo = 0
+        self._motion_blur_depth_velocity_texture = 0
+        self._motion_blur_half_velocity_texture = 0
+        self._motion_blur_neighborhood_fbos: list[int] = []
+        self._motion_blur_neighborhood_textures: list[int] = []
+        self._motion_blur_scatter_fbos: list[int] = []
+        self._motion_blur_scatter_textures: list[int] = []
+        self._motion_blur_scatter_valid = [False, False]
+        self._motion_blur_sizes = ((0, 0), (0, 0), (0, 0))
         self._temporal_sample_count = 0
         self._temporal_signature = None
+        # These are the three dynamic producers for native TAA m_Misc.xyz.
+        # None selects the recovered executable fallback for response/HDR.
+        self._temporal_nonopaque_response: Optional[float] = None
+        self._temporal_conditional_floor = False
+        self._temporal_hdr_reference: Optional[float] = None
         self._current_temporal_jitter = (0.0, 0.0)
+        self._previous_fur_mvp: Optional[np.ndarray] = None
+        self._previous_fur_projection: Optional[np.ndarray] = None
+        self._previous_fur_view: Optional[np.ndarray] = None
+        self._previous_fur_wind_time: Optional[float] = None
+        self._previous_fur_jitter: Optional[tuple[float, float]] = None
+        self._fur_motion_signature = None
         self._display_scene_texture = 0
         self._current_scene_texture = 0
+        self._current_scene_fbo = 0
         self._bloom_size = (0, 0)
         # Load persisted control settings
         self._controls: dict = load_controls()
@@ -2567,7 +3538,9 @@ class Viewport3D(QOpenGLWidget):
 
     def load_mesh(self, model: ModelAsset):
         """Queue a model for GPU upload — actual upload happens in paintGL."""
+        self._fur_scene_view = None
         self._pending_model  = model
+        self._pending_poses = {}
         self._active_lod     = 0   # reset to LOD0 on new model load
         self._cached_material_textures = {}   # clear texture cache for new model
         self._pending_textures = {}
@@ -2576,6 +3549,31 @@ class Viewport3D(QOpenGLWidget):
             del self._cam_logged
         from PyQt6.QtCore import QTimer
         QTimer.singleShot(10, self._trigger_repaint)
+
+    def set_deformed_pose(self, poses: dict):
+        """Queue per-GPU-submesh (positions, normals, tangents) on the UI thread.
+
+        Arrays must use the uploaded submesh vertex order. Multiple queued
+        updates coalesce; history refers to the last rendered pose, not an
+        intermediate queued pose. Native animation decoding is a separate producer.
+        """
+        if self._pending_model is not None:
+            raise ValueError('Wait for the pending model upload before setting a pose')
+        pending = {}
+        for index, streams in poses.items():
+            if not isinstance(index, int) or not 0 <= index < len(self._gpu_meshes):
+                raise ValueError('Invalid uploaded submesh index')
+            n = len(self._gpu_meshes[index]._pose_vertices)
+            if len(streams) != 3:
+                raise ValueError('A pose requires positions, normals and tangents')
+            arrays = tuple(np.array(x, dtype=np.float32, copy=True) for x in streams)
+            for array, shape in zip(arrays, [(n, 3), (n, 3), (n, 4)]):
+                if array.shape != shape or not np.isfinite(array).all():
+                    raise ValueError('Pose streams must be finite and preserve vertex count')
+            pending[index] = arrays
+        self._pending_poses.update(pending)
+        self._fur_scene_view = None
+        self._trigger_repaint()
 
     def load_textures(self, material_textures: dict):
         """
@@ -2625,13 +3623,15 @@ class Viewport3D(QOpenGLWidget):
         fur_shading = {}
         fur_wind_turbulence = {}
 
-        def upload_slot(mat_idx, slot_data, role):
+        def upload_slot(mat_idx, slot_data, role, anisotropy=1.0):
             if not slot_data or not slot_data[0]:
                 return None
             rgba_bytes, width, height = slot_data[0], slot_data[1], slot_data[2]
             metadata = slot_data[4] if len(slot_data) > 4 \
                 and isinstance(slot_data[4], dict) else {}
-            signature = (role, id(rgba_bytes), width, height)
+            anisotropy = min(anisotropy, self._max_texture_anisotropy)
+            dxgi_format = metadata.get('dxgi_format')
+            signature = (role, id(rgba_bytes), width, height, anisotropy, dxgi_format)
             if self._uploaded_texture_signatures.get((mat_idx, role)) == signature:
                 return None
             try:
@@ -2641,9 +3641,10 @@ class Viewport3D(QOpenGLWidget):
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT)
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT)
+                if self._max_texture_anisotropy > 1.0:
+                    glTexParameterf(GL_TEXTURE_2D, 0x84FE, anisotropy)
                 compressed_mips = metadata.get('compressed_mips')
                 compressed_mip0 = metadata.get('compressed_mip0')
-                dxgi_format = metadata.get('dxgi_format')
                 compressed_format = _compressed_gl_format(
                     dxgi_format, _is_srgb_texture_role(role),
                 )
@@ -2696,7 +3697,7 @@ class Viewport3D(QOpenGLWidget):
                     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_RED)
                 else:
                     internal_format = GL_SRGB8_ALPHA8 \
-                        if _is_srgb_texture_role(role) else GL_RGBA8
+                        if (_is_srgb_texture_role(role) or dxgi_format in (29, 72, 75, 78, 91, 93, 99)) else GL_RGBA8
                     glTexImage2D(
                         GL_TEXTURE_2D, 0, internal_format, width, height, 0,
                         GL_RGBA, GL_UNSIGNED_BYTE, rgba_bytes,
@@ -2799,7 +3800,17 @@ class Viewport3D(QOpenGLWidget):
                 'retail_lava_mask_b_tex_id': 'retail_lava_mask_b',
             }
             for attr, slot_data in slots_by_attr.items():
-                tex_id = upload_slot(mat_idx, slot_data, role_by_attr[attr])
+                # Captured fur samplers: albedo 16x, gloss/control 8x. Keep
+                # the procedural layer volume on its separate linear sampler.
+                anisotropy = 1.0
+                if slots_by_attr['fur_control_tex_id']:
+                    anisotropy = {
+                        'texture_id': 16.0, 'specular_tex_id': 8.0,
+                        'fur_control_tex_id': 8.0,
+                    }.get(attr, 1.0)
+                tex_id = upload_slot(
+                    mat_idx, slot_data, role_by_attr[attr], anisotropy,
+                )
                 if tex_id:
                     uploaded[attr][mat_idx] = tex_id
 
@@ -2844,6 +3855,7 @@ class Viewport3D(QOpenGLWidget):
         if model is None:
             return
         self._active_lod = lod_idx
+        self._fur_scene_view = None
         self._pending_model = model   # re-upload with new LOD filter
         # Re-apply cached textures after model re-upload
         if self._cached_material_textures:
@@ -3023,8 +4035,71 @@ class Viewport3D(QOpenGLWidget):
         QApplication.processEvents()
 
     def _reset_temporal_history(self) -> None:
+        self._reset_pose_history = True
         self._temporal_signature = None
         self._temporal_sample_count = 0
+        self._motion_blur_scatter_valid = [False, False]
+        self._temporal_disocclusion_valid = [False, False]
+        self._temporal_alpha_valid = False
+        self._previous_fur_mvp = None
+        self._previous_fur_projection = None
+        self._previous_fur_view = None
+        self._previous_fur_wind_time = None
+        self._previous_fur_jitter = None
+        self._fur_motion_signature = None
+
+    def set_temporal_aa_state(
+        self, *, nonopaque_response: float | None = None,
+        conditional_floor: bool = False,
+        hdr_reference: float | None = None,
+    ) -> None:
+        """Set the per-frame producers consumed by native TAA ``m_Misc.xyz``."""
+        response = (
+            None if nonopaque_response is None else float(nonopaque_response)
+        )
+        reference = None if hdr_reference is None else float(hdr_reference)
+        state = (response, bool(conditional_floor), reference)
+        previous = (
+            self._temporal_nonopaque_response,
+            self._temporal_conditional_floor,
+            self._temporal_hdr_reference,
+        )
+        if state == previous:
+            return
+        self._temporal_nonopaque_response = response
+        self._temporal_conditional_floor = bool(conditional_floor)
+        self._temporal_hdr_reference = reference
+        self._reset_temporal_history()
+        self._redraw()
+
+    def temporal_aa_misc(
+        self, history_age: int | None = None,
+    ) -> tuple[float, float, float, float]:
+        """Return the live native TAA scalar register for inspection/upload."""
+        return temporal_apply_misc(
+            nonopaque_response=self._temporal_nonopaque_response,
+            conditional_floor=self._temporal_conditional_floor,
+            runtime_hdr_reference=self._temporal_hdr_reference,
+            history_age=(
+                self._temporal_sample_count
+                if history_age is None else history_age
+            ),
+        )
+
+    def set_preview_light_direction(self, direction) -> None:
+        """Set an isolated-view key light; a valid scene retains its own key."""
+        values = np.asarray(direction, dtype=np.float64)
+        if values.shape != (3,) or not np.isfinite(values).all():
+            raise ValueError('Light direction requires three finite values')
+        magnitude = np.linalg.norm(values)
+        if not np.isfinite(magnitude) or magnitude < 1e-12:
+            raise ValueError('Light direction must be nonzero')
+        result = tuple(float(v) for v in values / magnitude)
+        if result == self._preview_light_direction:
+            return
+        self._preview_light_direction = result
+        self._reset_temporal_history()
+        self._redraw()
 
     def set_fur_weather(
         self, *, wetness: float | None = None,
@@ -3039,9 +4114,10 @@ class Viewport3D(QOpenGLWidget):
         if wind_strength is not None:
             self._fur_wind_strength = max(float(wind_strength), 0.0)
         if wind_vector is not None:
-            value = np.asarray(wind_vector, dtype=np.float32).reshape(3)
-            length = float(np.linalg.norm(value))
-            self._fur_wind_vector = value / length if length > 1e-8 else value
+            # The runtime vector's magnitude contributes to shell displacement.
+            self._fur_wind_vector = np.asarray(
+                wind_vector, dtype=np.float32,
+            ).reshape(3).copy()
         if wind_object_phase is not None:
             self._fur_wind_object_phase = float(wind_object_phase)
         self._fur_wind_time_override = (
@@ -3058,7 +4134,8 @@ class Viewport3D(QOpenGLWidget):
         self, cube_mips, brdf_half_rgba: bytes,
         brdf_size: tuple[int, int] = (64, 64),
     ) -> None:
-        """Queue a decoded RGB16F Hair probe and captured RG16F BRDF LUT."""
+        """Queue a native BC6U/decoded RGB16F cube and captured RG16F BRDF LUT."""
+        validate_cube_mips(cube_mips)
         self._pending_fur_environment = (
             cube_mips, bytes(brdf_half_rgba), tuple(brdf_size),
         )
@@ -3071,26 +4148,130 @@ class Viewport3D(QOpenGLWidget):
         self._reset_temporal_history()
         self._redraw()
 
+    def _fur_scene_view_key(self):
+        """Lookup masks belong to one camera/view and cannot follow an orbit."""
+        return (self.camera.view_matrix().tobytes(), self._framebuffer_size(),
+                bool(getattr(self, '_ortho', False)), id(self._gpu_meshes))
+
+    def set_fur_scene_lighting(self, bundle) -> None:
+        """Attach explicit resources for the current view, or clear with None.
+
+        The scene loader must supply matching world placement and a current
+        per-tile lookup. Camera, viewport and model changes invalidate that
+        lookup until a new bundle is supplied.
+        """
+        from core.hair_scene import validate_hair_scene
+        pending = None if bundle is None else validate_hair_scene(bundle)
+        if pending is not None and pending[1]['viewport_size'] != self._framebuffer_size():
+            raise ValueError('Scene lighting lookup dimensions must match the current framebuffer')
+        self._pending_fur_scene = (pending, self._fur_scene_view_key()) if pending is not None else None
+        if self._fur_shader_prog:
+            self.makeCurrent()
+            try:
+                self._upload_fur_scene()
+            finally:
+                self.doneCurrent()
+        self._reset_temporal_history()
+        self._redraw()
+
+    def _upload_fur_scene(self):
+        from core.hair_scene import HairSceneGpu
+        pending = self._pending_fur_scene
+        self._pending_fur_scene = None
+        replacement = None
+        if pending is not None:
+            if not self._fur_scene_program:
+                self._fur_scene_program = compileProgram(
+                    self._compile_viewport_shader(POST_VERT, GL_VERTEX_SHADER),
+                    self._compile_viewport_shader(
+                        FUR_SCENE_LIGHTING_FRAG, GL_FRAGMENT_SHADER,
+                    ), validate=False,
+                )
+            replacement = HairSceneGpu(*pending[0])
+        if self._fur_scene_gpu is not None:
+            self._fur_scene_gpu.close()
+        self._fur_scene_gpu = replacement
+        self._fur_scene_view = pending[1] if pending is not None else None
+
+    def _fur_scene_is_current(self):
+        return self._fur_scene_gpu is not None and self._fur_scene_view == self._fur_scene_view_key()
+
+    def _set_fur_temporal_uniforms(self, program):
+        if self._fur_scene_is_current():
+            params = self._fur_scene_gpu.params
+            index, cycle = params['temporal_index'], params['temporal_plus_cycle']
+        else:
+            index = _halton((self._temporal_sample_count % 32) + 1, 2)
+            cycle = self._temporal_sample_count
+        _set_uniform_1f(program, 'uTemporalIndex', float(index))
+        _set_uniform_1f(program, 'uTemporalPlusCycle', float(cycle))
+
     # ── OpenGL Lifecycle ──────────────────────────────────────────────────────
+
+    def _compile_viewport_shader(self, source: str, shader_type: int):
+        return compileShader(
+            _shader_with_raster_mode(source, self._native_raster_active),
+            shader_type,
+        )
+
+    def _apply_raster_convention(self) -> None:
+        """Apply one coherent origin, clip-depth, and depth-test convention."""
+        if self._native_raster_active:
+            glClipControl(GL_UPPER_LEFT, GL_ZERO_TO_ONE)
+            glClearDepth(0.0)
+            glDepthFunc(GL_GEQUAL)
+        else:
+            glClearDepth(1.0)
+            glDepthFunc(GL_LESS)
 
     def initializeGL(self):
         if not _HAS_OPENGL:
             return
+
+        extensions = {
+            glGetStringi(GL_EXTENSIONS, index)
+            for index in range(int(glGetIntegerv(GL_NUM_EXTENSIONS)))
+        }
+        version = (
+            int(glGetIntegerv(GL_MAJOR_VERSION)),
+            int(glGetIntegerv(GL_MINOR_VERSION)),
+        )
+        self._native_raster_active = bool(
+            callable(globals().get('glClipControl'))
+            and _supports_native_raster(version, extensions)
+        )
+        self._apply_raster_convention()
+        if extensions.intersection({
+            b'GL_EXT_texture_filter_anisotropic',
+            b'GL_ARB_texture_filter_anisotropic',
+        }):
+            self._max_texture_anisotropy = float(glGetFloatv(0x84FF))
 
         glClearColor(0.102, 0.110, 0.133, 1.0)  # matches BG_BASE #1a1c22
         glEnable(GL_DEPTH_TEST)
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
-        vert = compileShader(VERT_SRC, GL_VERTEX_SHADER)
-        frag = compileShader(FRAG_SRC, GL_FRAGMENT_SHADER)
+        vert = self._compile_viewport_shader(VERT_SRC, GL_VERTEX_SHADER)
+        frag = self._compile_viewport_shader(FRAG_SRC, GL_FRAGMENT_SHADER)
         self._shader_prog = compileProgram(vert, frag)
 
         self._fur_shader_prog = compileProgram(
-            compileShader(FUR_SHELL_VERT_SRC, GL_VERTEX_SHADER),
-            compileShader(FUR_SHELL_GEOM_SRC, GL_GEOMETRY_SHADER),
-            compileShader(FUR_SHELL_FRAG_SRC, GL_FRAGMENT_SHADER),
+            self._compile_viewport_shader(FUR_SHELL_VERT_SRC, GL_VERTEX_SHADER),
+            self._compile_viewport_shader(FUR_SHELL_GEOM_SRC, GL_GEOMETRY_SHADER),
+            self._compile_viewport_shader(FUR_SHELL_FRAG_SRC, GL_FRAGMENT_SHADER),
         )
+        self._fur_material_prog = compileProgram(
+            self._compile_viewport_shader(FUR_SHELL_VERT_SRC, GL_VERTEX_SHADER),
+            self._compile_viewport_shader(FUR_SHELL_GEOM_SRC, GL_GEOMETRY_SHADER),
+            self._compile_viewport_shader(FUR_MATERIAL_FRAG_SRC, GL_FRAGMENT_SHADER),
+        )
+        for attribute, source in (('_fur_decode_prog', FUR_DECODE_FRAG),
+                                  ('_fur_lighting_prog', FUR_LIGHTING_FRAG)):
+            setattr(self, attribute, compileProgram(
+                self._compile_viewport_shader(POST_VERT, GL_VERTEX_SHADER),
+                self._compile_viewport_shader(source, GL_FRAGMENT_SHADER),
+            ))
         self._upload_fur_layer_volume()
         try:
             self._upload_fur_environment()
@@ -3098,26 +4279,70 @@ class Viewport3D(QOpenGLWidget):
             print(f"[viewport] fur environment upload failed: {ex}", flush=True)
             raise
 
-        gv = compileShader(GRID_VERT, GL_VERTEX_SHADER)
-        gf = compileShader(GRID_FRAG, GL_FRAGMENT_SHADER)
+        gv = self._compile_viewport_shader(GRID_VERT, GL_VERTEX_SHADER)
+        gf = self._compile_viewport_shader(GRID_FRAG, GL_FRAGMENT_SHADER)
         self._grid_prog = compileProgram(gv, gf)
 
-        pv = compileShader(POST_VERT, GL_VERTEX_SHADER)
-        bf = compileShader(BLUR_FRAG, GL_FRAGMENT_SHADER)
-        cf = compileShader(COMPOSITE_FRAG, GL_FRAGMENT_SHADER)
+        pv = self._compile_viewport_shader(POST_VERT, GL_VERTEX_SHADER)
+        bf = self._compile_viewport_shader(BLUR_FRAG, GL_FRAGMENT_SHADER)
+        cf = self._compile_viewport_shader(COMPOSITE_FRAG, GL_FRAGMENT_SHADER)
         self._blur_prog = compileProgram(pv, bf)
         # A shader object cannot be linked into a second program after
         # compileProgram has deleted it, so compile a fresh fullscreen vertex.
         self._composite_prog = compileProgram(
-            compileShader(POST_VERT, GL_VERTEX_SHADER), cf,
+            self._compile_viewport_shader(POST_VERT, GL_VERTEX_SHADER), cf,
         )
         self._temporal_accum_prog = compileProgram(
-            compileShader(POST_VERT, GL_VERTEX_SHADER),
-            compileShader(TEMPORAL_ACCUM_FRAG, GL_FRAGMENT_SHADER),
+            self._compile_viewport_shader(POST_VERT, GL_VERTEX_SHADER),
+            self._compile_viewport_shader(TEMPORAL_ACCUM_FRAG, GL_FRAGMENT_SHADER),
+        )
+        self._temporal_disocclusion_prog = compileProgram(
+            self._compile_viewport_shader(POST_VERT, GL_VERTEX_SHADER),
+            self._compile_viewport_shader(TEMPORAL_DISOCCLUSION_FRAG, GL_FRAGMENT_SHADER),
+        )
+        self._temporal_linear_depth_prog = compileProgram(
+            self._compile_viewport_shader(POST_VERT, GL_VERTEX_SHADER),
+            self._compile_viewport_shader(TEMPORAL_LINEAR_DEPTH_FRAG, GL_FRAGMENT_SHADER),
+        )
+        self._temporal_half_base_prog = compileProgram(
+            self._compile_viewport_shader(POST_VERT, GL_VERTEX_SHADER),
+            self._compile_viewport_shader(TEMPORAL_HALF_BASE_FRAG, GL_FRAGMENT_SHADER),
+        )
+        self._temporal_alpha_mask_prog = compileProgram(
+            self._compile_viewport_shader(POST_VERT, GL_VERTEX_SHADER),
+            self._compile_viewport_shader(TEMPORAL_ALPHA_MASK_FRAG, GL_FRAGMENT_SHADER),
+        )
+        self._temporal_alpha_half_prog = compileProgram(
+            self._compile_viewport_shader(POST_VERT, GL_VERTEX_SHADER),
+            self._compile_viewport_shader(TEMPORAL_ALPHA_HALF_FRAG, GL_FRAGMENT_SHADER),
+        )
+        self._motion_blur_downsample_prog = compileProgram(
+            self._compile_viewport_shader(POST_VERT, GL_VERTEX_SHADER),
+            self._compile_viewport_shader(MOTION_BLUR_DOWNSAMPLE_FRAG, GL_FRAGMENT_SHADER),
+        )
+        self._motion_blur_neighborhood_half_prog = compileProgram(
+            self._compile_viewport_shader(POST_VERT, GL_VERTEX_SHADER),
+            self._compile_viewport_shader(MOTION_BLUR_NEIGHBORHOOD_HALF_FRAG, GL_FRAGMENT_SHADER),
+        )
+        self._motion_blur_neighborhood_quarter_prog = compileProgram(
+            self._compile_viewport_shader(POST_VERT, GL_VERTEX_SHADER),
+            self._compile_viewport_shader(MOTION_BLUR_NEIGHBORHOOD_QUARTER_FRAG, GL_FRAGMENT_SHADER),
+        )
+        self._motion_blur_gather_neighborhood_prog = compileProgram(
+            self._compile_viewport_shader(POST_VERT, GL_VERTEX_SHADER),
+            self._compile_viewport_shader(MOTION_BLUR_GATHER_NEIGHBORHOOD_FRAG, GL_FRAGMENT_SHADER),
+        )
+        self._motion_blur_scatter_prog = compileProgram(
+            self._compile_viewport_shader(POST_VERT, GL_VERTEX_SHADER),
+            self._compile_viewport_shader(MOTION_BLUR_SCATTER_FRAG, GL_FRAGMENT_SHADER),
+        )
+        self._fur_contact_prog = compileProgram(
+            self._compile_viewport_shader(POST_VERT, GL_VERTEX_SHADER),
+            self._compile_viewport_shader(FUR_CONTACT_FRAG, GL_FRAGMENT_SHADER),
         )
         self._fur_denoise_prog = compileProgram(
-            compileShader(POST_VERT, GL_VERTEX_SHADER),
-            compileShader(FUR_DENOISE_FRAG, GL_FRAGMENT_SHADER),
+            self._compile_viewport_shader(POST_VERT, GL_VERTEX_SHADER),
+            self._compile_viewport_shader(FUR_DENOISE_FRAG, GL_FRAGMENT_SHADER),
         )
         # The recovered fur pass does not use the old weighted-OIT ribbon
         # attachments. Its no-TAA viewport resolve composites expected shell
@@ -3166,59 +4391,45 @@ class Viewport3D(QOpenGLWidget):
         glBindTexture(GL_TEXTURE_2D_ARRAY, 0)
 
     def _upload_fur_environment(self):
-        """Upload the verified face-major RGB16F probe and captured BRDF LUT."""
+        """Upload the original BC6U blocks or a decoded diagnostic cube."""
         pending = self._pending_fur_environment
         if pending is None:
             return
         cube_mips, brdf_half_rgba, brdf_size = pending
-        if len(cube_mips) != 6 or not cube_mips[0]:
-            raise ValueError("Hair environment requires six BC6 cube faces")
+        encoding = validate_cube_mips(cube_mips)
         if self._fur_environment_texture:
             glDeleteTextures(1, [self._fur_environment_texture])
         if self._fur_brdf_texture:
             glDeleteTextures(1, [self._fur_brdf_texture])
         self._fur_environment_texture = int(glGenTextures(1))
-        glBindTexture(GL_TEXTURE_2D_ARRAY, self._fur_environment_texture)
+        glBindTexture(GL_TEXTURE_CUBE_MAP, self._fur_environment_texture)
         level_count = len(cube_mips[0])
         for face, levels in enumerate(cube_mips):
-            if len(levels) != level_count:
-                raise ValueError("Hair environment faces have unequal mip counts")
-        # Upload a complete six-layer image per mip. The source BC6 blocks are
-        # decoded to linear half-float samples before this point because
-        # PyOpenGL 3.1.10 cannot marshal compressed 2D-array payloads.
-        for level in range(level_count):
-            width, height, _ = cube_mips[0][level]
-            level_faces = []
-            for face in range(6):
-                face_width, face_height, pixels = cube_mips[face][level]
-                if (face_width, face_height) != (width, height):
-                    raise ValueError(
-                        "Hair environment faces have unequal mip dimensions"
+            for level, (width, height, pixels) in enumerate(levels):
+                target = GL_TEXTURE_CUBE_MAP_POSITIVE_X + face
+                if encoding == 'bc6u':
+                    blocks = np.frombuffer(pixels, dtype=np.uint8)
+                    # Bypass PyOpenGL's compressed-array converter, which
+                    # rejects these otherwise valid original blocks.
+                    _raw_compressed_tex_image_2d(
+                        target, level, GL_COMPRESSED_RGB_BPTC_UNSIGNED_FLOAT,
+                        width, height, 0, blocks.nbytes,
+                        ctypes.c_void_p(blocks.ctypes.data),
                     )
-                expected_bytes = width * height * 3 * 2
-                if len(pixels) != expected_bytes:
-                    raise ValueError(
-                        f"Hair environment face needs {expected_bytes} bytes, "
-                        f"got {len(pixels)}"
-                    )
-                level_faces.append(pixels)
-            packed = np.frombuffer(
-                b"".join(level_faces), dtype=np.float16,
-            ).reshape(6, height, width, 3)
-            glTexImage3D(
-                GL_TEXTURE_2D_ARRAY, level, GL_RGB16F,
-                width, height, 6, 0,
-                GL_RGB, GL_HALF_FLOAT, packed,
-            )
-        glTexParameteri(
-            GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER,
-            GL_LINEAR_MIPMAP_LINEAR,
-        )
-        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
-        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
-        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
-        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_BASE_LEVEL, 0)
-        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAX_LEVEL, level_count - 1)
+                else:
+                    decoded = np.frombuffer(pixels, dtype=np.float16)
+                    glTexImage2D(target, level, GL_RGB16F, width, height, 0,
+                                 GL_RGB, GL_HALF_FLOAT, decoded)
+                error = glGetError()
+                if error != GL_NO_ERROR:
+                    raise RuntimeError(f'Hair cube upload failed: GL error {error}')
+        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
+        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        for axis in (GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T, GL_TEXTURE_WRAP_R):
+            glTexParameteri(GL_TEXTURE_CUBE_MAP, axis, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_BASE_LEVEL, 0)
+        glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAX_LEVEL, level_count - 1)
+        glEnable(GL_TEXTURE_CUBE_MAP_SEAMLESS)
 
         brdf_width, brdf_height = brdf_size
         expected_bytes = brdf_width * brdf_height * 2 * 2
@@ -3239,10 +4450,21 @@ class Viewport3D(QOpenGLWidget):
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
         glBindTexture(GL_TEXTURE_2D, 0)
-        glBindTexture(GL_TEXTURE_2D_ARRAY, 0)
+        glBindTexture(GL_TEXTURE_CUBE_MAP, 0)
         self._pending_fur_environment = None
 
     def _delete_bloom_targets(self):
+        for texture in self._fur_material_textures + [
+            self._fur_indirect_texture,
+            self._scene_linear_depth_texture,
+            self._scene_velocity_texture,
+            self._scene_stencil_texture,
+        ]:
+            if texture:
+                glDeleteTextures(1, [texture])
+        for fbo in (self._fur_material_fbo, self._fur_decode_fbo, self._fur_lighting_fbo):
+            if fbo:
+                glDeleteFramebuffers(1, [fbo])
         if self._hdr_color_buffers:
             glDeleteTextures(len(self._hdr_color_buffers), self._hdr_color_buffers)
         if self._fur_gbuffer_texture:
@@ -3251,6 +4473,12 @@ class Viewport3D(QOpenGLWidget):
             glDeleteTextures(1, [self._fur_normal_texture])
         if self._fur_denoise_texture:
             glDeleteTextures(1, [self._fur_denoise_texture])
+        if self._fur_gather_address_texture:
+            glDeleteTextures(1, [self._fur_gather_address_texture])
+        if self._fur_key_texture:
+            glDeleteTextures(1, [self._fur_key_texture])
+        if self._fur_contact_texture:
+            glDeleteTextures(1, [self._fur_contact_texture])
         if self._fur_oit_textures:
             glDeleteTextures(len(self._fur_oit_textures), self._fur_oit_textures)
         if self._fur_scene_depth_texture:
@@ -3259,22 +4487,85 @@ class Viewport3D(QOpenGLWidget):
             glDeleteTextures(len(self._pingpong_textures), self._pingpong_textures)
         if self._temporal_textures:
             glDeleteTextures(len(self._temporal_textures), self._temporal_textures)
+        if self._temporal_depth_textures:
+            glDeleteTextures(
+                len(self._temporal_depth_textures), self._temporal_depth_textures,
+            )
+        if self._temporal_disocclusion_textures:
+            glDeleteTextures(
+                len(self._temporal_disocclusion_textures),
+                self._temporal_disocclusion_textures,
+            )
+        temporal_alpha_textures = [
+            *self._temporal_linear_depth_textures,
+            *self._temporal_half_textures,
+            self._temporal_alpha_mask_texture,
+        ]
+        temporal_alpha_textures = [
+            texture for texture in temporal_alpha_textures if texture
+        ]
+        if temporal_alpha_textures:
+            glDeleteTextures(len(temporal_alpha_textures), temporal_alpha_textures)
+        motion_blur_textures = [
+            self._motion_blur_depth_velocity_texture,
+            self._motion_blur_half_velocity_texture,
+            *self._motion_blur_neighborhood_textures,
+            *self._motion_blur_scatter_textures,
+        ]
+        motion_blur_textures = [texture for texture in motion_blur_textures if texture]
+        if motion_blur_textures:
+            glDeleteTextures(len(motion_blur_textures), motion_blur_textures)
         if self._hdr_depth_rbo:
             glDeleteRenderbuffers(1, [self._hdr_depth_rbo])
         if self._hdr_fbo:
             glDeleteFramebuffers(1, [self._hdr_fbo])
         if self._fur_denoise_fbo:
             glDeleteFramebuffers(1, [self._fur_denoise_fbo])
+        if self._fur_contact_fbo:
+            glDeleteFramebuffers(1, [self._fur_contact_fbo])
         if self._pingpong_fbos:
             glDeleteFramebuffers(len(self._pingpong_fbos), self._pingpong_fbos)
         if self._temporal_fbos:
             glDeleteFramebuffers(len(self._temporal_fbos), self._temporal_fbos)
+        if self._temporal_disocclusion_fbos:
+            glDeleteFramebuffers(
+                len(self._temporal_disocclusion_fbos),
+                self._temporal_disocclusion_fbos,
+            )
+        temporal_alpha_fbos = [
+            self._temporal_linear_depth_fbo,
+            self._temporal_half_fbo,
+            self._temporal_alpha_mask_fbo,
+        ]
+        temporal_alpha_fbos = [fbo for fbo in temporal_alpha_fbos if fbo]
+        if temporal_alpha_fbos:
+            glDeleteFramebuffers(len(temporal_alpha_fbos), temporal_alpha_fbos)
+        motion_blur_fbos = [
+            self._motion_blur_downsample_fbo,
+            *self._motion_blur_neighborhood_fbos,
+            *self._motion_blur_scatter_fbos,
+        ]
+        motion_blur_fbos = [fbo for fbo in motion_blur_fbos if fbo]
+        if motion_blur_fbos:
+            glDeleteFramebuffers(len(motion_blur_fbos), motion_blur_fbos)
         self._hdr_fbo = 0
         self._hdr_color_buffers = []
+        self._fur_material_fbo = 0
+        self._fur_material_textures = []
+        self._fur_decode_fbo = 0
+        self._fur_lighting_fbo = 0
+        self._fur_indirect_texture = 0
+        self._scene_linear_depth_texture = 0
+        self._scene_velocity_texture = 0
+        self._scene_stencil_texture = 0
         self._fur_gbuffer_texture = 0
         self._fur_normal_texture = 0
         self._fur_denoise_fbo = 0
+        self._fur_key_texture = 0
+        self._fur_contact_fbo = 0
+        self._fur_contact_texture = 0
         self._fur_denoise_texture = 0
+        self._fur_gather_address_texture = 0
         self._fur_oit_textures = []
         self._fur_scene_depth_texture = 0
         self._fur_depth_snapshot_ready = False
@@ -3283,11 +4574,64 @@ class Viewport3D(QOpenGLWidget):
         self._pingpong_textures = []
         self._temporal_fbos = []
         self._temporal_textures = []
+        self._temporal_depth_textures = []
+        self._temporal_disocclusion_fbos = []
+        self._temporal_disocclusion_textures = []
+        self._temporal_disocclusion_valid = [False, False]
+        self._temporal_linear_depth_fbo = 0
+        self._temporal_linear_depth_textures = []
+        self._temporal_half_fbo = 0
+        self._temporal_half_textures = []
+        self._temporal_alpha_mask_fbo = 0
+        self._temporal_alpha_mask_texture = 0
+        self._temporal_alpha_valid = False
+        self._motion_blur_downsample_fbo = 0
+        self._motion_blur_depth_velocity_texture = 0
+        self._motion_blur_half_velocity_texture = 0
+        self._motion_blur_neighborhood_fbos = []
+        self._motion_blur_neighborhood_textures = []
+        self._motion_blur_scatter_fbos = []
+        self._motion_blur_scatter_textures = []
+        self._motion_blur_scatter_valid = [False, False]
+        self._motion_blur_sizes = ((0, 0), (0, 0), (0, 0))
         self._temporal_sample_count = 0
         self._temporal_signature = None
+        self._previous_fur_mvp = None
+        self._previous_fur_projection = None
+        self._previous_fur_view = None
+        self._previous_fur_wind_time = None
+        self._previous_fur_jitter = None
+        self._fur_motion_signature = None
         self._display_scene_texture = 0
         self._current_scene_texture = 0
+        self._current_scene_fbo = 0
         self._bloom_size = (0, 0)
+
+    @staticmethod
+    def _create_fur_gather_addresses(width, height):
+        """Pixel indices sampled with the native texture-coordinate convention."""
+        texture = int(glGenTextures(1))
+        glBindTexture(GL_TEXTURE_2D, texture)
+        addresses = np.arange(width * height, dtype=np.uint32).reshape(height, width)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, width, height, 0,
+                     GL_RED_INTEGER, GL_UNSIGNED_INT, addresses)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        return texture
+
+    @staticmethod
+    def _make_fur_target(width, height, internal, fmt, dtype, attachment):
+        texture = int(glGenTextures(1))
+        glBindTexture(GL_TEXTURE_2D, texture)
+        glTexImage2D(GL_TEXTURE_2D, 0, internal, width, height, 0, fmt, dtype, None)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + attachment, GL_TEXTURE_2D, texture, 0)
+        return texture
 
     def _resize_bloom_targets(self, width: int, height: int):
         """Create floating-point scene/bright buffers and blur ping-pong targets."""
@@ -3295,6 +4639,7 @@ class Viewport3D(QOpenGLWidget):
             return
         try:
             self._delete_bloom_targets()
+            self._fur_gather_address_texture = self._create_fur_gather_addresses(width, height)
             self._hdr_fbo = int(glGenFramebuffers(1))
             glBindFramebuffer(GL_FRAMEBUFFER, self._hdr_fbo)
             self._hdr_color_buffers = self._generated_ids(glGenTextures(2))
@@ -3313,36 +4658,13 @@ class Viewport3D(QOpenGLWidget):
                     GL_TEXTURE_2D, tex_id, 0,
                 )
             glDrawBuffers(2, [GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1])
-            self._fur_gbuffer_texture = int(glGenTextures(1))
-            glBindTexture(GL_TEXTURE_2D, self._fur_gbuffer_texture)
-            glTexImage2D(
-                # Retail's custom fur reciprocal depth feeds the float
-                # g_ViewDepthBuffer. Preserve its 0.00025-0.005 dry offsets
-                # without reducing precision before the Hair contact pass.
-                GL_TEXTURE_2D, 0, GL_RGBA32F, width, height, 0,
-                GL_RGBA, GL_FLOAT, None,
+            self._scene_linear_depth_texture = self._make_fur_target(
+                width, height, GL_RGBA32F, GL_RGBA, GL_FLOAT, 2)
+            self._scene_velocity_texture = self._make_fur_target(
+                width, height, GL_RG16F, GL_RG, GL_HALF_FLOAT, 3,
             )
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
-            glFramebufferTexture2D(
-                GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2,
-                GL_TEXTURE_2D, self._fur_gbuffer_texture, 0,
-            )
-            self._fur_normal_texture = int(glGenTextures(1))
-            glBindTexture(GL_TEXTURE_2D, self._fur_normal_texture)
-            glTexImage2D(
-                GL_TEXTURE_2D, 0, GL_RGBA16F, width, height, 0,
-                GL_RGBA, GL_FLOAT, None,
-            )
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
-            glFramebufferTexture2D(
-                GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT3,
-                GL_TEXTURE_2D, self._fur_normal_texture, 0,
+            self._scene_stencil_texture = self._make_fur_target(
+                width, height, GL_R8UI, GL_RED_INTEGER, GL_UNSIGNED_BYTE, 4,
             )
             if self._fur_oit_supported:
                 self._fur_oit_textures = self._generated_ids(glGenTextures(2))
@@ -3369,24 +4691,64 @@ class Viewport3D(QOpenGLWidget):
             if glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE:
                 raise RuntimeError("HDR framebuffer is incomplete")
 
-            self._fur_denoise_fbo = int(glGenFramebuffers(1))
-            self._fur_denoise_texture = int(glGenTextures(1))
-            glBindFramebuffer(GL_FRAMEBUFFER, self._fur_denoise_fbo)
-            glBindTexture(GL_TEXTURE_2D, self._fur_denoise_texture)
-            glTexImage2D(
-                GL_TEXTURE_2D, 0, GL_RGBA16F, width, height, 0,
-                GL_RGBA, GL_FLOAT, None,
-            )
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+            self._fur_material_fbo = int(glGenFramebuffers(1))
+            glBindFramebuffer(GL_FRAMEBUFFER, self._fur_material_fbo)
+            self._fur_material_textures = [
+                self._make_fur_target(width, height, internal, fmt, dtype, attachment)
+                for attachment, (internal, fmt, dtype) in enumerate((
+                    (GL_RGBA16UI, GL_RGBA_INTEGER, GL_UNSIGNED_SHORT),
+                    (GL_SRGB8_ALPHA8, GL_RGBA, GL_UNSIGNED_BYTE),
+                    (GL_R32F, GL_RED, GL_FLOAT),
+                    (GL_R32UI, GL_RED_INTEGER, GL_UNSIGNED_INT),
+                    (GL_RG16F, GL_RG, GL_HALF_FLOAT),
+                ))
+            ]
+            # Both material passes depth-test against the same opaque geometry.
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, self._hdr_depth_rbo)
+            # The native temporal apply loads category bit 128 from the same
+            # per-pixel target for opaque and accumulated-alpha geometry.
             glFramebufferTexture2D(
-                GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-                GL_TEXTURE_2D, self._fur_denoise_texture, 0,
+                GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT5, GL_TEXTURE_2D,
+                self._scene_stencil_texture, 0,
             )
+            glDrawBuffers(6, [GL_COLOR_ATTACHMENT0 + i for i in range(6)])
             if glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE:
-                raise RuntimeError("Fur denoise framebuffer is incomplete")
+                raise RuntimeError('Fur material framebuffer is incomplete')
+            self._fur_decode_fbo = int(glGenFramebuffers(1))
+            glBindFramebuffer(GL_FRAMEBUFFER, self._fur_decode_fbo)
+            self._fur_gbuffer_texture = self._make_fur_target(width, height, GL_RGBA32F, GL_RGBA, GL_FLOAT, 0)
+            self._fur_normal_texture = self._make_fur_target(width, height, GL_RGBA32F, GL_RGBA, GL_FLOAT, 1)
+            glDrawBuffers(2, [GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1])
+            if glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE:
+                raise RuntimeError('Fur vector framebuffer is incomplete')
+            self._fur_lighting_fbo = int(glGenFramebuffers(1))
+            glBindFramebuffer(GL_FRAMEBUFFER, self._fur_lighting_fbo)
+            self._fur_indirect_texture = self._make_fur_target(width, height, GL_RGBA32F, GL_RGBA, GL_FLOAT, 0)
+            self._fur_key_texture = self._make_fur_target(width, height, GL_RGBA32F, GL_RGBA, GL_FLOAT, 1)
+            glDrawBuffers(2, [GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1])
+            if glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE:
+                raise RuntimeError('Fur illumination framebuffer is incomplete')
+
+            for prefix in ('_fur_contact', '_fur_denoise'):
+                fbo = int(glGenFramebuffers(1))
+                texture = int(glGenTextures(1))
+                setattr(self, prefix + '_fbo', fbo)
+                setattr(self, prefix + '_texture', texture)
+                glBindFramebuffer(GL_FRAMEBUFFER, fbo)
+                glBindTexture(GL_TEXTURE_2D, texture)
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, width, height, 0, GL_RGBA, GL_FLOAT, None)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0)
+                if prefix == '_fur_contact':
+                    # Fur replaces covered opaque emission in the bloom buffer.
+                    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1,
+                                           GL_TEXTURE_2D, self._hdr_color_buffers[1], 0)
+                    glDrawBuffers(2, [GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1])
+                if glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE:
+                    raise RuntimeError('Fur lighting framebuffer is incomplete: ' + prefix)
 
             # Keep a detached depth texture for the fur pass. Sampling the
             # attached depth image while it is also used for depth testing is
@@ -3430,12 +4792,18 @@ class Viewport3D(QOpenGLWidget):
 
             self._temporal_fbos = self._generated_ids(glGenFramebuffers(2))
             self._temporal_textures = self._generated_ids(glGenTextures(2))
-            for fbo, tex_id in zip(self._temporal_fbos, self._temporal_textures):
+            self._temporal_depth_textures = self._generated_ids(glGenTextures(2))
+            for fbo, tex_id, depth_id in zip(
+                self._temporal_fbos,
+                self._temporal_textures,
+                self._temporal_depth_textures,
+            ):
                 glBindFramebuffer(GL_FRAMEBUFFER, fbo)
                 glBindTexture(GL_TEXTURE_2D, tex_id)
-                glTexImage2D(
-                    GL_TEXTURE_2D, 0, GL_RGBA16F, width, height, 0,
-                    GL_RGBA, GL_FLOAT, None,
+                _raw_tex_image_2d(
+                    GL_TEXTURE_2D, 0, GL_R11F_G11F_B10F, width, height, 0,
+                    GL_RGB, GL_UNSIGNED_INT_10F_11F_11F_REV,
+                    ctypes.c_void_p(0),
                 )
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
@@ -3445,8 +4813,175 @@ class Viewport3D(QOpenGLWidget):
                     GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                     GL_TEXTURE_2D, tex_id, 0,
                 )
+                glDrawBuffer(GL_COLOR_ATTACHMENT0)
                 if glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE:
                     raise RuntimeError("Temporal framebuffer is incomplete")
+                glBindTexture(GL_TEXTURE_2D, depth_id)
+                glTexImage2D(
+                    GL_TEXTURE_2D, 0, GL_RG16F, width, height, 0,
+                    GL_RG, GL_HALF_FLOAT, None,
+                )
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+
+            self._temporal_disocclusion_fbos = self._generated_ids(
+                glGenFramebuffers(2),
+            )
+            self._temporal_disocclusion_textures = self._generated_ids(
+                glGenTextures(2),
+            )
+            for fbo, disocclusion_id, depth_id in zip(
+                self._temporal_disocclusion_fbos,
+                self._temporal_disocclusion_textures,
+                self._temporal_depth_textures,
+            ):
+                glBindFramebuffer(GL_FRAMEBUFFER, fbo)
+                glBindTexture(GL_TEXTURE_2D, disocclusion_id)
+                glTexImage2D(
+                    GL_TEXTURE_2D, 0, GL_RG8, width, height, 0,
+                    GL_RG, GL_UNSIGNED_BYTE, None,
+                )
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+                glFramebufferTexture2D(
+                    GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                    GL_TEXTURE_2D, disocclusion_id, 0,
+                )
+                glFramebufferTexture2D(
+                    GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1,
+                    GL_TEXTURE_2D, depth_id, 0,
+                )
+                glDrawBuffers(2, [GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1])
+                if glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE:
+                    raise RuntimeError("Temporal disocclusion framebuffer is incomplete")
+            self._temporal_disocclusion_valid = [False, False]
+
+            half_size = (max(1, (width + 1) // 2), max(1, (height + 1) // 2))
+            quarter_size = (
+                max(1, (half_size[0] + 1) // 2),
+                max(1, (half_size[1] + 1) // 2),
+            )
+            sixteenth_size = (
+                max(1, (quarter_size[0] + 3) // 4),
+                max(1, (quarter_size[1] + 3) // 4),
+            )
+            self._motion_blur_sizes = (half_size, quarter_size, sixteenth_size)
+
+            self._temporal_linear_depth_fbo = int(glGenFramebuffers(1))
+            glBindFramebuffer(GL_FRAMEBUFFER, self._temporal_linear_depth_fbo)
+            self._temporal_linear_depth_textures = [
+                self._make_fur_target(
+                    width, height, GL_R16F, GL_RED, GL_HALF_FLOAT, attachment,
+                )
+                for attachment in range(2)
+            ]
+            glDrawBuffers(2, [GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1])
+            if glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE:
+                raise RuntimeError("Temporal linear-depth framebuffer is incomplete")
+
+            self._temporal_half_fbo = int(glGenFramebuffers(1))
+            glBindFramebuffer(GL_FRAMEBUFFER, self._temporal_half_fbo)
+            self._temporal_half_textures = [
+                self._make_fur_target(
+                    *half_size, internal, fmt, dtype, attachment,
+                )
+                for attachment, (internal, fmt, dtype) in enumerate((
+                    (GL_R8, GL_RED, GL_UNSIGNED_BYTE),
+                    (GL_RG16F, GL_RG, GL_HALF_FLOAT),
+                    (GL_R16F, GL_RED, GL_HALF_FLOAT),
+                    (GL_R16F, GL_RED, GL_HALF_FLOAT),
+                ))
+            ]
+            glBindTexture(GL_TEXTURE_2D, self._temporal_half_textures[0])
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+            glDrawBuffers(4, [GL_COLOR_ATTACHMENT0 + index for index in range(4)])
+            if glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE:
+                raise RuntimeError("Temporal half-resolution framebuffer is incomplete")
+
+            self._temporal_alpha_mask_fbo = int(glGenFramebuffers(1))
+            glBindFramebuffer(GL_FRAMEBUFFER, self._temporal_alpha_mask_fbo)
+            self._temporal_alpha_mask_texture = self._make_fur_target(
+                *half_size, GL_R8, GL_RED, GL_UNSIGNED_BYTE, 0,
+            )
+            glBindTexture(GL_TEXTURE_2D, self._temporal_alpha_mask_texture)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+            glDrawBuffer(GL_COLOR_ATTACHMENT0)
+            if glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE:
+                raise RuntimeError("Temporal accumulated-alpha mask framebuffer is incomplete")
+            self._temporal_alpha_valid = False
+
+            self._motion_blur_downsample_fbo = int(glGenFramebuffers(1))
+            glBindFramebuffer(GL_FRAMEBUFFER, self._motion_blur_downsample_fbo)
+            self._motion_blur_depth_velocity_texture = self._make_fur_target(
+                *half_size, GL_RG16F, GL_RG, GL_HALF_FLOAT, 0,
+            )
+            glBindTexture(GL_TEXTURE_2D, self._motion_blur_depth_velocity_texture)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+            self._motion_blur_half_velocity_texture = self._make_fur_target(
+                *half_size, GL_RG16F, GL_RG, GL_HALF_FLOAT, 1,
+            )
+            glDrawBuffers(2, [GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1])
+            if glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE:
+                raise RuntimeError("Motion-blur downsample framebuffer is incomplete")
+
+            self._motion_blur_neighborhood_fbos = self._generated_ids(
+                glGenFramebuffers(3),
+            )
+            self._motion_blur_neighborhood_textures = self._generated_ids(
+                glGenTextures(3),
+            )
+            neighborhood_sizes = (quarter_size, sixteenth_size, sixteenth_size)
+            for fbo, texture, target_size in zip(
+                self._motion_blur_neighborhood_fbos,
+                self._motion_blur_neighborhood_textures,
+                neighborhood_sizes,
+            ):
+                glBindFramebuffer(GL_FRAMEBUFFER, fbo)
+                glBindTexture(GL_TEXTURE_2D, texture)
+                glTexImage2D(
+                    GL_TEXTURE_2D, 0, GL_RG16F, *target_size, 0,
+                    GL_RG, GL_HALF_FLOAT, None,
+                )
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+                glFramebufferTexture2D(
+                    GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                    GL_TEXTURE_2D, texture, 0,
+                )
+                if glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE:
+                    raise RuntimeError("Motion-blur neighborhood framebuffer is incomplete")
+
+            self._motion_blur_scatter_fbos = self._generated_ids(glGenFramebuffers(2))
+            self._motion_blur_scatter_textures = self._generated_ids(glGenTextures(2))
+            for fbo, texture in zip(
+                self._motion_blur_scatter_fbos, self._motion_blur_scatter_textures,
+            ):
+                glBindFramebuffer(GL_FRAMEBUFFER, fbo)
+                glBindTexture(GL_TEXTURE_2D, texture)
+                glTexImage2D(
+                    GL_TEXTURE_2D, 0, GL_R8, *half_size, 0,
+                    GL_RED, GL_UNSIGNED_BYTE, None,
+                )
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+                glFramebufferTexture2D(
+                    GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                    GL_TEXTURE_2D, texture, 0,
+                )
+                if glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE:
+                    raise RuntimeError("Motion-blur scatter framebuffer is incomplete")
+            self._motion_blur_scatter_valid = [False, False]
             self._bloom_size = (width, height)
             glBindFramebuffer(GL_FRAMEBUFFER, self.defaultFramebufferObject())
         except Exception as ex:
@@ -3458,67 +4993,509 @@ class Viewport3D(QOpenGLWidget):
             except Exception:
                 pass
 
-    def _accumulate_temporal_scene(self, projection, view, light_dir):
-        """Accumulate stochastic opaque fur samples for a stationary camera."""
-        if not self._temporal_accum_prog or len(self._temporal_fbos) != 2:
-            self._display_scene_texture = self._hdr_color_buffers[0]
+    def _build_motion_blur_scatter(self, target_index: int) -> None:
+        """Build the retail motion/depth scatter signal for the next frame."""
+        programs = (
+            self._motion_blur_downsample_prog,
+            self._motion_blur_neighborhood_half_prog,
+            self._motion_blur_neighborhood_quarter_prog,
+            self._motion_blur_gather_neighborhood_prog,
+            self._motion_blur_scatter_prog,
+        )
+        if (
+            not all(programs)
+            or len(self._fur_material_textures) < 5
+            or not self._fur_normal_texture
+            or not self._scene_linear_depth_texture
+            or not self._scene_velocity_texture
+            or len(self._motion_blur_neighborhood_fbos) != 3
+            or len(self._motion_blur_neighborhood_textures) != 3
+            or len(self._motion_blur_scatter_fbos) != 2
+            or len(self._motion_blur_scatter_textures) != 2
+            or target_index not in (0, 1)
+        ):
             return
-        signature = (
+
+        half_size, quarter_size, sixteenth_size = self._motion_blur_sizes
+        glDisable(GL_DEPTH_TEST)
+        glDisable(GL_BLEND)
+
+        glBindFramebuffer(GL_FRAMEBUFFER, self._motion_blur_downsample_fbo)
+        glDrawBuffers(2, [GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1])
+        glViewport(0, 0, *half_size)
+        glUseProgram(self._motion_blur_downsample_prog)
+        for sampler, unit in (
+            ('uMotion', 0), ('uOpaqueMotion', 1), ('uFurMask', 2),
+            ('uFurDepth', 3), ('uSceneDepth', 4),
+        ):
+            location = glGetUniformLocation(self._motion_blur_downsample_prog, sampler)
+            if location >= 0:
+                glUniform1i(location, unit)
+        _set_uniform_2f(
+            self._motion_blur_downsample_prog, 'uOutputInvSize',
+            1.0 / half_size[0], 1.0 / half_size[1],
+        )
+        _set_uniform_1f(
+            self._motion_blur_downsample_prog, 'uShutterScale',
+            0.14122892916202545,
+        )
+        for unit, texture in enumerate((
+            self._fur_material_textures[4], self._scene_velocity_texture,
+            self._fur_normal_texture, self._fur_material_textures[2],
+            self._scene_linear_depth_texture,
+        )):
+            glActiveTexture(GL_TEXTURE0 + unit)
+            glBindTexture(GL_TEXTURE_2D, texture)
+        glBindVertexArray(self._grid_vao)
+        glDrawArrays(GL_TRIANGLES, 0, self._grid_count)
+
+        neighborhood_stages = (
+            (
+                self._motion_blur_neighborhood_half_prog,
+                self._motion_blur_neighborhood_fbos[0], quarter_size,
+                self._motion_blur_half_velocity_texture, 0.14122892916202545,
+            ),
+            (
+                self._motion_blur_neighborhood_quarter_prog,
+                self._motion_blur_neighborhood_fbos[1], sixteenth_size,
+                self._motion_blur_neighborhood_textures[0], None,
+            ),
+            (
+                self._motion_blur_gather_neighborhood_prog,
+                self._motion_blur_neighborhood_fbos[2], sixteenth_size,
+                self._motion_blur_neighborhood_textures[1], None,
+            ),
+        )
+        for program, fbo, target_size, source, velocity_scale in neighborhood_stages:
+            glBindFramebuffer(GL_FRAMEBUFFER, fbo)
+            glDrawBuffer(GL_COLOR_ATTACHMENT0)
+            glViewport(0, 0, *target_size)
+            glUseProgram(program)
+            location = glGetUniformLocation(program, 'uVelocity')
+            if location >= 0:
+                glUniform1i(location, 0)
+            _set_uniform_2f(
+                program, 'uOutputInvSize',
+                1.0 / target_size[0], 1.0 / target_size[1],
+            )
+            if velocity_scale is not None:
+                _set_uniform_1f(program, 'uVelocityScale', velocity_scale)
+            glActiveTexture(GL_TEXTURE0)
+            glBindTexture(GL_TEXTURE_2D, source)
+            glDrawArrays(GL_TRIANGLES, 0, self._grid_count)
+
+        glBindFramebuffer(GL_FRAMEBUFFER, self._motion_blur_scatter_fbos[target_index])
+        glDrawBuffer(GL_COLOR_ATTACHMENT0)
+        glViewport(0, 0, *half_size)
+        glUseProgram(self._motion_blur_scatter_prog)
+        for sampler, unit in (('uDepthVelocity', 0), ('uNeighborhoodVelocity', 1)):
+            location = glGetUniformLocation(self._motion_blur_scatter_prog, sampler)
+            if location >= 0:
+                glUniform1i(location, unit)
+        _set_uniform_2f(
+            self._motion_blur_scatter_prog, 'uOutputInvSize',
+            1.0 / half_size[0], 1.0 / half_size[1],
+        )
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(GL_TEXTURE_2D, self._motion_blur_depth_velocity_texture)
+        glActiveTexture(GL_TEXTURE1)
+        glBindTexture(GL_TEXTURE_2D, self._motion_blur_neighborhood_textures[2])
+        glDrawArrays(GL_TRIANGLES, 0, self._grid_count)
+        self._motion_blur_scatter_valid[target_index] = True
+
+        glBindVertexArray(0)
+        for unit in range(4, -1, -1):
+            glActiveTexture(GL_TEXTURE0 + unit)
+            glBindTexture(GL_TEXTURE_2D, 0)
+        glActiveTexture(GL_TEXTURE0)
+        glEnable(GL_BLEND)
+        glEnable(GL_DEPTH_TEST)
+
+    def _temporal_frame_signature(self):
+        return (
             self._bloom_size,
-            round(float(self.camera.yaw), 6),
-            round(float(self.camera.pitch), 6),
-            round(float(self.camera.dist), 6),
-            tuple(round(float(value), 6) for value in self.camera.target),
             bool(self._show_fur),
             int(getattr(self, '_active_lod', 0)),
             len(self._gpu_meshes),
         )
+
+    def _sync_temporal_signature(self) -> None:
+        signature = self._temporal_frame_signature()
         if signature != self._temporal_signature:
             self._temporal_signature = signature
             self._temporal_sample_count = 0
+            self._motion_blur_scatter_valid = [False, False]
+            self._temporal_disocclusion_valid = [False, False]
+            self._temporal_alpha_valid = False
+
+    def _build_temporal_disocclusion(
+        self, target_index: int, projection, view,
+        previous_projection, previous_view,
+    ) -> None:
+        """Build base and accumulated-alpha disocclusion plus half outputs."""
+        programs = (
+            self._temporal_linear_depth_prog,
+            self._temporal_half_base_prog,
+            self._temporal_alpha_mask_prog,
+            self._temporal_alpha_half_prog,
+            self._temporal_disocclusion_prog,
+        )
+        if (
+            not all(programs)
+            or len(self._temporal_disocclusion_fbos) != 2
+            or len(self._temporal_disocclusion_textures) != 2
+            or len(self._temporal_depth_textures) != 2
+            or len(self._motion_blur_scatter_textures) != 2
+            or len(self._temporal_linear_depth_textures) != 2
+            or len(self._temporal_half_textures) != 4
+            or not self._temporal_linear_depth_fbo
+            or not self._temporal_half_fbo
+            or not self._temporal_alpha_mask_fbo
+            or not self._temporal_alpha_mask_texture
+            or target_index not in (0, 1)
+            or not self._scene_linear_depth_texture
+            or not self._scene_velocity_texture
+        ):
+            self._temporal_alpha_valid = False
+            return
+
+        previous_index = 1 - target_index
+        has_fur_motion = bool(
+            self._fur_deferred_active
+            and len(self._fur_material_textures) >= 5
+            and self._fur_material_textures[2]
+            and self._fur_material_textures[4]
+            and self._fur_normal_texture
+        )
+        has_history = bool(
+            self._temporal_sample_count > 0
+            and self._temporal_disocclusion_valid[previous_index]
+            and self._motion_blur_scatter_valid[target_index]
+        )
+        projection = np.asarray(projection, dtype=np.float32)
+        view = np.asarray(view, dtype=np.float32)
+        previous_projection = np.asarray(
+            projection if previous_projection is None else previous_projection,
+            dtype=np.float32,
+        )
+        previous_view = np.asarray(
+            view if previous_view is None else previous_view,
+            dtype=np.float32,
+        )
+        current_to_previous = (
+            previous_view.astype(np.float64)
+            @ np.linalg.inv(view.astype(np.float64))
+        ).astype(np.float32)
+        current_to_previous_rotation = current_to_previous[:3, :3].copy()
+
+        glDisable(GL_DEPTH_TEST)
+        glDisable(GL_BLEND)
+        glBindVertexArray(self._grid_vao)
+
+        glBindFramebuffer(GL_FRAMEBUFFER, self._temporal_linear_depth_fbo)
+        glDrawBuffers(2, [GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1])
+        glViewport(0, 0, *self._bloom_size)
+        glUseProgram(self._temporal_linear_depth_prog)
+        for sampler, unit in (
+            ('uFurMask', 0), ('uFurDepth', 1), ('uSceneDepth', 2),
+        ):
+            location = glGetUniformLocation(self._temporal_linear_depth_prog, sampler)
+            if location >= 0:
+                glUniform1i(location, unit)
+        _set_uniform_bool(
+            self._temporal_linear_depth_prog, 'uHasFurDepth', has_fur_motion,
+        )
+        for unit, texture in enumerate((
+            self._fur_normal_texture if has_fur_motion else 0,
+            self._fur_material_textures[2] if has_fur_motion else 0,
+            self._scene_linear_depth_texture,
+        )):
+            glActiveTexture(GL_TEXTURE0 + unit)
+            glBindTexture(GL_TEXTURE_2D, texture)
+        glDrawArrays(GL_TRIANGLES, 0, self._grid_count)
+
+        def draw_full_disocclusion(
+            linear_depth: int, use_fur_motion: bool,
+            motion_threshold: float, require_alpha_flag: bool,
+        ) -> None:
+            glBindFramebuffer(
+                GL_FRAMEBUFFER, self._temporal_disocclusion_fbos[target_index],
+            )
+            glDrawBuffers(2, [GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1])
+            glViewport(0, 0, *self._bloom_size)
+            glUseProgram(self._temporal_disocclusion_prog)
+            for sampler, unit in (
+                ('uMotion', 0), ('uFurMask', 1), ('uLinearDepth', 2),
+                ('uHistoryDepthMotion', 3), ('uMotionBlurScatter', 4),
+                ('uAccAlphaFlags', 5), ('uOpaqueMotion', 6),
+            ):
+                location = glGetUniformLocation(
+                    self._temporal_disocclusion_prog, sampler,
+                )
+                if location >= 0:
+                    glUniform1i(location, unit)
+            _set_uniform_mat4(
+                self._temporal_disocclusion_prog,
+                'uCurrentToPreviousView', current_to_previous,
+            )
+            _set_uniform_mat3(
+                self._temporal_disocclusion_prog,
+                'uCurrentToPreviousRotation', current_to_previous_rotation,
+            )
+            _set_uniform_mat4(
+                self._temporal_disocclusion_prog,
+                'uPreviousProjection', previous_projection,
+            )
+            _set_uniform_4f(
+                self._temporal_disocclusion_prog,
+                'uCurrentProjection',
+                projection[0, 0], projection[1, 1],
+                projection[0, 2], projection[1, 2],
+            )
+            _set_uniform_2f(
+                self._temporal_disocclusion_prog,
+                'uDimensions', *self._bloom_size,
+            )
+            _set_uniform_1f(
+                self._temporal_disocclusion_prog, 'uDepthBase',
+                TEMPORAL_DISOCCLUSION_CAPTURE_DEPTH_BASE,
+            )
+            _set_uniform_1f(
+                self._temporal_disocclusion_prog, 'uDepthSlope',
+                TEMPORAL_DISOCCLUSION_CAPTURE_DEPTH_SLOPE,
+            )
+            _set_uniform_1f(
+                self._temporal_disocclusion_prog,
+                'uMotionThreshold', motion_threshold,
+            )
+            _set_uniform_1f(
+                self._temporal_disocclusion_prog, 'uCameraMotionScale',
+                temporal_disocclusion_camera_scale(self._bloom_size[0]),
+            )
+            _set_uniform_bool(
+                self._temporal_disocclusion_prog,
+                'uHasFurMotion', use_fur_motion,
+            )
+            _set_uniform_bool(
+                self._temporal_disocclusion_prog,
+                'uHasOpaqueMotion', bool(self._scene_velocity_texture),
+            )
+            _set_uniform_bool(
+                self._temporal_disocclusion_prog, 'uHasHistory', has_history,
+            )
+            _set_uniform_bool(
+                self._temporal_disocclusion_prog,
+                'uRequireAccAlphaFlag', require_alpha_flag,
+            )
+            textures = (
+                self._fur_material_textures[4] if use_fur_motion else 0,
+                self._fur_normal_texture if use_fur_motion else 0,
+                linear_depth,
+                self._temporal_depth_textures[previous_index] if has_history else 0,
+                self._motion_blur_scatter_textures[target_index]
+                if self._motion_blur_scatter_valid[target_index] else 0,
+                self._temporal_alpha_mask_texture if require_alpha_flag else 0,
+                self._scene_velocity_texture,
+            )
+            for unit, texture in enumerate(textures):
+                glActiveTexture(GL_TEXTURE0 + unit)
+                glBindTexture(GL_TEXTURE_2D, texture)
+            glDrawArrays(GL_TRIANGLES, 0, self._grid_count)
+
+        # Event 16262 is the opaque/base pass. The captured base half-depth
+        # inputs are the exact four-texel extrema of this pre-alpha depth.
+        draw_full_disocclusion(
+            self._temporal_linear_depth_textures[0], False,
+            TEMPORAL_DISOCCLUSION_CAPTURE_MOTION_THRESHOLD, False,
+        )
+
+        half_size = self._motion_blur_sizes[0]
+        glBindFramebuffer(GL_FRAMEBUFFER, self._temporal_half_fbo)
+        glDrawBuffers(4, [GL_COLOR_ATTACHMENT0 + index for index in range(4)])
+        glViewport(0, 0, *half_size)
+        glUseProgram(self._temporal_half_base_prog)
+        for sampler, unit in (('uFullDisocclusion', 0), ('uOpaqueDepth', 1)):
+            location = glGetUniformLocation(self._temporal_half_base_prog, sampler)
+            if location >= 0:
+                glUniform1i(location, unit)
+        _set_uniform_2f(
+            self._temporal_half_base_prog, 'uFullDimensions', *self._bloom_size,
+        )
+        for unit, texture in enumerate((
+            self._temporal_disocclusion_textures[target_index],
+            self._temporal_linear_depth_textures[0],
+        )):
+            glActiveTexture(GL_TEXTURE0 + unit)
+            glBindTexture(GL_TEXTURE_2D, texture)
+        glDrawArrays(GL_TRIANGLES, 0, self._grid_count)
+
+        # Event 18687 compares the current post-alpha R16F depth against the
+        # pre-alpha four-texel minimum. This R8 target is the exact t10 family
+        # consumed by the final TAA apply.
+        glBindFramebuffer(GL_FRAMEBUFFER, self._temporal_alpha_mask_fbo)
+        glDrawBuffer(GL_COLOR_ATTACHMENT0)
+        glViewport(0, 0, *half_size)
+        glUseProgram(self._temporal_alpha_mask_prog)
+        for sampler, unit in (('uComposedDepth', 0), ('uOpaqueMinimumDepth', 1)):
+            location = glGetUniformLocation(self._temporal_alpha_mask_prog, sampler)
+            if location >= 0:
+                glUniform1i(location, unit)
+        _set_uniform_2f(
+            self._temporal_alpha_mask_prog, 'uFullDimensions', *self._bloom_size,
+        )
+        for unit, texture in enumerate((
+            self._temporal_linear_depth_textures[1],
+            self._temporal_half_textures[3],
+        )):
+            glActiveTexture(GL_TEXTURE0 + unit)
+            glBindTexture(GL_TEXTURE_2D, texture)
+        glDrawArrays(GL_TRIANGLES, 0, self._grid_count)
+        self._temporal_alpha_valid = True
+
+        if has_fur_motion:
+            # Events 18695/18704 use a packed tile queue. A full-screen draw
+            # with a fragment discard on the same mask is output-equivalent:
+            # unflagged pixels retain the base targets and flagged pixels use
+            # the captured accumulated-alpha threshold.
+            draw_full_disocclusion(
+                self._temporal_linear_depth_textures[1], True,
+                TEMPORAL_ACC_ALPHA_MOTION_THRESHOLD, True,
+            )
+
+            glBindFramebuffer(GL_FRAMEBUFFER, self._temporal_half_fbo)
+            glDrawBuffers(4, [GL_COLOR_ATTACHMENT0 + index for index in range(4)])
+            glViewport(0, 0, *half_size)
+            glUseProgram(self._temporal_alpha_half_prog)
+            for sampler, unit in (
+                ('uFullDisocclusion', 0), ('uComposedDepth', 1),
+                ('uFurVelocity', 2), ('uOpaqueVelocity', 3),
+                ('uFurMask', 4), ('uAlphaMask', 5),
+            ):
+                location = glGetUniformLocation(
+                    self._temporal_alpha_half_prog, sampler,
+                )
+                if location >= 0:
+                    glUniform1i(location, unit)
+            _set_uniform_2f(
+                self._temporal_alpha_half_prog,
+                'uFullDimensions', *self._bloom_size,
+            )
+            for unit, texture in enumerate((
+                self._temporal_disocclusion_textures[target_index],
+                self._temporal_linear_depth_textures[1],
+                self._fur_material_textures[4],
+                self._scene_velocity_texture,
+                self._fur_normal_texture,
+                self._temporal_alpha_mask_texture,
+            )):
+                glActiveTexture(GL_TEXTURE0 + unit)
+                glBindTexture(GL_TEXTURE_2D, texture)
+            glDrawArrays(GL_TRIANGLES, 0, self._grid_count)
+
+        glBindVertexArray(0)
+        for unit in range(6, -1, -1):
+            glActiveTexture(GL_TEXTURE0 + unit)
+            glBindTexture(GL_TEXTURE_2D, 0)
+        glActiveTexture(GL_TEXTURE0)
+        self._temporal_disocclusion_valid[target_index] = True
+        glEnable(GL_BLEND)
+        glEnable(GL_DEPTH_TEST)
+
+    def _accumulate_temporal_scene(self, previous_jitter=(0.0, 0.0)):
+        """Accumulate stochastic fur, reprojecting its proven motion target."""
+        if (
+            not self._temporal_accum_prog
+            or len(self._temporal_fbos) != 2
+            or len(self._temporal_depth_textures) != 2
+        ):
+            self._display_scene_texture = self._current_scene_texture or self._hdr_color_buffers[0]
+            return
+        self._sync_temporal_signature()
 
         target_index = self._temporal_sample_count % 2
         previous_index = 1 - target_index
-        previous_count = min(self._temporal_sample_count, 31)
-        history_weight = previous_count / float(previous_count + 1)
+        temporal_misc = self.temporal_aa_misc()
         glBindFramebuffer(GL_FRAMEBUFFER, self._temporal_fbos[target_index])
+        glDrawBuffer(GL_COLOR_ATTACHMENT0)
         glViewport(0, 0, *self._bloom_size)
         glDisable(GL_DEPTH_TEST)
         glDisable(GL_BLEND)
         glUseProgram(self._temporal_accum_prog)
         for sampler, unit in (
-            ('uCurrent', 0), ('uHistory', 1), ('uFurGBuffer', 2),
+            ('uCurrent', 0), ('uHistory', 1), ('uMotion', 2),
+            ('uFurMask', 3), ('uLinearDepth', 4),
+            ('uAlphaMask', 5), ('uDisocclusion', 6),
+            ('uOpaqueMotion', 7), ('uStencil', 8),
         ):
             location = glGetUniformLocation(self._temporal_accum_prog, sampler)
             if location >= 0:
                 glUniform1i(location, unit)
         _set_uniform_1f(
-            self._temporal_accum_prog, 'uHistoryWeight', history_weight,
+            self._temporal_accum_prog, 'uHistoryWarmup', temporal_misc[3],
+        )
+        _set_uniform_1f(
+            self._temporal_accum_prog, 'uTemporalMinimumRejection',
+            temporal_misc[0],
+        )
+        _set_uniform_1f(
+            self._temporal_accum_prog, 'uNonopaqueStencilRejection',
+            temporal_misc[1],
+        )
+        _set_uniform_1f(
+            self._temporal_accum_prog, 'uTemporalHdrScale', temporal_misc[2],
+        )
+        _set_uniform_4f(
+            self._temporal_accum_prog, 'uTemporalDither',
+            *temporal_dither_constants(self._temporal_sample_count),
         )
         _set_uniform_2f(
-            self._temporal_accum_prog, 'uCurrentUvOffset',
-            *_temporal_current_sample_offset(
-                self._current_temporal_jitter, self._bloom_size,
+            self._temporal_accum_prog, 'uTemporalFilterOffsetPixels',
+            *_temporal_filter_offset_pixels(
+                self._current_temporal_jitter,
+                upper_left=self._native_raster_active,
             ),
         )
         _set_uniform_2f(
-            self._temporal_accum_prog, 'uProjectionScale',
-            projection[0, 0], projection[1, 1],
+            self._temporal_accum_prog, 'uHistoryJitterOffset',
+            *_temporal_history_jitter_offset(
+                self._current_temporal_jitter, previous_jitter,
+                self._bloom_size,
+                upper_left=self._native_raster_active,
+            ),
         )
-        _set_uniform_1f(
-            self._temporal_accum_prog, 'uScreenToViewScaleX',
-            2.0 / max(abs(float(projection[0, 0])), 0.000001),
-        )
-        view_light_dir = view[:3, :3] @ np.asarray(light_dir, dtype=np.float32)
-        _set_uniform_3f(
-            self._temporal_accum_prog, 'uWorldLightDir', *light_dir,
-        )
-        _set_uniform_3f(
-            self._temporal_accum_prog, 'uViewLightDir', *view_light_dir,
+        has_fur_motion = bool(
+            self._fur_deferred_active
+            and len(self._fur_material_textures) >= 5
+            and self._fur_material_textures[2]
+            and self._fur_material_textures[4]
+            and self._fur_normal_texture
         )
         _set_uniform_bool(
-            self._temporal_accum_prog, 'uFurContactEnabled',
-            self._fur_contact_enabled and bool(self._fur_gbuffer_texture),
+            self._temporal_accum_prog, 'uHasFurMotion', has_fur_motion,
+        )
+        has_opaque_motion = bool(self._scene_velocity_texture)
+        has_stencil = bool(self._scene_stencil_texture)
+        _set_uniform_bool(
+            self._temporal_accum_prog, 'uHasOpaqueMotion', has_opaque_motion,
+        )
+        _set_uniform_bool(
+            self._temporal_accum_prog, 'uHasStencil', has_stencil,
+        )
+        _set_uniform_bool(
+            self._temporal_accum_prog, 'uHasTemporalHistory',
+            self._temporal_sample_count > 0,
+        )
+        _set_uniform_bool(
+            self._temporal_accum_prog, 'uHasAlphaMask',
+            self._temporal_alpha_valid,
+        )
+        has_disocclusion = bool(
+            len(self._temporal_disocclusion_textures) == 2
+            and self._temporal_disocclusion_valid[target_index]
+        )
+        _set_uniform_bool(
+            self._temporal_accum_prog,
+            'uHasDisocclusion', has_disocclusion,
         )
         glActiveTexture(GL_TEXTURE0)
         glBindTexture(
@@ -3528,13 +5505,47 @@ class Viewport3D(QOpenGLWidget):
         glActiveTexture(GL_TEXTURE1)
         glBindTexture(GL_TEXTURE_2D, self._temporal_textures[previous_index])
         glActiveTexture(GL_TEXTURE2)
-        glBindTexture(GL_TEXTURE_2D, self._fur_gbuffer_texture)
+        glBindTexture(
+            GL_TEXTURE_2D,
+            self._fur_material_textures[4] if has_fur_motion else 0,
+        )
+        glActiveTexture(GL_TEXTURE3)
+        glBindTexture(
+            GL_TEXTURE_2D, self._fur_normal_texture if has_fur_motion else 0,
+        )
+        glActiveTexture(GL_TEXTURE4)
+        glBindTexture(
+            GL_TEXTURE_2D,
+            self._temporal_linear_depth_textures[1]
+            if len(self._temporal_linear_depth_textures) == 2 else 0,
+        )
+        glActiveTexture(GL_TEXTURE5)
+        glBindTexture(
+            GL_TEXTURE_2D,
+            self._temporal_alpha_mask_texture if self._temporal_alpha_valid else 0,
+        )
+        glActiveTexture(GL_TEXTURE6)
+        glBindTexture(
+            GL_TEXTURE_2D,
+            self._temporal_disocclusion_textures[target_index]
+            if has_disocclusion else 0,
+        )
+        glActiveTexture(GL_TEXTURE7)
+        glBindTexture(
+            GL_TEXTURE_2D,
+            self._scene_velocity_texture if has_opaque_motion else 0,
+        )
+        glActiveTexture(GL_TEXTURE8)
+        glBindTexture(
+            GL_TEXTURE_2D,
+            self._scene_stencil_texture if has_stencil else 0,
+        )
         glBindVertexArray(self._grid_vao)
         glDrawArrays(GL_TRIANGLES, 0, self._grid_count)
         glBindVertexArray(0)
-        glActiveTexture(GL_TEXTURE2)
-        glBindTexture(GL_TEXTURE_2D, 0)
-        glActiveTexture(GL_TEXTURE1)
+        for unit in range(8, 0, -1):
+            glActiveTexture(GL_TEXTURE0 + unit)
+            glBindTexture(GL_TEXTURE_2D, 0)
         glBindTexture(GL_TEXTURE_2D, 0)
         glActiveTexture(GL_TEXTURE0)
         glBindTexture(GL_TEXTURE_2D, 0)
@@ -3543,20 +5554,126 @@ class Viewport3D(QOpenGLWidget):
         glEnable(GL_BLEND)
         glEnable(GL_DEPTH_TEST)
 
+    def _prepare_fur_lighting(self, projection, view, light_dir):
+        """Decode stored native values, then evaluate the asset-preview lights."""
+        material, albedo, depth, strand, _motion = self._fur_material_textures
+        scene = self._fur_scene_gpu if self._fur_scene_is_current() else None
+        lighting_program = self._fur_scene_program if scene is not None else self._fur_lighting_prog
+        glDisable(GL_DEPTH_TEST)
+        glDisable(GL_BLEND)
+        glViewport(0, 0, *self._bloom_size)
+        stages = (
+            (self._fur_decode_fbo, self._fur_decode_prog, (
+                ('uMaterial', material), ('uStrand', strand), ('uLinearDepth', depth),
+                ('uOpaqueDepth', self._scene_linear_depth_texture))),
+            (self._fur_lighting_fbo, lighting_program, (
+                ('uMaterial', material), ('uStrand', strand), ('uAlbedoOcclusion', albedo),
+                ('uFurGBuffer', self._fur_gbuffer_texture), ('uFurNormalMask', self._fur_normal_texture))),
+        )
+        for fbo, program, textures in stages:
+            glBindFramebuffer(GL_FRAMEBUFFER, fbo)
+            glUseProgram(program)
+            for unit, (sampler, texture) in enumerate(textures):
+                glUniform1i(glGetUniformLocation(program, sampler), unit)
+                glActiveTexture(GL_TEXTURE0 + unit)
+                glBindTexture(GL_TEXTURE_2D, texture)
+            if program == lighting_program:
+                # Native view axes are right/down/forward; GL uses right/up/back.
+                native_to_world = view[:3, :3].T @ np.diag([1.0, -1.0, -1.0])
+                _set_uniform_mat3(program, 'uViewToWorld', native_to_world.astype(np.float32))
+                scale = np.array([projection[0, 0], projection[1, 1]], dtype=np.float32)
+                offset = np.array([projection[0, 2], -projection[1, 2]], dtype=np.float32)
+                screen = np.concatenate((2.0 / scale, (offset - 1.0) / scale))
+                glUniform4f(glGetUniformLocation(program, 'uScreenToView'), *screen)
+                _set_uniform_2f(program, 'uViewportSize', *self._bloom_size)
+                _set_uniform_3f(program, 'uLightDir', *light_dir)
+                _set_uniform_3f(program, 'uCameraPosition', *self.camera.eye_position())
+                _set_uniform_bool(program, 'uFurContactEnabled', self._fur_contact_enabled)
+                self._set_fur_temporal_uniforms(program)
+                _set_uniform_bool(program, 'uHasFurEnvironment', bool((scene is not None or self._fur_environment_texture) and self._fur_brdf_texture))
+                for unit, sampler, target, texture in (
+                    (5, 'uFurEnvironment', GL_TEXTURE_CUBE_MAP, self._fur_environment_texture),
+                    (6, 'uFurBrdfLut', GL_TEXTURE_2D, self._fur_brdf_texture),
+                ):
+                    glUniform1i(glGetUniformLocation(program, sampler), unit)
+                    glActiveTexture(GL_TEXTURE0 + unit)
+                    glBindTexture(target, texture)
+                if scene is not None:
+                    scene.bind(program)
+            glBindVertexArray(self._grid_vao)
+            glDrawArrays(GL_TRIANGLES, 0, self._grid_count)
+        glBindVertexArray(0)
+        if scene is not None:
+            scene.unbind()
+        for unit in range(6, -1, -1):
+            glActiveTexture(GL_TEXTURE0 + unit)
+            glBindTexture(GL_TEXTURE_2D, 0)
+        glActiveTexture(GL_TEXTURE5)
+        glBindTexture(GL_TEXTURE_CUBE_MAP, 0)
+        glActiveTexture(GL_TEXTURE0)
+
+    def _resolve_fur_lighting(self, projection, view, light_dir):
+        """Resolve key contact visibility before HairDenoise and temporal history."""
+        self._current_scene_fbo = self._hdr_fbo
+        self._current_scene_texture = self._hdr_color_buffers[0]
+        if not self._fur_deferred_active:
+            return
+        self._prepare_fur_lighting(projection, view, light_dir)
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, self._hdr_fbo)
+        glReadBuffer(GL_COLOR_ATTACHMENT0)
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, self._fur_contact_fbo)
+        glDrawBuffer(GL_COLOR_ATTACHMENT0)
+        glBlitFramebuffer(0, 0, *self._bloom_size, 0, 0, *self._bloom_size,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST)
+        glBindFramebuffer(GL_FRAMEBUFFER, self._fur_contact_fbo)
+        glDrawBuffers(2, [GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1])
+        glViewport(0, 0, *self._bloom_size)
+        glDisable(GL_DEPTH_TEST)
+        glDisable(GL_BLEND)
+        program = self._fur_contact_prog
+        glUseProgram(program)
+        for sampler, unit in (('uScene', 0), ('uFurKeyLight', 1),
+                              ('uFurGBuffer', 2), ('uFurNormalMask', 3)):
+            location = glGetUniformLocation(program, sampler)
+            if location >= 0:
+                glUniform1i(location, unit)
+        _set_uniform_mat3(program, 'uViewRotation', view[:3, :3])
+        _set_uniform_2f(program, 'uProjectionScale', projection[0, 0], projection[1, 1])
+        _set_uniform_2f(program, 'uProjectionOffset', projection[0, 2], -projection[1, 2])
+        _set_uniform_2f(program, 'uViewportSize', *self._bloom_size)
+        _set_uniform_3f(program, 'uWorldLightDir', *light_dir)
+        self._set_fur_temporal_uniforms(program)
+        # Scene lighting includes contact before the combined material resolve.
+        _set_uniform_bool(program, 'uFurContactEnabled', self._fur_contact_enabled
+                          and not self._fur_scene_is_current() and not getattr(self, '_ortho', False))
+        for unit, texture in enumerate((self._fur_indirect_texture, self._fur_key_texture,
+                                        self._fur_gbuffer_texture, self._fur_normal_texture)):
+            glActiveTexture(GL_TEXTURE0 + unit)
+            glBindTexture(GL_TEXTURE_2D, texture)
+        glBindVertexArray(self._grid_vao)
+        glDrawArrays(GL_TRIANGLES, 0, self._grid_count)
+        glBindVertexArray(0)
+        for unit in (GL_TEXTURE3, GL_TEXTURE2, GL_TEXTURE1, GL_TEXTURE0):
+            glActiveTexture(unit)
+            glBindTexture(GL_TEXTURE_2D, 0)
+        self._current_scene_fbo = self._fur_contact_fbo
+        self._current_scene_texture = self._fur_contact_texture
+        glEnable(GL_BLEND)
+        glEnable(GL_DEPTH_TEST)
+
     def _denoise_fur_scene(self, projection, view):
         """Apply the captured tangent/depth/mask-gated HairDenoise gather."""
-        self._current_scene_texture = self._hdr_color_buffers[0]
         if not (
             self._fur_denoise_prog and self._fur_denoise_fbo
             and self._fur_denoise_texture and self._fur_gbuffer_texture
             and self._fur_normal_texture and self._show_fur
-            and self._fur_denoise_enabled
+            and self._fur_denoise_enabled and self._fur_deferred_active
         ):
             return
         # Retail's destination already contains the other shading models;
         # CS_HairDenoise writes only worklisted hair pixels. Preserve that
         # behavior so non-fur scene color does not take an extra FP16 roundtrip.
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, self._hdr_fbo)
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, self._current_scene_fbo)
         glReadBuffer(GL_COLOR_ATTACHMENT0)
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, self._fur_denoise_fbo)
         glDrawBuffer(GL_COLOR_ATTACHMENT0)
@@ -3572,6 +5689,7 @@ class Viewport3D(QOpenGLWidget):
         glUseProgram(self._fur_denoise_prog)
         for sampler, unit in (
             ('uScene', 0), ('uFurGBuffer', 1), ('uFurNormalMask', 2),
+            ('uGatherAddress', 4),
         ):
             location = glGetUniformLocation(self._fur_denoise_prog, sampler)
             if location >= 0:
@@ -3584,35 +5702,34 @@ class Viewport3D(QOpenGLWidget):
             projection[0, 0], projection[1, 1],
         )
         _set_uniform_2f(
+            self._fur_denoise_prog, 'uProjectionOffset',
+            projection[0, 2], -projection[1, 2],
+        )
+        _set_uniform_2f(
             self._fur_denoise_prog, 'uViewportSize', *self._bloom_size,
         )
-        frame_location = glGetUniformLocation(
-            self._fur_denoise_prog, 'uFrameIndex',
-        )
-        if frame_location >= 0:
-            glUniform1i(frame_location, int(self._temporal_sample_count))
-        temporal_location = glGetUniformLocation(
-            self._fur_denoise_prog, 'uTemporalIndex',
-        )
-        if temporal_location >= 0:
-            glUniform1f(
-                temporal_location,
-                float(_halton((self._temporal_sample_count % 32) + 1, 2)),
-            )
+        self._set_fur_temporal_uniforms(self._fur_denoise_prog)
+        _set_uniform_bool(self._fur_denoise_prog, 'uHasSceneProjection', False)
+        _set_uniform_bool(self._fur_denoise_prog, 'uHasSceneDenoiseMask', False)
+        _set_uniform_bool(self._fur_denoise_prog, 'uHasGatherAddress', bool(self._fur_gather_address_texture))
+        if self._fur_scene_is_current():
+            self._fur_scene_gpu.bind_denoise(self._fur_denoise_prog)
         for unit, texture_id in (
-            (GL_TEXTURE0, self._hdr_color_buffers[0]),
+            (GL_TEXTURE0, self._current_scene_texture),
             (GL_TEXTURE1, self._fur_gbuffer_texture),
             (GL_TEXTURE2, self._fur_normal_texture),
+            (GL_TEXTURE4, self._fur_gather_address_texture),
         ):
             glActiveTexture(unit)
             glBindTexture(GL_TEXTURE_2D, texture_id)
         glBindVertexArray(self._grid_vao)
         glDrawArrays(GL_TRIANGLES, 0, self._grid_count)
         glBindVertexArray(0)
-        for unit in (GL_TEXTURE2, GL_TEXTURE1, GL_TEXTURE0):
+        for unit in (GL_TEXTURE4, GL_TEXTURE3, GL_TEXTURE2, GL_TEXTURE1, GL_TEXTURE0):
             glActiveTexture(unit)
             glBindTexture(GL_TEXTURE_2D, 0)
         self._current_scene_texture = self._fur_denoise_texture
+        self._current_scene_fbo = self._fur_denoise_fbo
         glEnable(GL_BLEND)
         glEnable(GL_DEPTH_TEST)
 
@@ -3641,6 +5758,11 @@ class Viewport3D(QOpenGLWidget):
             first_pass = False
 
         glBindFramebuffer(GL_FRAMEBUFFER, self.defaultFramebufferObject())
+        if self._native_raster_active:
+            # QOpenGLWidget presents its backing FBO with Qt's conventional
+            # lower-left GL row ownership. Keep native offscreen targets
+            # upper-left, then write this one boundary in Qt's convention.
+            glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE)
         glViewport(0, 0, *self._bloom_size)
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         glUseProgram(self._composite_prog)
@@ -3670,6 +5792,7 @@ class Viewport3D(QOpenGLWidget):
         glBindTexture(GL_TEXTURE_2D, 0)
         glEnable(GL_BLEND)
         glEnable(GL_DEPTH_TEST)
+        self._apply_raster_convention()
 
     def _composite_fur_oit(self):
         """Composite order-independent fur accumulation into HDR scene color."""
@@ -3722,8 +5845,9 @@ class Viewport3D(QOpenGLWidget):
                 pass
             return 0
 
-    def _draw_fur_strands(self, mvp, model, normal_mat, eye,
-                          light_dir, fill_dir):
+    def _draw_fur_strands(self, mvp, previous_mvp, model, normal_mat, eye,
+                          light_dir, fill_dir, wind_time,
+                          previous_wind_time, near_plane):
         """Render one stochastic opaque sample of the recovered shell pass."""
         if not self._fur_shader_prog or not self._fur_layer_texture:
             return
@@ -3741,52 +5865,43 @@ class Viewport3D(QOpenGLWidget):
         if not fur_meshes:
             return
 
-        glUseProgram(self._fur_shader_prog)
-        _set_uniform_mat4(self._fur_shader_prog, 'uMVP', mvp)
-        _set_uniform_mat4(self._fur_shader_prog, 'uModel', model)
-        _set_uniform_mat3(self._fur_shader_prog, 'uNormal', normal_mat)
-        _set_uniform_3f(self._fur_shader_prog, 'uEye', *eye)
-        _set_uniform_3f(self._fur_shader_prog, 'uLightDir', *light_dir)
-        _set_uniform_3f(self._fur_shader_prog, 'uFillDir', *fill_dir)
+        program = self._fur_material_prog if self._fur_deferred_active else self._fur_shader_prog
+        glUseProgram(program)
+        _set_uniform_mat4(program, 'uMVP', mvp)
+        _set_uniform_mat4(program, 'uPreviousMVP', previous_mvp)
+        _set_uniform_mat4(program, 'uModel', model)
+        _set_uniform_mat3(program, 'uNormal', normal_mat)
+        _set_uniform_3f(program, 'uEye', *eye)
+        _set_uniform_3f(program, 'uLightDir', *light_dir)
+        _set_uniform_3f(program, 'uFillDir', *fill_dir)
         _set_uniform_1f(
-            self._fur_shader_prog, 'uFurWindStrength', self._fur_wind_strength,
+            program, 'uFurWindStrength', self._fur_wind_strength,
         )
         _set_uniform_3f(
-            self._fur_shader_prog, 'uFurWindVector', *self._fur_wind_vector,
-        )
-        wind_time = self._fur_wind_time_override
-        if wind_time is None:
-            wind_time = time.monotonic() - self._fur_wind_epoch
-        _set_uniform_1f(
-            self._fur_shader_prog, 'uFurWindTime', wind_time,
+            program, 'uFurWindVector', *self._fur_wind_vector,
         )
         _set_uniform_1f(
-            self._fur_shader_prog, 'uFurWindObjectPhase',
+            program, 'uFurWindTime', wind_time,
+        )
+        _set_uniform_1f(
+            program, 'uPreviousFurWindTime', previous_wind_time,
+        )
+        _set_uniform_1f(program, 'uMotionNearPlane', near_plane)
+        _set_uniform_1f(
+            program, 'uFurWindObjectPhase',
             self._fur_wind_object_phase,
         )
         _set_uniform_2f(
-            self._fur_shader_prog, 'uViewportSize',
+            program, 'uViewportSize',
             *self._framebuffer_size(),
         )
-        frame_location = glGetUniformLocation(
-            self._fur_shader_prog, 'uFrameIndex',
-        )
-        if frame_location >= 0:
-            glUniform1i(frame_location, int(self._temporal_sample_count))
-        temporal_location = glGetUniformLocation(
-            self._fur_shader_prog, 'uTemporalIndex',
-        )
-        if temporal_location >= 0:
-            temporal_index = _halton(
-                (self._temporal_sample_count % 32) + 1, 2,
-            )
-            glUniform1f(temporal_location, float(temporal_index))
+        self._set_fur_temporal_uniforms(program)
         for sampler, unit in (
             ('uFurAlbedo', 0), ('uFurControl', 1), ('uFurLayers', 2),
             ('uFurSpecular', 3),
             ('uFurEnvironment', 4), ('uFurBrdfLut', 5),
         ):
-            location = glGetUniformLocation(self._fur_shader_prog, sampler)
+            location = glGetUniformLocation(program, sampler)
             if location >= 0:
                 glUniform1i(location, unit)
 
@@ -3799,11 +5914,11 @@ class Viewport3D(QOpenGLWidget):
             self._fur_environment_texture > 0 and self._fur_brdf_texture > 0
         )
         _set_uniform_bool(
-            self._fur_shader_prog, 'uHasFurEnvironment', has_fur_environment,
+            program, 'uHasFurEnvironment', has_fur_environment,
         )
         glActiveTexture(GL_TEXTURE4)
         glBindTexture(
-            GL_TEXTURE_2D_ARRAY,
+            GL_TEXTURE_CUBE_MAP,
             self._fur_environment_texture if has_fur_environment else 0,
         )
         glActiveTexture(GL_TEXTURE5)
@@ -3812,35 +5927,35 @@ class Viewport3D(QOpenGLWidget):
             self._fur_brdf_texture if has_fur_environment else 0,
         )
         for mesh in fur_meshes:
-            _set_uniform_1f(self._fur_shader_prog, 'uFurLength', mesh.fur_length)
+            _set_uniform_1f(program, 'uFurLength', mesh.fur_length)
             _set_uniform_1f(
-                self._fur_shader_prog, 'uFurWindRadius', mesh.fur_wind_radius,
+                program, 'uFurWindRadius', mesh.fur_wind_radius,
             )
             _set_uniform_1f(
-                self._fur_shader_prog, 'uFurWindTurbulence',
+                program, 'uFurWindTurbulence',
                 mesh.fur_wind_turbulence,
             )
-            _set_uniform_1f(self._fur_shader_prog, 'uFurDensity', mesh.fur_density)
+            _set_uniform_1f(program, 'uFurDensity', mesh.fur_density)
             _set_uniform_1f(
-                self._fur_shader_prog, 'uFurOffsetScale',
+                program, 'uFurOffsetScale',
                 mesh.fur_offset_scale,
             )
             _set_uniform_1f(
-                self._fur_shader_prog, 'uFurGlossScale', mesh.fur_gloss_scale,
+                program, 'uFurGlossScale', mesh.fur_gloss_scale,
             )
             _set_uniform_1f(
-                self._fur_shader_prog, 'uFurSpecularScale',
+                program, 'uFurSpecularScale',
                 mesh.fur_specular_scale,
             )
             _set_uniform_1f(
-                self._fur_shader_prog, 'uFurTransmittanceScale',
+                program, 'uFurTransmittanceScale',
                 mesh.fur_transmittance_scale,
             )
             _set_uniform_1f(
-                self._fur_shader_prog, 'uFurWetness', self._fur_wetness,
+                program, 'uFurWetness', self._fur_wetness,
             )
             _set_uniform_bool(
-                self._fur_shader_prog, 'uHasFurSpecular',
+                program, 'uHasFurSpecular',
                 mesh.specular_tex_id > 0,
             )
             glActiveTexture(GL_TEXTURE0)
@@ -3851,11 +5966,11 @@ class Viewport3D(QOpenGLWidget):
             glBindTexture(GL_TEXTURE_2D, mesh.specular_tex_id)
             glBindVertexArray(mesh.vao)
             layer_count = max(1, int(mesh.fur_layer_count or 32))
-            location = glGetUniformLocation(self._fur_shader_prog, 'uLayerCount')
+            location = glGetUniformLocation(program, 'uLayerCount')
             if location >= 0:
                 glUniform1i(location, layer_count)
             layer_location = glGetUniformLocation(
-                self._fur_shader_prog, 'uReverseLayer',
+                program, 'uReverseLayer',
             )
             debug_layer = self._fur_debug_reverse_layer
             reverse_layers = (
@@ -3873,7 +5988,7 @@ class Viewport3D(QOpenGLWidget):
         glActiveTexture(GL_TEXTURE5)
         glBindTexture(GL_TEXTURE_2D, 0)
         glActiveTexture(GL_TEXTURE4)
-        glBindTexture(GL_TEXTURE_2D_ARRAY, 0)
+        glBindTexture(GL_TEXTURE_CUBE_MAP, 0)
         glActiveTexture(GL_TEXTURE2)
         glBindTexture(GL_TEXTURE_2D_ARRAY, 0)
         glActiveTexture(GL_TEXTURE3)
@@ -3890,9 +6005,26 @@ class Viewport3D(QOpenGLWidget):
         if not _HAS_OPENGL:
             return
 
+        # Qt preserves context state between paints, but applying the complete
+        # convention here also guards against state changed by external GL use.
+        self._apply_raster_convention()
+        glDisable(GL_CULL_FACE)
+
         # Upload any pending model now that GL context is active
         if self._pending_model is not None:
             self._upload_pending_model()
+
+        if self._pending_fur_scene is not None:
+            self._upload_fur_scene()
+
+        pending_poses = self._pending_poses
+        self._pending_poses = {}
+        for index, streams in pending_poses.items():
+            self._gpu_meshes[index].update_pose(*streams)
+        if self._reset_pose_history or self._previous_fur_mvp is None:
+            for mesh in self._gpu_meshes:
+                mesh.settle_pose_history()
+            self._reset_pose_history = False
 
         # Upload any pending textures
         pending_tex = getattr(self, '_pending_textures', None)
@@ -3909,26 +6041,25 @@ class Viewport3D(QOpenGLWidget):
             and len(self._hdr_color_buffers) == 2
             and len(self._pingpong_fbos) == 2
         )
+        self._fur_deferred_active = bool(use_hdr and self._fur_contact_prog
+            and self._fur_contact_fbo and self._fur_key_texture and self._show_fur
+            and self._fur_material_prog and self._fur_decode_prog and self._fur_lighting_prog
+            and self._fur_material_fbo and not getattr(self, '_ortho', False))
         glBindFramebuffer(
             GL_FRAMEBUFFER,
             self._hdr_fbo if use_hdr else self.defaultFramebufferObject(),
         )
         glViewport(0, 0, *framebuffer_size)
         if use_hdr:
-            if self._fur_gbuffer_texture:
-                glDrawBuffers(4, [
-                    GL_COLOR_ATTACHMENT0,
-                    GL_COLOR_ATTACHMENT1,
-                    GL_COLOR_ATTACHMENT2,
-                    GL_COLOR_ATTACHMENT3,
-                ])
+            if self._scene_velocity_texture and self._scene_stencil_texture:
+                glDrawBuffers(5, [GL_COLOR_ATTACHMENT0 + index for index in range(5)])
             glClearBufferfv(
                 GL_COLOR, 0, np.array([0.102, 0.110, 0.133, 1.0], dtype=np.float32),
             )
             glClearBufferfv(
                 GL_COLOR, 1, np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32),
             )
-            if self._fur_gbuffer_texture:
+            if self._scene_velocity_texture and self._scene_stencil_texture:
                 glClearBufferfv(
                     GL_COLOR, 2,
                     np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32),
@@ -3937,12 +6068,16 @@ class Viewport3D(QOpenGLWidget):
                     GL_COLOR, 3,
                     np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float32),
                 )
+                glClearBufferuiv(
+                    GL_COLOR, 4, np.zeros(4, dtype=np.uint32),
+                )
                 glDrawBuffers(2, [GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1])
             glClear(GL_DEPTH_BUFFER_BIT)
         else:
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
         aspect = w / max(h, 1)
+        near = 0.0001
         self._current_temporal_jitter = (0.0, 0.0)
         if getattr(self, '_ortho', False):
             # Orthographic: scale half-height by camera distance.
@@ -3951,8 +6086,14 @@ class Viewport3D(QOpenGLWidget):
             # keeping far large enough for big scenes.
             half_h = self.camera.dist * 0.5
             extent = max(self.camera.dist * 10.0, 500.0)
-            proj   = _ortho(-half_h * aspect, half_h * aspect,
-                            -half_h, half_h, -extent, extent)
+            projection_builder = (
+                _ortho_reverse_z_zero_to_one
+                if self._native_raster_active else _ortho
+            )
+            proj = projection_builder(
+                -half_h * aspect, half_h * aspect,
+                -half_h, half_h, -extent, extent,
+            )
         else:
             if hasattr(self, '_aabb_min') and hasattr(self, '_aabb_max'):
                 near, far = _perspective_clip_planes(
@@ -3961,7 +6102,11 @@ class Viewport3D(QOpenGLWidget):
             else:
                 near = max(self.camera.dist * 1e-4, 0.0001)
                 far = max(self.camera.dist * 10.0, 100.0)
-            proj = _perspective(60.0, aspect, near, far)
+            projection_builder = (
+                _perspective_reverse_z_zero_to_one
+                if self._native_raster_active else _perspective
+            )
+            proj = projection_builder(60.0, aspect, near, far)
             if use_hdr and self._show_fur and self._gpu_meshes:
                 # The retail stochastic coverage is consumed by a jittered
                 # temporal pipeline.  Jitter is required to reconstruct the
@@ -3977,8 +6122,36 @@ class Viewport3D(QOpenGLWidget):
         model  = np.eye(4, dtype=np.float32)
         mvp    = proj @ view @ model
         normal_mat = np.linalg.inv(model[:3, :3]).T
+        wind_time = self._fur_wind_time_override
+        if wind_time is None:
+            wind_time = time.monotonic() - self._fur_wind_epoch
+        motion_signature = (framebuffer_size, id(getattr(self, '_current_model', None)))
+        if self._fur_motion_signature != motion_signature:
+            self._previous_fur_mvp = None
+            self._previous_fur_wind_time = None
+            self._previous_fur_jitter = None
+        previous_mvp = self._previous_fur_mvp
+        if previous_mvp is None:
+            previous_mvp = mvp
+            # A camera/resource reset must reset pose motion in the same frame.
+            for mesh in self._gpu_meshes:
+                mesh.settle_pose_history()
+        previous_projection = self._previous_fur_projection
+        if previous_projection is None:
+            previous_projection = proj
+        previous_view = self._previous_fur_view
+        if previous_view is None:
+            previous_view = view
+        previous_wind_time = self._previous_fur_wind_time
+        if previous_wind_time is None:
+            previous_wind_time = wind_time
+        previous_fur_jitter = self._previous_fur_jitter
+        if previous_fur_jitter is None:
+            previous_fur_jitter = self._current_temporal_jitter
 
-        light_dir = np.array([0.6, 1.0, 0.8], np.float32)
+        light_dir = np.array(self._preview_light_direction, np.float32)
+        if self._fur_deferred_active and self._fur_scene_is_current():
+            light_dir = np.array(self._fur_scene_gpu.params['key_direction'], np.float32)
         light_dir /= np.linalg.norm(light_dir)
         fill_dir  = np.array([0.0, 0.3, 1.0], np.float32)   # soft front fill
         fill_dir  /= np.linalg.norm(fill_dir)
@@ -4002,17 +6175,22 @@ class Viewport3D(QOpenGLWidget):
 
         # Draw meshes
         if self._gpu_meshes:
-            if use_hdr and self._fur_gbuffer_texture:
-                glDrawBuffers(4, [
-                    GL_COLOR_ATTACHMENT0,
-                    GL_COLOR_ATTACHMENT1,
-                    GL_COLOR_ATTACHMENT2,
-                    GL_COLOR_ATTACHMENT3,
-                ])
+            if use_hdr and self._scene_velocity_texture and self._scene_stencil_texture:
+                glDrawBuffers(5, [GL_COLOR_ATTACHMENT0 + index for index in range(5)])
+                # Linear depth is data; alpha blending would square the depth
+                # or mix it with previously drawn geometry.
+                glDisablei(GL_BLEND, 2)
+                glDisablei(GL_BLEND, 3)
+                glDisablei(GL_BLEND, 4)
             glUseProgram(self._shader_prog)
             _set_uniform_mat4(self._shader_prog, 'uMVP', mvp)
+            _set_uniform_mat4(self._shader_prog, 'uPreviousMVP', previous_mvp)
             _set_uniform_mat4(self._shader_prog, 'uModel', model)
             _set_uniform_mat3(self._shader_prog, 'uNormal', normal_mat)
+            _set_uniform_2f(
+                self._shader_prog, 'uViewportSize', *framebuffer_size,
+            )
+            _set_uniform_1f(self._shader_prog, 'uMotionNearPlane', near)
             _set_uniform_3f(self._shader_prog, 'uLightDir', *light_dir)
             _set_uniform_3f(self._shader_prog, 'uFillDir',  *fill_dir)
             _set_uniform_bool(self._shader_prog, 'uWireframe', self._wireframe)
@@ -4129,22 +6307,57 @@ class Viewport3D(QOpenGLWidget):
 
             glPolygonMode(GL_FRONT_AND_BACK, GL_FILL)
 
-            if use_hdr and self._fur_gbuffer_texture:
-                glDrawBuffers(4, [
-                    GL_COLOR_ATTACHMENT0,
-                    GL_COLOR_ATTACHMENT1,
-                    GL_COLOR_ATTACHMENT2,
-                    GL_COLOR_ATTACHMENT3,
-                ])
+            if use_hdr and self._scene_velocity_texture and self._scene_stencil_texture:
+                glDrawBuffers(5, [GL_COLOR_ATTACHMENT0 + index for index in range(5)])
+            srgb_enabled = bool(glIsEnabled(GL_FRAMEBUFFER_SRGB))
+            if self._fur_deferred_active:
+                glBindFramebuffer(GL_FRAMEBUFFER, self._fur_material_fbo)
+                glClearBufferuiv(GL_COLOR, 0, np.zeros(4, dtype=np.uint32))
+                glClearBufferfv(GL_COLOR, 1, np.zeros(4, dtype=np.float32))
+                glClearBufferfv(GL_COLOR, 2, np.zeros(4, dtype=np.float32))
+                glClearBufferuiv(GL_COLOR, 3, np.zeros(4, dtype=np.uint32))
+                glClearBufferfv(GL_COLOR, 4, np.zeros(4, dtype=np.float32))
+                glEnable(GL_FRAMEBUFFER_SRGB)
+            if self._native_raster_active:
+                # The captured state proves CCW/back-face culling for the fur
+                # material draw. Other editor materials can be authored
+                # two-sided, so keep this state scoped to the recovered pass.
+                glFrontFace(GL_CCW)
+                glCullFace(GL_BACK)
+                glEnable(GL_CULL_FACE)
             self._draw_fur_strands(
-                mvp, model, normal_mat, eye, light_dir, fill_dir,
+                mvp, previous_mvp, model, normal_mat, eye, light_dir, fill_dir,
+                wind_time, previous_wind_time, near,
             )
+            if self._native_raster_active:
+                glDisable(GL_CULL_FACE)
+            self._previous_fur_mvp = mvp.copy()
+            self._previous_fur_projection = proj.copy()
+            self._previous_fur_view = view.copy()
+            self._previous_fur_wind_time = float(wind_time)
+            self._previous_fur_jitter = tuple(self._current_temporal_jitter)
+            self._fur_motion_signature = motion_signature
+            if self._fur_deferred_active:
+                if not srgb_enabled:
+                    glDisable(GL_FRAMEBUFFER_SRGB)
+                glBindFramebuffer(GL_FRAMEBUFFER, self._hdr_fbo)
             if use_hdr:
                 glDrawBuffers(2, [GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1])
 
         if use_hdr:
+            if self._fur_deferred_active and not self._gpu_meshes:
+                glBindFramebuffer(GL_FRAMEBUFFER, self._fur_material_fbo)
+                glClearBufferuiv(GL_COLOR, 0, np.zeros(4, dtype=np.uint32))
+            self._resolve_fur_lighting(proj, view, light_dir)
             self._denoise_fur_scene(proj, view)
-            self._accumulate_temporal_scene(proj, view, light_dir)
+            self._sync_temporal_signature()
+            temporal_target_index = self._temporal_sample_count % 2
+            self._build_motion_blur_scatter(temporal_target_index)
+            self._build_temporal_disocclusion(
+                temporal_target_index, proj, view,
+                previous_projection, previous_view,
+            )
+            self._accumulate_temporal_scene(previous_fur_jitter)
             self._composite_bloom()
             if self._temporal_sample_count < 32:
                 self.update()
@@ -4252,11 +6465,13 @@ class Viewport3D(QOpenGLWidget):
     def _toggle_ortho(self):
         """Toggle between perspective and orthographic projection."""
         self._ortho = not getattr(self, '_ortho', False)
+        self._reset_temporal_history()
         self._redraw()
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _free_gpu_meshes(self):
+        self._pending_poses = {}
         # Collect unique texture IDs before freeing (multiple meshes may share a texture)
         unique_tex_ids = set()
         for gm in self._gpu_meshes:
@@ -4291,6 +6506,11 @@ class Viewport3D(QOpenGLWidget):
         for gm in self._gpu_meshes:
             gm.free()
         self._gpu_meshes.clear()
+        self._reset_temporal_history()
+        if self._fur_scene_gpu is not None:
+            self._fur_scene_gpu.close()
+            self._fur_scene_gpu = None
+        self._fur_scene_view = None
 
         # Now delete unique textures once each
         if unique_tex_ids:
@@ -4328,6 +6548,28 @@ def _perspective(fov_deg: float, aspect: float, near: float, far: float) -> np.n
         [0,        0, -1,                        0                       ]
     ], dtype=np.float32)
 
+
+def _perspective_reverse_z_zero_to_one(
+    fov_deg: float, aspect: float, near: float, far: float,
+) -> np.ndarray:
+    """Build the native right-handed finite reverse-Z projection.
+
+    This is kept separate from ``_perspective`` until clip origin, shared
+    depth, fullscreen passes, and screen-space addressing can migrate as one
+    operation.  With visible view-space Z negative, near maps to 1 and far to
+    0 under ``GL_ZERO_TO_ONE``.
+    """
+    if not 0.0 < near < far:
+        raise ValueError("reverse-Z perspective requires 0 < near < far")
+    f = 1.0 / math.tan(math.radians(fov_deg) / 2.0)
+    inverse_range = 1.0 / (far - near)
+    return np.array([
+        [f/aspect, 0,  0,                         0                        ],
+        [0,        f,  0,                         0                        ],
+        [0,        0,  near * inverse_range,      near * far * inverse_range],
+        [0,        0, -1,                         0                        ],
+    ], dtype=np.float32)
+
 def _ortho(left: float, right: float, bottom: float, top: float,
            near: float, far: float) -> np.ndarray:
     return np.array([
@@ -4335,6 +6577,21 @@ def _ortho(left: float, right: float, bottom: float, top: float,
         [0,              2/(top-bottom), 0,             -(top+bottom)/(top-bottom)],
         [0,              0,             -2/(far-near),  -(far+near)/(far-near)    ],
         [0,              0,              0,              1                        ],
+    ], dtype=np.float32)
+
+
+def _ortho_reverse_z_zero_to_one(
+    left: float, right: float, bottom: float, top: float,
+    near: float, far: float,
+) -> np.ndarray:
+    """Map right-handed view planes ``-near``/``-far`` to one/zero."""
+    if right == left or top == bottom or far == near:
+        raise ValueError("orthographic bounds must have non-zero extent")
+    return np.array([
+        [2/(right-left), 0,              0,            -(right+left)/(right-left)],
+        [0,              2/(top-bottom), 0,            -(top+bottom)/(top-bottom)],
+        [0,              0,              1/(far-near),  far/(far-near)            ],
+        [0,              0,              0,             1                         ],
     ], dtype=np.float32)
 
 def _look_at(eye: np.ndarray, center: np.ndarray, up: np.ndarray) -> np.ndarray:
@@ -4381,6 +6638,12 @@ def _set_uniform_2f(prog, name, x, y):
     loc = glGetUniformLocation(prog, name)
     if loc >= 0:
         glUniform2f(loc, float(x), float(y))
+
+
+def _set_uniform_4f(prog, name, x, y, z, w):
+    loc = glGetUniformLocation(prog, name)
+    if loc >= 0:
+        glUniform4f(loc, float(x), float(y), float(z), float(w))
 
 def _hsv_to_rgb(h, s, v):
     i = int(h * 6)

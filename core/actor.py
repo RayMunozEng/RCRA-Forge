@@ -2,34 +2,34 @@
 core/actor.py
 Actor DAT1 parser for RCRA Forge.
 
-Actor assets (.actor) are thin wrappers that reference a model asset by path.
-The model path is stored as a plain null-terminated string in the DAT1 string
-pool, always as the second string after "Actor Built File".
-
-Confirmed from binary analysis of:
-  - modifynavvolume.actor       (no model — nav volume only)
-  - meg_prop_chair_01_bk_chunk_01_kick.actor  (has model path in pool)
-
-Actor DAT1 layout:
-  unk1 = 0x944BD3AD  (shared by all actor types)
-  String pool: "Actor Built File\\0" + optional model path + other strings
-  Model path: first string ending in ".model" in the pool
+Retail loader 0x140F18A20 reads the model-path string offset from section
+0x32FAC8E0, the default scene definition from 0x364A6C7C, and component
+definitions from 0x135832C8. String-pool order does not select the model.
 """
 
 import struct
 from dataclasses import dataclass
 from typing import Optional
 
+from core.archive import DAT1
+from core.scene_components import SceneComponent, parse_component_records
+
 
 ACTOR_TYPE = 0x944BD3AD
+TAG_ACTOR_HEADER = 0x32FAC8E0
+TAG_ACTOR_SCENE = 0x364A6C7C
+TAG_ACTOR_COMPONENTS = 0x135832C8
 
 
 @dataclass
 class ActorAsset:
-    """Parsed actor — primarily just the model path reference."""
+    """Actor model reference, default scene definition, and component defaults."""
     model_path:  Optional[str]   # e.g. "environment\\...\\chair.model"
     model_asset_id: Optional[int]  # resolved via HashLookup (None if not in hashes.txt)
     all_strings: list            # all strings found in pool (for debugging)
+    scene_type: Optional[int] = None
+    scene_data: bytes = b''
+    components: tuple[SceneComponent, ...] = ()
 
     @property
     def has_model(self) -> bool:
@@ -81,12 +81,28 @@ def parse_actor_asset(data: bytes,
     # Extract all null-terminated strings from pool
     all_strings = _read_all_strings(pool)
 
-    # Find model path — first string ending with '.model'
+    dat1_data = data[dat1_off:]
+    dat1 = DAT1(dat1_data)
+    header = dat1.get_section(TAG_ACTOR_HEADER)
+    scene = dat1.get_section(TAG_ACTOR_SCENE)
+    scene_type = None
+    if scene is not None:
+        if len(scene) < 0x80:
+            raise ValueError('Truncated actor scene definition')
+        size = struct.unpack_from('<I', scene, 0x7C)[0] & 0x7FFFFFFF
+        if size < 0x80 or size > len(scene):
+            raise ValueError('Invalid actor scene definition size')
+        scene_type = scene[0x5F]
+        scene = bytes(scene[:size])
+
+    # The renderer uses this reference only when the scene factory selects a model.
     model_path = None
-    for s in all_strings:
-        if s.lower().endswith('.model') and s:
-            model_path = s.replace('\\', '/').lower()
-            break
+    if header is not None and scene_type == 0:
+        if len(header) < 4:
+            raise ValueError('Truncated actor header')
+        path = dat1.get_string(struct.unpack_from('<I', header)[0])
+        if path:
+            model_path = path.replace('\\', '/').lower()
 
     # Resolve model path to asset ID via HashLookup
     model_asset_id = None
@@ -103,6 +119,8 @@ def parse_actor_asset(data: bytes,
         model_path=model_path,
         model_asset_id=model_asset_id,
         all_strings=all_strings,
+        scene_type=scene_type, scene_data=scene or b'',
+        components=parse_component_records(dat1_data, dat1.get_section(TAG_ACTOR_COMPONENTS) or b''),
     )
 
 

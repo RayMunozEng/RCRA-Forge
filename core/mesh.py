@@ -73,7 +73,7 @@ def _decode_normal(norm: int) -> tuple:
 
     nx = nx * nw
     ny = ny * nw
-    nz = 1.0 - 0.5 * nxxyy
+    nz = abs(1.0 - 0.5 * nxxyy)
     if flip:
         nz = -nz
 
@@ -98,7 +98,7 @@ def _decode_tangent(position_w: int, norm: int) -> tuple:
     tw = math.sqrt(max(0.0, 1.0 - 0.25 * txxyy))
     tx *= tw
     ty *= tw
-    tz = 1.0 - 0.5 * txxyy
+    tz = abs(1.0 - 0.5 * txxyy)
     if ((norm >> 30) & 1) == 0:
         tz = -tz
 
@@ -109,8 +109,9 @@ def _decode_tangent(position_w: int, norm: int) -> tuple:
 def _decode_position_correction(position_w: int) -> float:
     """Decode the small position-quantization term used by the retail VS."""
     exponent = abs(int(position_w)) & 0x7C00
-    scaled = float(exponent) * 0.000032
-    return 1.0 / (scaled * scaled) if scaled > 0.0 else 0.0
+    # Captured DXIL immediate 0x38042108 (float32 reciprocal of 31744).
+    scaled = float(exponent) * 0.00003150201519019902
+    return 1.0 / (scaled * scaled) if scaled > 0.0 else math.inf
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────

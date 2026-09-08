@@ -8,7 +8,12 @@ Zone assets use unk1 = 0x8A0B1487.
 These are complex assets with many section types. For RCRA Forge's purposes
 we expose enough to show the scene hierarchy and instance placements.
 
-The most relevant sections discovered from ALERT:
+The RCRA level loader at 0x14107BEE0 accepts type 0x587B60A6. Its zone
+catalogue has 12-byte records containing an asset ID and a signed name index.
+The name index selects a separate DAT1 string-offset table (0x14107D520).
+This catalogue does not establish runtime residency or world transforms.
+
+Other sections discovered from ALERT:
   dat1lib/types/sections/level/  — level-specific sections
   dat1lib/types/sections/zone/   — zone sections (autogen.py has many entries)
 
@@ -26,8 +31,48 @@ from core.archive import DAT1, ASSET_TYPE_NAMES
 
 # DAT1 unk1 values for asset types we handle here
 ASSET_TYPE_LEVEL  = 0x2AFE7495
+ASSET_TYPE_LEVEL_RCRA = 0x587B60A6
 ASSET_TYPE_ZONE   = 0x8A0B1487
 ASSET_TYPE_CONFIG = 0x21A56F68
+TAG_LEVEL_HEADER = 0x7CA7267D
+TAG_LEVEL_ZONES = 0x4E023760
+TAG_LEVEL_ZONE_NAMES = 0x2BA33702
+TAG_LEVEL_REGIONS = 0x396F9418
+TAG_LEVEL_REGION_NAMES = 0x4130D903
+TAG_LEVEL_REGION_BOUNDS = 0xC30D92B6
+TAG_LEVEL_ZONE_INDICES = 0x95F91E24
+TAG_LEVEL_CHECKPOINTS = 0x3395AEC1
+TAG_LEVEL_CHECKPOINT_NAMES = 0x2236C47A
+
+
+@dataclass(frozen=True)
+class LevelRegion:
+    index: int
+    asset_id: int
+    kind: int
+    name: str
+    parent_index: int
+    child_indices: tuple[int, ...]
+    zone_indices: tuple[int, ...]
+    replacement_zone_indices: tuple[int, ...]
+    checkpoint_indices: tuple[int, ...]
+    bounds_index: int
+    bounds_data: bytes = field(repr=False)
+    property_start: int
+    property_count: int
+    raw: bytes = field(repr=False)
+
+
+@dataclass(frozen=True)
+class LevelCheckpoint:
+    index: int
+    checkpoint_id: int
+    name: str
+    region_index: int
+    position: tuple[float, ...]
+    property_start: int
+    property_count: int
+    raw: bytes = field(repr=False)
 
 
 @dataclass
@@ -35,6 +80,9 @@ class ZoneInfo:
     asset_id: int
     name:     str = ''
     instance_count: int = 0
+    table_index: int = 0
+    name_index: int = -1
+    reserved: int = 0  # The final u16 is preserved; its meaning is not established.
 
 
 @dataclass
@@ -43,6 +91,77 @@ class LevelInfo:
     version:     int = 0
     zone_ids:    list[int] = field(default_factory=list)
     description: str = ''
+    zones: list[ZoneInfo] = field(default_factory=list)
+    regions: list[LevelRegion] = field(default_factory=list)
+    checkpoints: list[LevelCheckpoint] = field(default_factory=list)
+
+    def region_zone_candidates(self, region_indices, *, include_parents=True) -> tuple[int, ...]:
+        """Catalogue indices for explicit regions, without simulating residency.
+
+        Type-6 replacement lists depend on runtime configuration; they remain
+        separate data. This helper returns declared primary-zone dependencies.
+        """
+        zones, seen_zones, seen_regions = [], set(), set()
+        for index in region_indices:
+            chain = set()
+            while index != -1:
+                if not 0 <= index < len(self.regions):
+                    raise ValueError(f'Invalid region index {index}')
+                if index in chain:
+                    raise ValueError('Cycle in level region parents')
+                chain.add(index)
+                if index in seen_regions:
+                    break
+                region = self.regions[index]
+                seen_regions.add(index)
+                for zone_index in region.zone_indices:
+                    if zone_index not in seen_zones:
+                        seen_zones.add(zone_index)
+                        zones.append(zone_index)
+                index = region.parent_index if include_parents else -1
+        return tuple(zones)
+
+    def streaming_region_zone_candidates(self, region_index: int) -> tuple[int, ...]:
+        """Unfiltered zone inputs for the retail kind-4 streaming selector.
+
+        The retail selector builds one runtime record for every child of the
+        selected kind-4 region and reads each child's primary zone list. Two
+        runtime bitsets filter those lists afterward, so cooked data alone can
+        establish this input set but cannot establish active residency.
+        """
+        if not 0 <= region_index < len(self.regions):
+            raise ValueError(f'Invalid region index {region_index}')
+        root = self.regions[region_index]
+        if root.kind != 4:
+            raise ValueError(f'Region {region_index} is kind {root.kind}, not kind 4')
+        zones, seen = [], set()
+        for child_index in root.child_indices:
+            for zone_index in self.regions[child_index].zone_indices:
+                if zone_index not in seen:
+                    seen.add(zone_index)
+                    zones.append(zone_index)
+        return tuple(zones)
+
+    def dependency_region_zone_candidates(self, region_index: int) -> tuple[int, ...]:
+        """Unfiltered inputs for the retail kind-3/5 dependency selector.
+
+        This path reads exactly two primary lists: the selected region's
+        immediate parent first (when present), then the selected region. A
+        runtime bitset removes dependencies that were already requested.
+        """
+        if not 0 <= region_index < len(self.regions):
+            raise ValueError(f'Invalid region index {region_index}')
+        selected = self.regions[region_index]
+        if selected.kind not in (3, 5):
+            raise ValueError(f'Region {region_index} is kind {selected.kind}, not kind 3 or 5')
+        indices = ([selected.parent_index] if selected.parent_index != -1 else []) + [region_index]
+        zones, seen = [], set()
+        for index in indices:
+            for zone_index in self.regions[index].zone_indices:
+                if zone_index not in seen:
+                    seen.add(zone_index)
+                    zones.append(zone_index)
+        return tuple(zones)
 
 
 @dataclass
@@ -72,12 +191,97 @@ class LevelParser:
         self.asset_type = ASSET_TYPE_NAMES.get(self.dat1.unk1, 'unknown')
 
     def parse_info(self) -> LevelInfo:
+        zones = self._parse_rcra_zones() if self.dat1.unk1 == ASSET_TYPE_LEVEL_RCRA else []
+        regions, checkpoints = self._parse_rcra_regions(len(zones)) if self.dat1.unk1 == ASSET_TYPE_LEVEL_RCRA else ([], [])
+        description = (f"DAT1 asset type: {self.dat1.unk1:#010x} ({self.asset_type})\n"
+                       f"Sections: {len(self.dat1.sections)}\n"
+                       f"Section tags: {', '.join(f'{t:#010x}' for t in sorted(self.dat1.sections.keys()))}")
+        if self.dat1.unk1 == ASSET_TYPE_LEVEL_RCRA:
+            description += (f"\nZone catalogue: {len(zones)} references"
+                            f"\nRegions: {len(regions)}; checkpoints: {len(checkpoints)}"
+                            "\nRuntime residency and zone transforms are not included.")
         return LevelInfo(
             asset_type  = self.asset_type,
-            description = f"DAT1 asset type: {self.dat1.unk1:#010x} ({self.asset_type})\n"
-                          f"Sections: {len(self.dat1.sections)}\n"
-                          f"Section tags: {', '.join(f'{t:#010x}' for t in sorted(self.dat1.sections.keys()))}",
+            zone_ids = [zone.asset_id for zone in zones],
+            description = description, zones = zones, regions = regions, checkpoints = checkpoints,
         )
+
+    def _parse_rcra_zones(self) -> list[ZoneInfo]:
+        header = self.dat1.get_section(TAG_LEVEL_HEADER)
+        if header is None or len(header) < 0x24:
+            raise ValueError('Truncated RCRA level header')
+        count = struct.unpack_from('<I', header, 0x18)[0]
+        records = self.dat1.get_section(TAG_LEVEL_ZONES) or b''
+        names = self.dat1.get_section(TAG_LEVEL_ZONE_NAMES) or b''
+        if len(records) != count * 12 or len(names) != count * 4:
+            raise ValueError('RCRA level zone/name table size does not match its header')
+        offsets = struct.unpack(f'<{count}I', names)
+        zones = []
+        for index, (asset_id, name_index, reserved) in enumerate(struct.iter_unpack('<QhH', records)):
+            # Retail supplies an unnamed fallback for out-of-range name indices.
+            name = self.dat1.get_string(offsets[name_index]) if 0 <= name_index < count else None
+            zones.append(ZoneInfo(asset_id=asset_id, name=name or '', table_index=index,
+                                  name_index=name_index, reserved=reserved))
+        return zones
+
+    def _parse_rcra_regions(self, zone_count):
+        header = self.dat1.get_section(TAG_LEVEL_HEADER)
+        region_count, index_count, bounds_count, _, checkpoint_count = struct.unpack_from('<5I', header, 0x0C)
+
+        def table(tag, count, stride, label):
+            raw = self.dat1.get_section(tag) or b''
+            if len(raw) != count * stride:
+                raise ValueError(f'RCRA level {label} table size does not match its header')
+            return raw
+
+        records = table(TAG_LEVEL_REGIONS, region_count, 36, 'region')
+        region_names = table(TAG_LEVEL_REGION_NAMES, region_count, 4, 'region name')
+        bounds = table(TAG_LEVEL_REGION_BOUNDS, bounds_count, 24, 'region bounds')
+        indices = struct.unpack(f'<{index_count}h', table(TAG_LEVEL_ZONE_INDICES, index_count, 2, 'zone index'))
+        checkpoint_records = table(TAG_LEVEL_CHECKPOINTS, checkpoint_count, 48, 'checkpoint')
+        checkpoint_names = table(TAG_LEVEL_CHECKPOINT_NAMES, checkpoint_count, 4, 'checkpoint name')
+
+        def name_at(table, index, count):
+            return (self.dat1.get_string(struct.unpack_from('<I', table, index*4)[0]) or '') if 0 <= index < count else ''
+
+        def sequence(start, count, limit, label):
+            if count < 0 or (count and (start < 0 or start + count > limit)):
+                raise ValueError(f'Invalid {label} range in RCRA level')
+            return tuple(range(start, start + count)) if count else ()
+
+        def zone_list(start, count, *, replacement=False):
+            values = tuple(indices[i] for i in sequence(start, count, index_count, 'zone index'))
+            if any(value < (-1 if replacement else 0) or value >= zone_count for value in values):
+                raise ValueError('Invalid zone catalogue index in RCRA region')
+            return values
+
+        regions = []
+        for index in range(region_count):
+            raw = bytes(records[index*36:(index+1)*36])
+            kind, name_index, bound, parent, child_start, child_count, zone_start, zone_size, replacement_start, replacement_count, checkpoint_start, checkpoint_size, prop_start, prop_count = struct.unpack_from('<14h', raw, 8)
+            if not -1 <= parent < region_count or not -1 <= bound < bounds_count:
+                raise ValueError('Invalid parent or bounds index in RCRA region')
+            regions.append(LevelRegion(
+                index=index, asset_id=struct.unpack_from('<Q', raw)[0], kind=kind,
+                name=name_at(region_names, name_index, region_count), parent_index=parent,
+                child_indices=sequence(child_start, child_count, region_count, 'child region'),
+                zone_indices=zone_list(zone_start, zone_size),
+                replacement_zone_indices=zone_list(replacement_start, replacement_count, replacement=True),
+                checkpoint_indices=sequence(checkpoint_start, checkpoint_size, checkpoint_count, 'checkpoint'),
+                bounds_index=bound, bounds_data=bytes(bounds[bound*24:(bound+1)*24]) if bound >= 0 else b'',
+                property_start=prop_start, property_count=prop_count, raw=raw,
+            ))
+        checkpoints = []
+        for index in range(checkpoint_count):
+            raw = bytes(checkpoint_records[index*48:(index+1)*48])
+            name_index, region, prop_start, prop_count = struct.unpack_from('<4h', raw, 0x1C)
+            if not -1 <= region < region_count:
+                raise ValueError('Invalid region index in RCRA checkpoint')
+            checkpoints.append(LevelCheckpoint(
+                index, struct.unpack_from('<Q', raw)[0], name_at(checkpoint_names, name_index, checkpoint_count),
+                region, struct.unpack_from('<3f', raw, 0x24), prop_start, prop_count, raw,
+            ))
+        return regions, checkpoints
 
     def list_section_tags(self) -> list[int]:
         return sorted(self.dat1.sections.keys())

@@ -1,0 +1,78 @@
+#ifndef RF_STANDALONE
+#include "/Engine/Public/Platform.ush"
+#endif
+// Input normals/strands are decoded packed vectors, NOT normalized again.
+// Depth is positive linear view depth in meters; coordinates are top-left.
+Texture2D<float4> FurSceneColor;
+Texture2D<float4> FurStrandDepth;
+Texture2D<float4> FurNormalMask;
+Texture2D<uint> FurActiveTiles;
+SamplerState FurPointClamp;
+RWTexture2D<float4> FurFilteredColor;
+uint2 FurDimensions;
+uint2 FurPixelOffset;
+float4 FurScreenToView;
+float4 FurViewToScreen;
+float4x4 FurWorldToView;
+float FurPreExposure;
+float FurTemporalIndex;
+float FurTemporalCycle;
+#include "RecoveredFurCore.ush"
+
+#include "RecoveredFurDenoise.ush"
+
+float4 hairDenoiseGatherDepth(float2 uv)
+{
+    float4 d=FurStrandDepth.GatherAlpha(FurPointClamp,uv);
+    return float4(hairDenoiseHalfDepth(d.x),hairDenoiseHalfDepth(d.y),
+                  hairDenoiseHalfDepth(d.z),hairDenoiseHalfDepth(d.w));
+}
+float4 hairDenoiseGatherMask(float2 uv)
+{
+    return FurNormalMask.GatherAlpha(FurPointClamp,uv);
+}
+float4 hairDenoiseGatherColor(float2 uv,int component)
+{
+    if(component==0)return FurSceneColor.GatherRed(FurPointClamp,uv)/FurPreExposure;
+    if(component==1)return FurSceneColor.GatherGreen(FurPointClamp,uv)/FurPreExposure;
+    return FurSceneColor.GatherBlue(FurPointClamp,uv)/FurPreExposure;
+}
+bool hairDenoiseTileActive(float2 uv)
+{
+    if(any(uv<0) || any(uv>=1))return false;
+    uint2 pixel=(uint2)(uv*FurDimensions);
+    return FurActiveTiles.Load(int3(pixel/8,0))!=0;
+}
+[numthreads(8,8,1)]
+void MainCS(uint3 id:SV_DispatchThreadID)
+{
+    if(any(id.xy>=FurDimensions))return;
+    int3 pixel=int3(id.xy,0);
+    float4 color=FurSceneColor.Load(pixel);
+    float4 normalMask=FurNormalMask.Load(pixel);
+    if(normalMask.a>0)
+    {
+        float4 strandDepth=FurStrandDepth.Load(pixel);
+        float depth=hairDenoiseHalfDepth(strandDepth.a);
+        // Invalid/missing surfaces are passed through, never filtered.
+        if(depth>0 && isfinite(depth))
+        {
+            float3 viewStrand=mul(float4(strandDepth.xyz,0),FurWorldToView).xyz;
+            HairDenoiseRay ray=hairDenoiseBuildRay(float2(id.xy),depth,
+                normalMask.xyz,strandDepth.xyz,viewStrand,1.0/float2(FurDimensions),
+                FurScreenToView,float2(1,0),FurViewToScreen,
+                hairScreenPhase(float2(id.xy+FurPixelOffset),1.0/float2(FurDimensions),FurTemporalIndex,FurTemporalCycle));
+            color.rgb=hairDenoiseFilter(ray,color.rgb/FurPreExposure,depth);
+            // Native R11G11B10 truncation, represented exactly in RGBA16F.
+            [unroll] for(uint c=0;c<3;++c)
+            {
+                float v=clamp(color[c],0.0,c==2?64512.0:65024.0);
+                if(isnan(color[c])) color[c]=asfloat(0x7fc00000u);
+                else if(color[c]!=asfloat(0x7f800000u))
+                    color[c]=v<0.00006103515625 ? floor(v*(c==2?524288.0:1048576.0))*(c==2?0.0000019073486328125:0.00000095367431640625) : asfloat(asuint(v)&(c==2?0xfffc0000u:0xfffe0000u));
+            }
+            color.rgb*=FurPreExposure;
+        }
+    }
+    FurFilteredColor[id.xy]=color;
+}

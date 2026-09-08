@@ -1,4 +1,6 @@
 import hashlib
+import inspect
+import struct
 
 import numpy as np
 from PyQt6.QtCore import QEvent, QPointF, Qt
@@ -12,14 +14,26 @@ from ui.viewport import (
     BASE_COLOR_ROLES,
     FUR_CONTROL_ROLES,
     NORMAL_ROLES,
+    FRAG_SRC,
+    VERT_SRC,
     _best_texture_slot,
     _can_draw_fur_strands,
     _fur_density_from_texture_slot,
     FUR_SHELL_FRAG_SRC,
+    FUR_FRAG_SRC,
     FUR_SHELL_GEOM_SRC,
+    FUR_MATERIAL_FRAG_SRC,
     FUR_SHELL_VERT_SRC,
     FUR_DENOISE_FRAG,
+    FUR_CONTACT_FRAG,
+    FUR_SCENE_LIGHTING_FRAG,
+    MOTION_BLUR_DOWNSAMPLE_FRAG,
     TEMPORAL_ACCUM_FRAG,
+    TEMPORAL_ALPHA_HALF_FRAG,
+    TEMPORAL_ALPHA_MASK_FRAG,
+    TEMPORAL_DISOCCLUSION_FRAG,
+    TEMPORAL_HALF_BASE_FRAG,
+    TEMPORAL_LINEAR_DEPTH_FRAG,
     _fur_header_from_texture_slot,
     _fur_offset_scale_from_texture_slot,
     _fur_shading_from_texture_slot,
@@ -27,7 +41,6 @@ from ui.viewport import (
     _build_fur_layer_volume,
     _build_fur_layer_mips,
     _fur_adjusted_shell_depth,
-    _fur_round_nearest_even,
     _fur_shell_availability,
     _fur_length_from_texture_slot,
     _fur_root_lod_factor,
@@ -42,18 +55,34 @@ from ui.viewport import (
     _is_lavafall_model,
     _is_srgb_texture_role,
     _temporal_current_sample_offset,
+    _temporal_filter_offset_pixels,
+    _temporal_history_jitter_offset,
     _lava_flow_sample_offsets,
     _merge_material_textures,
     _mesh_tangents,
     _postprocess_settings,
+    _perspective_reverse_z_zero_to_one,
     _perspective_clip_planes,
+    _ortho_reverse_z_zero_to_one,
     _resolved_mesh_uvs,
     _scaled_framebuffer_size,
+    _shader_with_raster_mode,
+    _supports_native_raster,
     _uses_molten_shader,
     Viewport3D,
 )
 from core.texture import TextureAsset
 from core.fur_resources import default_hair_brdf_rg_half
+from core.hair_temporal import (
+    DITHER_TABLE_SHA256,
+    TEMPORAL_CONDITIONAL_REJECTION_FLOOR,
+    TEMPORAL_DITHER_TABLE,
+    TEMPORAL_MINIMUM_REJECTION_FLOOR,
+    TEMPORAL_NONOPAQUE_RESPONSE_FALLBACK,
+    temporal_dither_constants,
+    temporal_history_warmup,
+    temporal_minimum_rejection,
+)
 
 
 def _slot(width: int, height: int, name: str):
@@ -289,59 +318,262 @@ def test_recovered_fur_shader_keeps_exact_cull_face_and_hash_terms():
     assert "const vec4 RETAIL_WIND_RANDOM[64]" in FUR_SHELL_VERT_SRC
     assert "uFurWindTurbulence * 20.0 + 10.0" in FUR_SHELL_VERT_SRC
     assert "uFurWindTurbulence * 100.0 + 50.0" in FUR_SHELL_VERT_SRC
-    assert "fract(noiseTime * 0.0163934) * 61.0" in FUR_SHELL_VERT_SRC
+    assert "fract(noiseTime * 0.016393441706895828) * 61.0" in FUR_SHELL_VERT_SRC
     assert "uFurWindRadius * 0.1" in FUR_SHELL_VERT_SRC
-    assert "inverse(mat3(uModel)) * windDirection" in FUR_SHELL_VERT_SRC
+    assert "inverse(mat3(uModel)) * uFurWindVector" in FUR_SHELL_VERT_SRC
     assert "cross(localTangent, localNormal)" in FUR_SHELL_VERT_SRC
+    assert "uPreviousMVP * vec4(previousLocalPosition, 1.0)" in FUR_SHELL_VERT_SRC
+    assert "vPreviousClip = vsPreviousClip[index]" in FUR_SHELL_GEOM_SRC
     assert "vsShellVisible[0] == 0" in FUR_SHELL_GEOM_SRC
     assert "vsShellVisible[1] == 0" in FUR_SHELL_GEOM_SRC
     assert "vsShellVisible[2] == 0" in FUR_SHELL_GEOM_SRC
     assert "gl_FrontFacing ? 1.0 : -1.0" in FUR_SHELL_FRAG_SRC
-    assert "shifted / max(uViewportSize, vec2(1.0))" in FUR_SHELL_FRAG_SRC
-    assert "vec2 cell = roundNearestEven(shifted)" in FUR_SHELL_FRAG_SRC
-    assert "wetBase + phase * 0.1" in FUR_SHELL_FRAG_SRC
-    assert "layerUV /= layerUvDivisor(gl_FragCoord.xy, wetness)" in FUR_SHELL_FRAG_SRC
-    assert "0.95 * control.b + 0.05" in FUR_SHELL_FRAG_SRC
-    assert "wetness + 0.005" in FUR_SHELL_FRAG_SRC
+    assert "vec2 nativePixel = furNativePixel(pixel)" in FUR_SHELL_FRAG_SRC
+    assert "return vec2(fragmentPixel.x, uViewportSize.y - fragmentPixel.y)" in FUR_SHELL_FRAG_SRC
+    assert "#ifdef RCRA_NATIVE_UPPER_LEFT" in FUR_SHELL_FRAG_SRC
+    assert "sampleDepth - depthBias > gl_FragCoord.z" in FUR_FRAG_SRC
+    assert "0.1 + gl_FragCoord.z * 0.90" in FUR_FRAG_SRC
+    assert "vec2 cell = floor(pixel)" in FUR_SHELL_FRAG_SRC
+    assert "floor((phase * 0.1 + 0.45) + wetBase)" in FUR_SHELL_FRAG_SRC
+    assert "vec2 layerUV = furLayerUV(" in FUR_SHELL_FRAG_SRC
+    assert "layerUvDivisor(gl_FragCoord.xy, wetness)" in FUR_SHELL_FRAG_SRC
+    assert "0.95 * controlLength + 0.05" in FUR_SHELL_FRAG_SRC
+    assert "furLength + 0.005" in FUR_SHELL_FRAG_SRC
     assert "FurGBuffer = vec4(strandTangent" in FUR_SHELL_FRAG_SRC
     assert "void recoveredHairBasis(" in FUR_SHELL_FRAG_SRC
-    assert "frameSeed = viewDirection * strandNormalSine" in FUR_SHELL_FRAG_SRC
-    assert "0.9725 - 0.7514 * primaryGloss" in FUR_SHELL_FRAG_SRC
-    assert "0.9725 - 0.07514 * secondaryGloss" in FUR_SHELL_FRAG_SRC
-    assert "strandTangent + 0.075 * (-normal - strandTangent)" in FUR_SHELL_FRAG_SRC
-    assert "sqrt(furResponse) * uFurGlossScale" in FUR_SHELL_FRAG_SRC
-    assert "furResponse * uFurSpecularScale" in FUR_SHELL_FRAG_SRC
+    assert "hairLobeFrame(strandTangent, geometricNormal, viewDirection)" in FUR_SHELL_FRAG_SRC
+    assert "HairMaterialResponse material = hairMaterialResponse(" in FUR_SHELL_FRAG_SRC
+    assert "material.primaryAlpha.x, material.primaryAlpha.y" in FUR_SHELL_FRAG_SRC
+    assert "hairSecondaryStrand(strandTangent, normal, packedStrand >> 26u)" in FUR_SHELL_FRAG_SRC
+    assert "sqrt(max(sampledResponse.r, 0.0)) * glossScale" in FUR_SHELL_FRAG_SRC
+    assert "sampledResponse.g * specularScale" in FUR_SHELL_FRAG_SRC
     assert "primaryFresnel * primaryDistribution" in FUR_SHELL_FRAG_SRC
-    assert "8.0 - transmissionPhase * 10.5" in FUR_SHELL_FRAG_SRC
-    assert "transmissionPhase * transmissionPhase * 3.17114" in FUR_SHELL_FRAG_SRC
-    assert "(normalLight + transmittance)" in FUR_SHELL_FRAG_SRC
-    assert "0.5 + 0.5 * grazing * grazing" in FUR_SHELL_FRAG_SRC
+    assert "hairTransmissionResponse(" in FUR_SHELL_FRAG_SRC
+    assert "hairDiffuseResponse(normalLight, material.transmission)" in FUR_SHELL_FRAG_SRC
+    assert "hairResolveWeights(material.transmission, normalView, material.occlusion, 1.0)" in FUR_SHELL_FRAG_SRC
+    assert "hairResolveLighting(albedo.rgb, material.occlusion" in FUR_SHELL_FRAG_SRC
     assert "vec3 sampleD3DCube" in FUR_SHELL_FRAG_SRC
-    assert "5.0 - clamp(averageRoughness" in FUR_SHELL_FRAG_SRC
-    assert "environmentBrdf.x * primaryF0 + environmentBrdf.y" in FUR_SHELL_FRAG_SRC
+    assert "5.0 - clamp(environment.averageGloss" in FUR_SHELL_FRAG_SRC
+    assert "environmentBrdf.x * material.primaryF0 + environmentBrdf.y" in FUR_SHELL_FRAG_SRC
     assert "0.35 + key * 0.80 + fill * 0.30" not in FUR_SHELL_FRAG_SRC
     assert "uFurTransmittanceScale * 0.20" not in FUR_SHELL_FRAG_SRC
     assert "FurNormalMask = vec4(normal, 1.0)" in FUR_SHELL_FRAG_SRC
-    assert "for (int step = 0; step < 3; ++step)" in FUR_DENOISE_FRAG
+    assert "for (int i = 0; i < 3; ++i)" in FUR_DENOISE_FRAG
     assert "200.0 / centerDepth" in FUR_DENOISE_FRAG
-    assert "sqrt(max(1.0 - tangentAgreement, 0.0)) * 0.05" in FUR_DENOISE_FRAG
+    assert "sqrt(1.0 - abs(dot(normal, strand))) * 0.05" in FUR_DENOISE_FRAG
     assert "rayLength = min(" in FUR_DENOISE_FRAG
     assert "0.0025" in FUR_DENOISE_FRAG
-    assert "depthScale * 0.015" in TEMPORAL_ACCUM_FRAG
-    assert "1000.0 / depthScale" in TEMPORAL_ACCUM_FRAG
-    assert "100.0 / depthScale" in TEMPORAL_ACCUM_FRAG
-    assert "1.0 / rayDepth - sampleReciprocalDepth" in TEMPORAL_ACCUM_FRAG
-    assert "0.75 * grazing * occlusion" in TEMPORAL_ACCUM_FRAG
+    assert "hairContactVisibility" in FUR_CONTACT_FRAG
+    assert "indirect.rgb + key.rgb * visibility" in FUR_CONTACT_FRAG
+    assert "pixel, viewDepth, normal, geometry.direction, viewLight" in FUR_SCENE_LIGHTING_FRAG
+    assert "uHairViewToScreen, uViewportSize, noiseAnglePhase, 0.0" in FUR_SCENE_LIGHTING_FRAG
+    assert "hairSceneCloudVisibility(worldPoint)" in FUR_SCENE_LIGHTING_FRAG
+    assert "uHairSceneConstants[41]" in FUR_SCENE_LIGHTING_FRAG
+    assert "hairSceneKeyGobo(worldPoint, radiance)" in FUR_SCENE_LIGHTING_FRAG
+    assert "uHairSceneConstants[40]" in FUR_SCENE_LIGHTING_FRAG
+    assert "hairSceneKeyShadowVolumes(" in FUR_SCENE_LIGHTING_FRAG
+    assert "uint(fract(encoded) * 64.0)" in FUR_SCENE_LIGHTING_FRAG
+    assert "hairContactVisibility" not in TEMPORAL_ACCUM_FRAG
+    assert "layout(location = 4) out vec2 Motion" in FUR_MATERIAL_FRAG_SRC
+    assert "layout(location = 5) out uint Stencil" in FUR_MATERIAL_FRAG_SRC
+    assert "Stencil = 128u" in FUR_MATERIAL_FRAG_SRC
+    assert "Motion = furMotionVector(" in FUR_MATERIAL_FRAG_SRC
+    assert "uMotionNearPlane, uViewportSize" in FUR_MATERIAL_FRAG_SRC
+    assert "vPreviousClip = uPreviousMVP * vec4(aPreviousPos, 1.0)" in VERT_SRC
+    assert "layout(location = 3) out vec2 SceneVelocity" in FRAG_SRC
+    assert "layout(location = 4) out uint SceneStencil" in FRAG_SRC
+    assert "SceneStencil = 0u" in FRAG_SRC
+    assert "textureGather(uOpaqueMotion, uv, 0)" in MOTION_BLUR_DOWNSAMPLE_FRAG
+    assert "uLinearDepth, currentPixel" in TEMPORAL_ACCUM_FRAG
+    assert "texelFetch(uOpaqueMotion, velocityPixel, 0).xy" in TEMPORAL_ACCUM_FRAG
+    assert "texelFetch(uStencil, velocityPixel, 0).r & 128u" in TEMPORAL_ACCUM_FRAG
+    assert "float(category) * uNonopaqueStencilRejection" in TEMPORAL_ACCUM_FRAG
+    assert "centerDepth <= 1.025 * diagonalDepth" in TEMPORAL_ACCUM_FRAG
+    assert "vec2 motionToPreviousPixels = vec2(-motionPixels.x, motionPixels.y)" in TEMPORAL_ACCUM_FRAG
+    assert "vec2 historyUV = historyPixel * texel + uHistoryJitterOffset" in TEMPORAL_ACCUM_FRAG
+    assert "uCurrentUvOffset" not in TEMPORAL_ACCUM_FRAG
+    assert "float rejection = uHistoryWarmup" in TEMPORAL_ACCUM_FRAG
+    assert "vec2 disocclusion = texelFetch(uDisocclusion" in TEMPORAL_ACCUM_FRAG
+    assert "rejection = max(rejection, 0.5 * disocclusion.g)" in TEMPORAL_ACCUM_FRAG
+    assert "uNonopaqueStencilRejection" in TEMPORAL_ACCUM_FRAG
+    assert "layout(location = 1) out float TemporalDepth" not in TEMPORAL_ACCUM_FRAG
+    assert "float alphaMask = textureLod(uAlphaMask, currentUV, 0.0).r" in TEMPORAL_ACCUM_FRAG
+    assert "rejection = max(rejection, 0.5 * alphaMask)" in TEMPORAL_ACCUM_FRAG
+    assert "float blendFactor = max(rejection, uTemporalMinimumRejection)" in TEMPORAL_ACCUM_FRAG
+    assert "(currentRgb - constrainedHistory) * blendFactor" in TEMPORAL_ACCUM_FRAG
+    assert "max(uHistoryWarmup, uTemporalMinimumRejection)" not in TEMPORAL_ACCUM_FRAG
+    assert "hairTemporalFilterWeights(uTemporalFilterOffsetPixels, weights)" in TEMPORAL_ACCUM_FRAG
+    assert "exp(-2.29 * (dx * dx + dy * dy))" in TEMPORAL_ACCUM_FRAG
+    assert "mix(normalizedGaussian, normalizedCatmull, 0.8)" in TEMPORAL_ACCUM_FRAG
+    assert "hairTemporalHistoryCatmullRom(" in TEMPORAL_ACCUM_FRAG
+    assert "vec2 base = floor(centered) + 0.5" in TEMPORAL_ACCUM_FRAG
+    assert "dot(motionPixels, motionPixels) >= 0.015625" in TEMPORAL_ACCUM_FRAG
+    assert "float broadening = clamp(rejection * 4.0 - 1.0" in TEMPORAL_ACCUM_FRAG
+    assert "float diagonalConfidence = clamp(1.0 - rejection * 20.0" in TEMPORAL_ACCUM_FRAG
+    assert "int[9](1, 3, 4, 5, 7, 0, 2, 6, 8)" in TEMPORAL_ACCUM_FRAG
+    assert "hairTemporalUndoHdrCompression(" in TEMPORAL_ACCUM_FRAG
+    assert "ditherPixel.y = dimensions.y - 1 - ditherPixel.y" in TEMPORAL_ACCUM_FRAG
+    assert "ditherPixel.x + 2 * ditherPixel.y" in TEMPORAL_ACCUM_FRAG
+    assert "outputRgb.rg *= 1.0 + noise * uTemporalDither.x" in TEMPORAL_ACCUM_FRAG
+    assert "layout(location = 0) out vec2 FullDisocclusion" in TEMPORAL_DISOCCLUSION_FRAG
+    assert "layout(location = 1) out vec2 DepthMotion" in TEMPORAL_DISOCCLUSION_FRAG
+    assert "texelFetch(uOpaqueMotion, pixel, 0).xy" in TEMPORAL_DISOCCLUSION_FRAG
+    assert "centerDepth <= 1.025 * diagonalDepth" in TEMPORAL_DISOCCLUSION_FRAG
+    assert "(selectedDepth - uDepthBase) * uDepthSlope" in TEMPORAL_DISOCCLUSION_FRAG
+    assert "translationOutside != 0.0 ? 24.0 : 120.0" in TEMPORAL_DISOCCLUSION_FRAG
+    assert "cameraMotion * 0.125 - 0.5" in TEMPORAL_DISOCCLUSION_FRAG
+    assert "FullDisocclusion = vec2(disocclusion, historyConfidence)" in TEMPORAL_DISOCCLUSION_FRAG
+    assert "ndc.y = -ndc.y" in TEMPORAL_DISOCCLUSION_FRAG
+    assert "centered.y = -centered.y" in TEMPORAL_DISOCCLUSION_FRAG
 
 
-def test_recovered_fur_rounding_matches_dxbc_round_nearest_even():
-    assert _fur_round_nearest_even(0.49) == 0.0
-    assert _fur_round_nearest_even(0.5) == 0.0
-    assert _fur_round_nearest_even(1.5) == 2.0
-    assert _fur_round_nearest_even(2.5) == 2.0
-    assert _fur_round_nearest_even(-0.5) == 0.0
-    assert _fur_round_nearest_even(-1.5) == -2.0
-    assert _fur_round_nearest_even(-2.5) == -2.0
+def test_native_raster_support_accepts_core_or_arb_clip_control():
+    assert _supports_native_raster((4, 5), ())
+    assert _supports_native_raster((4, 6), ())
+    assert _supports_native_raster((3, 3), (b'GL_ARB_clip_control',))
+    assert _supports_native_raster((3, 3), ('GL_ARB_clip_control',))
+    assert not _supports_native_raster((4, 4), ())
+
+
+def test_native_raster_define_is_injected_after_version_only_when_enabled():
+    source = "\n#version 330 core\n#extension GL_ARB_gpu_shader5 : enable\nvoid main() {}\n"
+    native = _shader_with_raster_mode(source, True)
+
+    assert native.startswith("\n#version 330 core\n#define RCRA_NATIVE_UPPER_LEFT 1\n")
+    assert native.count("#define RCRA_NATIVE_UPPER_LEFT") == 1
+    assert _shader_with_raster_mode(source, False) == source
+
+
+def test_native_raster_final_qt_boundary_restores_lower_left_origin():
+    source = inspect.getsource(Viewport3D._composite_bloom)
+
+    assert "glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE)" in source
+    assert source.index("glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE)") \
+        < source.index("glUseProgram(self._composite_prog)")
+    assert source.rstrip().endswith("self._apply_raster_convention()")
+
+
+def test_native_raster_culling_is_scoped_to_recovered_fur_draw():
+    source = inspect.getsource(Viewport3D.paintGL)
+    opaque_draw = source.index("gm.draw()")
+    enable_cull = source.index("glEnable(GL_CULL_FACE)", opaque_draw)
+    fur_draw = source.index("self._draw_fur_strands(", enable_cull)
+    disable_cull = source.index("glDisable(GL_CULL_FACE)", fur_draw)
+
+    assert opaque_draw < enable_cull < fur_draw < disable_cull
+    assert "OpaqueDepth = opaqueDepth" in TEMPORAL_LINEAR_DEPTH_FRAG
+    assert "ComposedDepth = hasFur ? furDepth : opaqueDepth" in TEMPORAL_LINEAR_DEPTH_FRAG
+    assert "MaximumDepth = max(max(depth00, depth10), max(depth01, depth11))" in TEMPORAL_HALF_BASE_FRAG
+    assert "MinimumDepth = min(min(depth00, depth10), min(depth01, depth11))" in TEMPORAL_HALF_BASE_FRAG
+    assert "fullDepth < halfDepth * 0.9980000257492065" in TEMPORAL_ALPHA_MASK_FRAG
+    assert "max(max(depths.x, depths.y), depths.z)" in TEMPORAL_ALPHA_HALF_FRAG
+    assert "min(min(depths.x, depths.y), depths.z)" in TEMPORAL_ALPHA_HALF_FRAG
+    assert "if (depths.w == maximumDepth)" in TEMPORAL_ALPHA_HALF_FRAG
+
+
+def test_temporal_dither_table_and_sequence_match_the_executable_builder():
+    raw = struct.pack("<256f", *TEMPORAL_DITHER_TABLE)
+    assert hashlib.sha256(raw).hexdigest() == DITHER_TABLE_SHA256
+    assert [temporal_dither_constants(age)[2] for age in range(5)] == [
+        0.0, 2.0, 4.0, 1.0, 3.0,
+    ]
+    first = temporal_dither_constants(0)
+    wrapped = temporal_dither_constants(256)
+    assert first[0] == struct.unpack("<f", bytes.fromhex("610b363c"))[0]
+    assert first[1] == np.float32(first[0] + first[0])
+    assert first[3] == wrapped[3]
+    assert temporal_dither_constants(7, enabled=False)[:2] == (0.0, 0.0)
+
+
+def test_temporal_history_warmup_matches_the_cbuffer_builder_division():
+    assert temporal_history_warmup(0) == 1.0
+    assert temporal_history_warmup(1) == 0.5
+    assert temporal_history_warmup(15) == 0.0625
+    assert temporal_history_warmup(31) == 0.03125
+    assert temporal_history_warmup(-20) == 1.0
+    assert temporal_history_warmup(9, has_history=False) == 1.0
+
+
+def test_temporal_minimum_rejection_uses_the_executable_fallback():
+    assert struct.pack("<f", TEMPORAL_NONOPAQUE_RESPONSE_FALLBACK).hex() == "0ad7233d"
+    assert TEMPORAL_NONOPAQUE_RESPONSE_FALLBACK == np.float32(0.04)
+    assert TEMPORAL_MINIMUM_REJECTION_FLOOR == 0.0625
+    assert TEMPORAL_CONDITIONAL_REJECTION_FLOOR == np.float32(0.1)
+    assert temporal_minimum_rejection() == 0.0625
+    assert temporal_minimum_rejection(conditional_floor=True) == np.float32(0.1)
+
+
+def test_viewport_temporal_runtime_state_builds_exact_captured_misc():
+    class State:
+        _temporal_nonopaque_response = None
+        _temporal_conditional_floor = False
+        _temporal_hdr_reference = None
+        _temporal_sample_count = 0
+        reset_count = 0
+        redraw_count = 0
+
+        def _reset_temporal_history(self):
+            self._temporal_sample_count = 0
+            self.reset_count += 1
+
+        def _redraw(self):
+            self.redraw_count += 1
+
+    state = State()
+    captured_state = {
+        "nonopaque_response": 0.04,
+        "conditional_floor": False,
+        "hdr_reference": 0.006569501478328294,
+    }
+    Viewport3D.set_temporal_aa_state(state, **captured_state)
+    assert state.reset_count == 1
+    assert state.redraw_count == 1
+    assert Viewport3D.temporal_aa_misc(state, 3645) == (
+        0.0625,
+        0.0022656249348074198,
+        76.1092758178711,
+        0.00027427318855188787,
+    )
+
+    Viewport3D.set_temporal_aa_state(state, **captured_state)
+    assert state.reset_count == 1
+    assert state.redraw_count == 1
+
+    Viewport3D.set_temporal_aa_state(
+        state,
+        nonopaque_response=0.08,
+        conditional_floor=True,
+        hdr_reference=2.0,
+    )
+    changed = Viewport3D.temporal_aa_misc(state, 0)
+    assert state.reset_count == 2
+    assert state.redraw_count == 2
+    assert changed[0] == np.float32(0.1)
+    assert changed[2:] == (np.float32(0.25), 1.0)
+
+
+def test_temporal_histories_use_native_color_and_depth_storage():
+    allocation_source = inspect.getsource(Viewport3D._resize_bloom_targets)
+    allocation = allocation_source.split(
+        'self._temporal_fbos', 1,
+    )[1]
+    assert 'GL_R11F_G11F_B10F' in allocation
+    assert 'GL_UNSIGNED_INT_10F_11F_11F_REV' in allocation
+    assert '_raw_tex_image_2d' in allocation
+    assert 'ctypes.c_void_p(0)' in allocation
+    assert 'self._temporal_depth_textures' in allocation
+    assert 'GL_RG16F' in allocation
+    assert 'self._temporal_disocclusion_textures' in allocation
+    assert 'GL_RG8' in allocation
+    assert 'GL_COLOR_ATTACHMENT1' in allocation
+    assert 'self._temporal_linear_depth_textures' in allocation
+    assert 'self._temporal_half_textures' in allocation
+    assert 'self._temporal_alpha_mask_texture' in allocation
+    assert 'GL_R16F' in allocation
+    assert 'self._scene_velocity_texture' in allocation_source
+    assert 'GL_R8UI' in allocation_source
+    assert 'self._scene_stencil_texture' in allocation_source
+    assert 'GL_COLOR_ATTACHMENT5' in allocation_source
 
 
 def test_recovered_fur_volume_matches_procedural_shape_and_profile():
@@ -357,6 +589,19 @@ def test_recovered_fur_volume_matches_procedural_shape_and_profile():
     assert 0.85 < np.corrcoef(
         volume[0].ravel(), volume[1].ravel(),
     )[0, 1] < 0.88
+
+
+def test_fur_mips_match_captured_gpu_texture_hashes():
+    # Ratchet draw 24715, t7, Rift Apart 3.630.1.0: all 32 slices per mip.
+    # These independent capture hashes catch float32 reciprocal/profile errors.
+    captured = (
+        'fe7ceb598779b2796595be8e373fedd3af8ab1385013c2a06748974374c73780',
+        '77807d40bff0d87521b8b33823b7a7e46c31fe7e826e51d2b4a67df152fa208c',
+        '72a0bf5d62f903c9ee7161a5a2f037587d483a484049da666780092a2ebe8f9a',
+        '3d9cf0bb6279ce79c90a76ea7d0b11c17974e290a382a8c808ce1444d916e1b8',
+    )
+    assert tuple(hashlib.sha256(mip.tobytes()).hexdigest()
+                 for mip in _build_fur_layer_mips()) == captured
 
 
 def test_recovered_fur_mips_use_exact_integer_2x2_averages():
@@ -453,6 +698,77 @@ def test_temporal_current_sample_offset_undoes_projection_jitter():
         _temporal_current_sample_offset((0.25, -0.5), (1000, 500)),
         (-0.00025, 0.001),
     )
+
+
+def test_temporal_history_jitter_offset_removes_both_raster_offsets():
+    size = (1000, 500)
+    current = (0.25, -0.5)
+    previous = (-0.25, 0.25)
+
+    current_offset = np.asarray(_temporal_current_sample_offset(current, size))
+    previous_offset = np.asarray(_temporal_current_sample_offset(previous, size))
+    history_offset = np.asarray(
+        _temporal_history_jitter_offset(current, previous, size)
+    )
+
+    np.testing.assert_allclose(
+        history_offset, current_offset - previous_offset,
+    )
+    np.testing.assert_allclose(
+        _temporal_history_jitter_offset(current, current, size), (0.0, 0.0),
+    )
+
+
+def test_temporal_filter_offset_uses_the_shader_texture_coordinate_frame():
+    jitter = (0.25, -0.5)
+    assert _temporal_filter_offset_pixels(jitter) == (0.25, -0.5)
+    assert _temporal_filter_offset_pixels(jitter, upper_left=True) == (0.25, 0.5)
+
+
+def test_native_motion_reprojects_to_stable_previous_gl_pixel():
+    size = np.asarray((1000.0, 500.0), dtype=np.float64)
+    current_jitter = np.asarray((0.25, -0.5), dtype=np.float64)
+    previous_jitter = np.asarray((-0.25, 0.25), dtype=np.float64)
+    current_stable = np.asarray((640.25, 320.75), dtype=np.float64)
+    previous_stable = np.asarray((638.5, 321.25), dtype=np.float64)
+
+    # The projection moves GL raster positions by negative jitter. Native Y is
+    # top-left, so its current-minus-previous motion has the opposite GL Y sign.
+    current_raster = current_stable - current_jitter
+    previous_raster = previous_stable - previous_jitter
+    native_motion = np.asarray((
+        current_raster[0] - previous_raster[0],
+        -(current_raster[1] - previous_raster[1]),
+    ))
+    jitter_offset = np.asarray(_temporal_history_jitter_offset(
+        tuple(current_jitter), tuple(previous_jitter), tuple(size.astype(int)),
+    ))
+    history_uv = current_stable / size + jitter_offset + np.asarray((
+        -native_motion[0] / size[0], native_motion[1] / size[1],
+    ))
+
+    np.testing.assert_allclose(history_uv, previous_stable / size)
+
+
+def test_upper_left_motion_reprojects_to_stable_previous_pixel():
+    size = np.asarray((1000.0, 500.0), dtype=np.float64)
+    current_jitter = np.asarray((0.25, -0.5), dtype=np.float64)
+    previous_jitter = np.asarray((-0.25, 0.25), dtype=np.float64)
+    current_stable = np.asarray((640.25, 320.75), dtype=np.float64)
+    previous_stable = np.asarray((638.5, 321.25), dtype=np.float64)
+
+    # With upper-left clip control, the existing projection coefficients move
+    # top-left raster X by -jitter.x and Y by +jitter.y.
+    current_raster = current_stable + np.asarray((-current_jitter[0], current_jitter[1]))
+    previous_raster = previous_stable + np.asarray((-previous_jitter[0], previous_jitter[1]))
+    native_motion = current_raster - previous_raster
+    jitter_offset = np.asarray(_temporal_history_jitter_offset(
+        tuple(current_jitter), tuple(previous_jitter), tuple(size.astype(int)),
+        upper_left=True,
+    ))
+    history_uv = current_stable / size + jitter_offset - native_motion / size
+
+    np.testing.assert_allclose(history_uv, previous_stable / size)
 
 
 def test_blizar_lava_material_uses_animated_effect_path():
@@ -585,6 +901,32 @@ def test_autodesk_style_pan_stays_in_the_camera_view_plane():
 def test_scaled_display_uses_the_full_physical_opengl_framebuffer():
     assert _scaled_framebuffer_size(800, 600, 1.25) == (1000, 750)
     assert _scaled_framebuffer_size(801, 601, 1.25) == (1001, 751)
+
+
+def test_native_reverse_z_perspective_maps_near_to_one_and_far_to_zero():
+    near, far = 0.1, 1000.0
+    projection = _perspective_reverse_z_zero_to_one(60.0, 16.0 / 9.0, near, far)
+
+    near_clip = projection @ np.array([0.0, 0.0, -near, 1.0], dtype=np.float32)
+    far_clip = projection @ np.array([0.0, 0.0, -far, 1.0], dtype=np.float32)
+
+    assert np.isclose(near_clip[2] / near_clip[3], 1.0, atol=1e-7)
+    assert np.isclose(far_clip[2] / far_clip[3], 0.0, atol=1e-7)
+    assert projection[2, 2] == np.float32(near / (far - near))
+    assert projection[2, 3] == np.float32(near * far / (far - near))
+    assert projection[3, 2] == -1.0
+
+
+def test_native_reverse_z_orthographic_maps_requested_bounds_to_one_and_zero():
+    near, far = -500.0, 500.0
+    projection = _ortho_reverse_z_zero_to_one(-8.0, 8.0, -4.0, 4.0, near, far)
+
+    near_clip = projection @ np.array([0.0, 0.0, -near, 1.0], dtype=np.float32)
+    far_clip = projection @ np.array([0.0, 0.0, -far, 1.0], dtype=np.float32)
+
+    assert np.isclose(near_clip[2], 1.0, atol=1e-7)
+    assert np.isclose(far_clip[2], 0.0, atol=1e-7)
+    assert projection[2, 2] == np.float32(1.0 / (far - near))
 
 
 def test_direct_mouse_bindings_match_maya_motion_tools_without_requiring_alt():

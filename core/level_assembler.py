@@ -2,9 +2,10 @@
 core/level_assembler.py
 Level assembly pipeline for RCRA Forge.
 
-Given a parsed ZoneDef (list of SceneNodes with world transforms),
+Given a parsed ZoneDef (indexed models and actors with zone-local transforms),
 resolves each node's actor → model → mesh and assembles them into
-a combined GLB export with correct world-space placement.
+a combined GLB export preserving those placements. Owning runtime zone
+transforms are separate and are not inferred here.
 
 Pipeline per SceneNode:
   1. SceneNode.asset_id  → find actor entry in TOC
@@ -20,12 +21,10 @@ Limitations:
   - Very large zones may have hundreds of actors — use max_nodes to limit
 """
 
-import struct
-import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
-from core.actor  import parse_actor_asset, ACTOR_TYPE
+from core.actor  import parse_actor_asset
 from core.zone   import ZoneDef, SceneNodeEntry
 from core.mesh   import ModelParser
 
@@ -61,7 +60,7 @@ class AssembledZone:
 
 class LevelAssembler:
     """
-    Resolves zone scene nodes to model assets and builds world transforms.
+    Resolves zone scene nodes to model assets and retains zone-local transforms.
 
     Usage:
         assembler = LevelAssembler(toc_parser, lookup)
@@ -78,227 +77,47 @@ class LevelAssembler:
     def assemble_zone(self, zone: ZoneDef,
                       max_nodes: Optional[int] = None,
                       progress_cb=None) -> AssembledZone:
-        """Resolve all scene nodes in a zone to model assets."""
-        nodes   = []
-        skipped = []
+        """Resolve each entry's actual model or actor reference, preserving order."""
         entries = zone.entries[:max_nodes] if max_nodes else zone.entries
-        total   = len(entries)
-
-        if zone.is_art_zone:
-            return self._assemble_art_zone(zone, entries, progress_cb)
-        else:
-            return self._assemble_gp_zone(zone, entries, progress_cb)
-
-    def _assemble_art_zone(self, zone, entries, progress_cb) -> AssembledZone:
-        """Art zones: each entry has model_id directly."""
-        nodes   = []
-        skipped = []
-        total   = len(entries)
-
-        print(f"[assembler] art zone: {total} entries, {len(zone.model_ids or [])} model IDs in table")
-
-        for i, entry in enumerate(entries):
+        nodes, skipped = [], []
+        for index, entry in enumerate(entries):
             if progress_cb:
-                progress_cb(i + 1, total)
-
-            if not entry.model_id:
-                skipped.append((entry, "no model_id in entry"))
-                continue
-
-            # Load model
-            if entry.model_id in self._model_cache:
-                model = self._model_cache[entry.model_id]
-            else:
-                model_entry = self.toc.find_entry(entry.model_id)
-                if model_entry is None:
-                    skipped.append((entry, f"model not in TOC ({entry.model_id:#018x})"))
-                    if i < 5:
-                        print(f"[assembler] model not in TOC: {entry.model_id:#018x}")
-                    continue
-                try:
-                    model_data = self.toc.extract_asset(model_entry)
-                    model = ModelParser(model_data).parse()
-                    self._model_cache[entry.model_id] = model  # cache BEFORE print
-                    model_name = self.lookup.name(entry.model_id) if self.lookup else ''
-                    id_str = model_name if model_name else f'{entry.model_id:#018x}'
-                    print(f"[assembler] loaded model: {id_str}")
-                except Exception as ex:
-                    import traceback
-                    skipped.append((entry, f"model parse failed: {ex}"))
-                    if i < 5:
-                        print(f"[assembler] model parse failed ({entry.model_id:#018x}): {ex}")
-                        traceback.print_exc()
-                    continue
-
-            nodes.append(AssembledNode(
-                entry=entry,
-                model_path=self.lookup.name(entry.model_id) if (self.lookup and entry.model_id) else '',
-                model_asset_id=entry.model_id,
-                model=model,
-                world_matrix=_build_matrix(entry),
-            ))
-
-        print(f"[assembler] art zone complete: {len(nodes)} nodes, {len(skipped)} skipped")
-        if skipped:
-            reasons = {}
-            for _, r in skipped:
-                reasons[r] = reasons.get(r, 0) + 1
-            for r, c in reasons.items():
-                print(f"  {c}× {r}")
-        return AssembledZone(zone=zone, nodes=nodes, skipped=skipped)
-
-    def _assemble_gp_zone(self, zone, entries, progress_cb) -> AssembledZone:
-        """GP zones: resolve actor paths from string pool → model."""
-        nodes   = []
-        skipped = []
-        total   = len(entries)
-
-        # Resolve actor paths to models
-        actor_id_map   = {}
-        actor_model_map = {}
-
-        if zone.actor_paths and self.lookup and self.lookup.is_loaded():
-            for path in zone.actor_paths:
-                aid = self.lookup.asset_id(path)
-                if aid is None:
-                    aid = self.lookup.asset_id(path.lstrip('/'))
-                if aid is None:
-                    aid = self.lookup.asset_id(path.replace('/', '\\'))
-                if aid is not None:
-                    actor_id_map[path] = aid
-                    print(f"[assembler] resolved actor: {path.split('/')[-1]} → {aid:#018x}")
-                else:
-                    print(f"[assembler] actor not in hashes.txt: {path}")
-
-        for path, actor_aid in actor_id_map.items():
-            if actor_aid in actor_model_map:
-                continue
-            actor_entry = self.toc.find_entry(actor_aid)
-            if actor_entry is None:
-                continue
+                progress_cb(index + 1, len(entries))
             try:
-                actor_data = self.toc.extract_asset(actor_entry)
-                actor = parse_actor_asset(actor_data, self.lookup)
-                if actor is None or not actor.has_model:
-                    print(f"[assembler] actor has no model: {path}")
-                    continue
-                if not actor.model_asset_id:
-                    continue
-                model_entry = self.toc.find_entry(actor.model_asset_id)
-                if model_entry is None:
-                    continue
-                model_data = self.toc.extract_asset(model_entry)
-                model = ModelParser(model_data).parse()
-                actor_model_map[actor_aid] = (actor.model_path, actor.model_asset_id, model)
-                print(f"[assembler] loaded model: {actor.model_path.split('/')[-1]}")
-            except Exception as ex:
-                print(f"[assembler] failed: {path}: {ex}")
-
-        resolved_actors = list(actor_model_map.values())
-
-        for i, entry in enumerate(entries):
-            if progress_cb:
-                progress_cb(i + 1, total)
-            if not resolved_actors:
-                skipped.append((entry, "no actors resolved"))
-                continue
-            actor_idx = i % len(resolved_actors)
-            model_path, model_aid, model = resolved_actors[actor_idx]
-            nodes.append(AssembledNode(
-                entry=entry, model_path=model_path,
-                model_asset_id=model_aid, model=model,
-                world_matrix=_build_matrix(entry),
-            ))
-
-        return AssembledZone(zone=zone, nodes=nodes, skipped=skipped)
-        """
-        Resolve all scene nodes in a zone to model assets.
-        Uses actor paths from the zone string pool to find actor assets.
-        """
-        nodes   = []
-        skipped = []
-        entries = zone.entries[:max_nodes] if max_nodes else zone.entries
-        total   = len(entries)
-
-        # Pre-resolve all actor paths to asset IDs from hashes.txt
-        # The zone string pool has the actor paths; we look them up once
-        actor_id_map = {}   # path → asset_id
-        if zone.actor_paths and self.lookup and self.lookup.is_loaded():
-            for path in zone.actor_paths:
-                aid = self.lookup.asset_id(path)
-                if aid is None:
-                    aid = self.lookup.asset_id(path.lstrip('/'))
-                if aid is None:
-                    # Try with backslashes
-                    aid = self.lookup.asset_id(path.replace('/', '\\'))
-                if aid is not None:
-                    actor_id_map[path] = aid
-                    print(f"[assembler] resolved actor: {path.split('/')[-1]} → {aid:#018x}")
-                else:
-                    print(f"[assembler] actor not in hashes.txt: {path}")
-
-        # Pre-build actor → model map
-        # For each unique actor, parse it to get the model path
-        actor_model_map = {}   # actor_asset_id → (model_path, model_asset_id, model)
-        for path, actor_aid in actor_id_map.items():
-            if actor_aid in actor_model_map:
-                continue
-            actor_entry = self.toc.find_entry(actor_aid)
-            if actor_entry is None:
-                print(f"[assembler] actor not in TOC: {path}")
-                continue
-            try:
-                actor_data  = self.toc.extract_asset(actor_entry)
-                actor       = parse_actor_asset(actor_data, self.lookup)
-                if actor is None or not actor.has_model:
-                    print(f"[assembler] actor has no model: {path}")
-                    continue
-                model_aid = actor.model_asset_id
-                if model_aid is None:
-                    print(f"[assembler] model not in hashes.txt: {actor.model_path}")
-                    continue
-                model_entry = self.toc.find_entry(model_aid)
-                if model_entry is None:
-                    print(f"[assembler] model not in TOC: {actor.model_path}")
-                    continue
-                model_data = self.toc.extract_asset(model_entry)
-                model = ModelParser(model_data).parse()
-                actor_model_map[actor_aid] = (actor.model_path, model_aid, model)
-                print(f"[assembler] loaded model: {actor.model_path.split('/')[-1]}")
-            except Exception as ex:
-                print(f"[assembler] failed to load actor {path}: {ex}")
-
-        # Now assign models to entries
-        # We match by actor path name stem to the entry name
-        # Entries are tagged with checkpoint names, not actor names
-        # So we assign all actors equally (one actor type per zone in simple tiles)
-        # For zones with multiple actor types, we assign by round-robin or first-match
-        
-        # Build list of resolved (actor_id, model) pairs
-        resolved_actors = list(actor_model_map.values())  # [(model_path, model_aid, model)]
-
-        for i, entry in enumerate(entries):
-            if progress_cb:
-                progress_cb(i + 1, total)
-
-            if not resolved_actors:
-                skipped.append((entry, "no actors resolved for this zone"))
-                continue
-
-            # For tiles with one actor type, assign that model to all entries
-            # For tiles with multiple, try to match by index modulo
-            actor_idx = i % len(resolved_actors)
-            model_path, model_aid, model = resolved_actors[actor_idx]
-
-            world_matrix = _build_matrix(entry)
-            nodes.append(AssembledNode(
-                entry=entry,
-                model_path=model_path,
-                model_asset_id=model_aid,
-                model=model,
-                world_matrix=world_matrix,
-            ))
-
+                model_id = entry.model_id
+                model_path = self.lookup.name(model_id) if self.lookup and model_id else ''
+                if not model_id:
+                    if not entry.asset_id:
+                        skipped.append((entry, 'no actor or model asset reference'))
+                        continue
+                    # Non-model scene types must not borrow another actor's model.
+                    if entry.node_type != 0:
+                        skipped.append((entry, f'actor scene type {entry.node_type} is not a model'))
+                        continue
+                    if entry.asset_id not in self._actor_cache:
+                        actor_entry = self.toc.find_entry(entry.asset_id)
+                        if actor_entry is None:
+                            skipped.append((entry, f'actor not in TOC ({entry.asset_id:#018x})'))
+                            continue
+                        self._actor_cache[entry.asset_id] = parse_actor_asset(
+                            self.toc.extract_asset(actor_entry), self.lookup)
+                    actor = self._actor_cache[entry.asset_id]
+                    if actor is None or not actor.has_model or not actor.model_asset_id:
+                        skipped.append((entry, 'actor has no resolved model reference'))
+                        continue
+                    model_id, model_path = actor.model_asset_id, actor.model_path
+                if model_id not in self._model_cache:
+                    model_entry = self.toc.find_entry(model_id)
+                    if model_entry is None:
+                        skipped.append((entry, f'model not in TOC ({model_id:#018x})'))
+                        continue
+                    self._model_cache[model_id] = ModelParser(
+                        self.toc.extract_asset(model_entry)).parse()
+                nodes.append(AssembledNode(
+                    entry=entry, model_path=model_path, model_asset_id=model_id,
+                    model=self._model_cache[model_id], world_matrix=_build_matrix(entry)))
+            except Exception as exc:
+                skipped.append((entry, f'asset resolution failed: {exc}'))
         return AssembledZone(zone=zone, nodes=nodes, skipped=skipped)
 
 
@@ -308,9 +127,13 @@ def _build_matrix(entry: SceneNodeEntry) -> tuple:
     Returns a 16-element tuple of plain Python floats for glTF node.matrix.
 
     GP zones:  entry.rot = full 9-float row-major 3×3 rotation matrix
-    Art zones: entry.rot = only 3 valid rotation floats (row 0); position
-               data bleeds into rot[3..8] so we reconstruct from row 0 only.
+    Retail model nodes supply the full row-vector matrix. Its flat row-major
+    sequence is already the equivalent column-major glTF matrix: retain all
+    three axes, nonuniform scale, reflection and translation without transposing.
+    Other callers without a matrix retain the legacy rotation fallback.
     """
+    if entry.matrix:
+        return tuple(float(value) for value in entry.matrix)
     x, y, z = float(entry.x), float(entry.y), float(entry.z)
 
     # Check if rot is a valid 3×3 (all values in [-1, 1] range)

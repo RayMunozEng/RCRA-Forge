@@ -1,0 +1,36 @@
+// Both targets are RGBA32F: preserve decoded vectors and linear depth until the native filter.
+// Fur-only surface attributes. The engine vertex entry retains the visible material WPO.
+#if VERTEXSHADER
+#include "/Engine/Private/DepthOnlyVertexShader.usf"
+#else
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Generated/Material.ush"
+#include "/Engine/Generated/VertexFactory.ush"
+void Main(
+ FVertexFactoryInterpolantsVSToPS FactoryInterpolants,
+ float4 PixelPosition : TEXCOORD6,
+#if USE_WORLD_POSITION_EXCLUDING_SHADER_OFFSETS
+ float3 PixelPositionExcludingWPO : TEXCOORD7,
+#endif
+ in INPUT_POSITION_QUALIFIERS float4 SvPosition : SV_Position,
+ in FStereoPSInput StereoInput
+ OPTIONAL_IsFrontFace,
+ out float4 NormalMask : SV_Target0,
+ out float4 StrandDepth : SV_Target1)
+{
+ StereoSetupPS(StereoInput);
+ FMaterialPixelParameters MaterialParameters=GetMaterialPixelParameters(FactoryInterpolants,SvPosition);
+ FPixelMaterialInputs PixelMaterialInputs;
+#if USE_WORLD_POSITION_EXCLUDING_SHADER_OFFSETS
+ CalcMaterialParametersEx(MaterialParameters,PixelMaterialInputs,SvPosition,
+  SvPositionToResolvedScreenPosition(SvPosition),bIsFrontFace,
+  SvPositionToResolvedTranslatedWorld(SvPosition),PixelPositionExcludingWPO);
+#else
+ CalcMaterialParameters(MaterialParameters,PixelMaterialInputs,SvPosition,bIsFrontFace);
+#endif
+ GetMaterialCoverageAndClipping(MaterialParameters,PixelMaterialInputs);
+ // Surviving masked samples carry full coverage. Fractional resolve is a separate stage.
+ NormalMask=float4(GetFurSurface0(MaterialParameters),1);
+ StrandDepth=float4(GetFurSurface1(MaterialParameters),ConvertFromDeviceZ(SvPosition.z)*0.01);
+}
+#endif

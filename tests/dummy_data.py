@@ -149,7 +149,7 @@ def make_fake_toc_dat1() -> bytes:
 
 def make_actor_asset(model_path: str | None = None) -> bytes:
     """Build a minimal actor DAT1 with an optional linked model path."""
-    from core.actor import ACTOR_TYPE
+    from core.actor import ACTOR_TYPE, TAG_ACTOR_HEADER, TAG_ACTOR_SCENE
     from core.archive import DAT1_MAGIC
 
     strings = [b"Actor Built File"]
@@ -157,16 +157,26 @@ def make_actor_asset(model_path: str | None = None) -> bytes:
         strings.append(model_path.encode("utf-8"))
     pool = b"\x00".join(strings) + b"\x00"
 
-    section_count = 1
+    section_count = 2 if model_path else 1
     header_size = 16 + section_count * 12
     section_offset = (header_size + len(pool) + 15) & ~15
-    section_data = b"\x00\x00\x00\x00"
-    total_size = section_offset + len(section_data)
+    model_offset = header_size + len(strings[0]) + 1 if model_path else 0
+    section_data = struct.pack('<I', model_offset)
+    scene = bytearray(0x140 if model_path else 0)
+    if scene:
+        struct.pack_into('<16f', scene, 0, 1, 0, 0, 0, 0, 1, 0, 0,
+                         0, 0, 1, 0, 0, 0, 0, 1)
+        struct.pack_into('<I', scene, 0x7C, len(scene))
+    total_size = section_offset + len(section_data) + len(scene)
 
     data = bytearray(total_size)
     header = struct.pack('<IIIHH', DAT1_MAGIC, ACTOR_TYPE, total_size, section_count, 0)
-    header += struct.pack('<III', 0x12345678, section_offset, len(section_data))
+    header += struct.pack('<III', TAG_ACTOR_HEADER, section_offset, len(section_data))
+    if scene:
+        header += struct.pack('<III', TAG_ACTOR_SCENE, section_offset + len(section_data), len(scene))
     data[:len(header)] = header
     data[header_size:header_size + len(pool)] = pool
     data[section_offset:section_offset + len(section_data)] = section_data
+    if scene:
+        data[section_offset + len(section_data):] = scene
     return bytes(data)

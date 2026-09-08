@@ -370,13 +370,28 @@ class TextureAsset:
                 result.extend(sd_levels)
         return result
 
+    @property
+    def is_packed_probe_atlas(self) -> bool:
+        """Identify the shipped BC6U probe atlas, not a 2D lat-long texture.
+
+        TextureManager's local probe array is 256x256 with six mips. Its
+        CS_CopyEnvProbe shader copies uint4 BC6 blocks from a 1024x512 atlas.
+        See docs/ENVIRONMENT_PROBES.md for the shader and allocation evidence.
+        """
+        return (
+            self.fmt == DXGI_BC6U and self.planes == 4 and self.array_size == 1
+            and self.width == 1024 and self.height == 512 and self.mips == 1
+        )
+
     def compressed_cube_mips(self) -> list[list[tuple[int, int, bytes]]]:
         """Return face-major BC mip chains for a cooked cube texture.
 
         RCRA marks cube resources with ``planes == 4`` and stores six complete
         face-major mip chains even though ``array_size`` remains one. This is
         the layout used by the captured 1024x1024 BC6 environment probe: its
-        payload is exactly ``6 * sum(mip_byte_sizes)``.
+        payload is exactly ``6 * sum(mip_byte_sizes)``. Local baked probes
+        instead pack all faces/mips into one 1024x512 BC6U atlas; their header's
+        mip count describes the atlas, not the destination cube.
         """
         if not self.is_block_compressed or self.planes != 4:
             return []
@@ -390,6 +405,29 @@ class TextureAsset:
             mip_count = max(1, self.sd_mips)
         else:
             return []
+        if self.is_packed_probe_atlas:
+            if len(data) != 1024 * 512:
+                return []
+            # CS_CopyEnvProbe uses a 256x128 uint4 view of the BC6 blocks.
+            # For each mip, faces 0..3 occupy the upper row and 4..5 the
+            # lower row. Remaining space holds the next mip recursively.
+            # Preserve the block bits and orientation; there is no resampling.
+            result = []
+            for face in range(6):
+                levels = []
+                for mip in range(6):
+                    block_side = 64 >> mip
+                    source_x = 256 - (4 - (face & 3)) * block_side
+                    source_y = 128 - (2 if face < 4 else 1) * block_side
+                    blocks = b''.join(
+                        data[((source_y + row) * 256 + source_x) * 16:
+                             ((source_y + row) * 256 + source_x + block_side) * 16]
+                        for row in range(block_side)
+                    )
+                    side = block_side * 4
+                    levels.append((side, side, blocks))
+                result.append(levels)
+            return result
         eight_byte_formats = (DXGI_DXT1, DXGI_DXT1S, DXGI_ATI1, DXGI_ATI1S)
         bytes_per_block = 8 if self.fmt in eight_byte_formats else 16
         face_stride = 0

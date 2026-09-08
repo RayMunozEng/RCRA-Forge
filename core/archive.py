@@ -69,16 +69,20 @@ ASSET_TYPE_NAMES = {
     0x8A0B1487: 'zone',        # Zone container type
     0x1F390AA0: 'zone',        # ZoneDef (tile/gp zones) ← confirmed from binary
     0x2AFE7495: 'level',
+    0x587B60A6: 'level',        # RCRA level built file; loader 0x14107BEE0
     0x21A56F68: 'config',
     0xF777E4A8: 'animset',
     0xC96F58F3: 'animclip',
+    0x0F64FFE8: 'animclip',   # RCRA: installed idle_wpn_wrench.animclip
     0x7C207220: 'actor',
     0x944BD3AD: 'actor',        # confirmed from binary (actor built file)
     0x39F27E27: 'atmosphere',
+    0x21D5E72C: 'atmosphere', # RCRA: installed atm_malinon_day.atmosphere
     0x1C04EF8C: 'material',
     0x07DC03E3: 'materialgraph',
     0x7E4F1BB7: 'soundbank',
     0xF05EF819: 'visualeffect',
+    0x21400EE4: 'visualeffect', # RCRA: installed muzzle and smoke-trail effects
     0x35C9D886: 'wwiselookup',
     0x567CC2F0: 'levellight',
     0x51B8E006: 'toc',

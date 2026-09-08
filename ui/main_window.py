@@ -137,30 +137,15 @@ class AssetLoader(QObject):
 
     def _emit_fur_environment(self, tex_data: dict) -> None:
         """Load recovered Hair defaults only for models that actually use fur."""
-        has_fur = any(
-            isinstance(slots, dict) and 'fur_control' in slots
-            for slots in (tex_data or {}).values()
-        )
-        if not has_fur:
-            return
-        from core.fur_resources import default_hair_brdf_rg_half
-        from core.texture import TextureParser
+        from core.asset_loader import load_fur_environment
 
-        # Captured g_EnvProbeDefault at the verified retail Hair dispatch.
-        probe_entry = self.toc_parser.find_entry(0x8F083136CEB5FB07)
-        if probe_entry is None:
-            print("[AssetLoader] recovered Hair environment is absent from TOC")
+        try:
+            environment = load_fur_environment(tex_data, self.toc_parser)
+        except Exception as ex:
+            print(f"[AssetLoader] {ex}", flush=True)
             return
-        probe = TextureParser(
-            self.toc_parser.extract_asset(probe_entry)
-        ).parse()
-        cube_mips = probe.decoded_cube_mips_rgb_half()
-        if not cube_mips:
-            print("[AssetLoader] recovered Hair environment failed BC6 decode")
-            return
-        self.fur_environment_ready.emit(
-            cube_mips, default_hair_brdf_rg_half(), (64, 64),
-        )
+        if environment is not None:
+            self.fur_environment_ready.emit(*environment)
 
     def run(self):
         try:

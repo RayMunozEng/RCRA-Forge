@@ -1,0 +1,41 @@
+#ifndef FUR_AUTHORING_USH
+#define FUR_AUTHORING_USH
+// Artist-authored procedural shell coverage. No game texture assets required.
+float2 FAHash(float2 p)
+{
+    return frac(sin(float2(dot(p,float2(127.1,311.7)),dot(p,float2(269.5,183.3))))*43758.5453);
+}
+float FACoverage(float2 uv, float depth, float density, float width, float wetness)
+{
+    if (depth < 0.0001) return 1;
+    float2 p = uv * max(density, 1);
+    float nearest = 10;
+    // Neighbor cells avoid cut strands at cell edges.
+    [unroll] for (int y=-1;y<=1;y++)
+    [unroll] for (int x=-1;x<=1;x++)
+    {
+        float2 cell = floor(p)+float2(x,y);
+        float2 center = cell + 0.15 + FAHash(cell)*0.7;
+        nearest = min(nearest,length(p-center));
+    }
+    float radius = width * lerp(1,0.18,depth) * lerp(1,0.65,saturate(wetness));
+    float aa = max(fwidth(nearest),0.001);
+    return 1-smoothstep(radius-aa,radius+aa,nearest);
+}
+float3 FAOffset(float3 normal, float2 uv, float depth, float lengthCm,
+                float3 groom, float3 wind, float strength, float speed, float time, float wetness)
+{
+    float3 n=normalize(normal);
+    float wave=sin(time*speed*2.1+uv.x*13+uv.y*7)
+              +0.35*sin(time*speed*3.7+uv.y*23);
+    float3 bend=groom+wind*strength*wave;
+    bend-=n*dot(n,bend);
+    return lengthCm*(n*depth*lerp(1,0.75,saturate(wetness)) + bend*depth*depth);
+}
+float3 FAColor(float3 root, float3 tip, float depth, float wetness)
+{
+    float3 albedo=lerp(root,tip,saturate(depth));
+    // Recovered wet albedo response, independent of the host lighting model.
+    return albedo+albedo*asfloat(0xbe4cccccu)*(sqrt(saturate(depth))*saturate(wetness));
+}
+#endif

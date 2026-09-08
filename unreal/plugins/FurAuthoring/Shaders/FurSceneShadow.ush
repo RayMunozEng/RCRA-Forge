@@ -1,0 +1,32 @@
+#ifndef FUR_SCENE_SHADOW_USH
+#define FUR_SCENE_SHADOW_USH
+// Bounded orthographic SceneDepth map from FurLightingController, in UE cm.
+// This bridge handles explicitly listed occluders, not Unreal VSM/Lumen history.
+float RFSceneShadow(Texture2D shadow,float3 position,float3 origin,float3 forward,
+    float3 right,float3 up,float width,float bias,float enabled)
+{
+    if(enabled<.5) return 1;
+    float3 delta=position-origin;
+    float2 uv=float2(dot(delta,right),-dot(delta,up))/max(width,1)+.5;
+    float depth=dot(delta,forward);
+    if(any(uv<0)||any(uv>1)||depth<0||depth>5000) return 1;
+    uint w,h;shadow.GetDimensions(w,h);
+    // Bilinear interpolation of the comparison results, not of raw depth.
+    // The separable weights merge nine bilinear PCF taps into 16 loads.
+    // Texel centers are at (i + .5); this keeps the filter continuous as the
+    // receiver moves across texels without blurring unrelated depth values.
+    float2 texel=uv*float2(w,h)-.5;
+    int2 pixel=int2(floor(texel));
+    float2 f=frac(texel);
+    float4 wx=float4(1-f.x,1,1,f.x);
+    float4 wy=float4(1-f.y,1,1,f.y);
+    float visibility=0;
+    [unroll] for(int y=0;y<4;++y)
+        [unroll] for(int x=0;x<4;++x)
+        {
+            int2 p=clamp(pixel+int2(x-1,y-1),int2(0,0),int2(w-1,h-1));
+            visibility += wx[x]*wy[y]*(depth-max(bias,.01)<=shadow.Load(int3(p,0)).r ? 1:0);
+        }
+    return visibility/9;
+}
+#endif

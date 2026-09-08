@@ -1,0 +1,15 @@
+#include "/Engine/Public/Platform.ush"
+Texture2D<float4> FurNormalMask;
+RWTexture2D<uint> FurTileMask;
+uint2 FurDimensions;
+groupshared uint Active;
+[numthreads(8,8,1)]
+void MainCS(uint3 Pixel:SV_DispatchThreadID,uint3 Tile:SV_GroupID,uint Lane:SV_GroupIndex)
+{
+ if(Lane==0)Active=0;
+ GroupMemoryBarrierWithGroupSync();
+ if(all(Pixel.xy<FurDimensions) && FurNormalMask.Load(int3(Pixel.xy,0)).a>0)
+  InterlockedOr(Active,1);
+ GroupMemoryBarrierWithGroupSync();
+ if(Lane==0)FurTileMask[Tile.xy]=Active;
+}

@@ -1,0 +1,125 @@
+// Translated from the recovered hair_surface/hair_denoise kernels.
+#ifndef RF_RECOVERED_DENOISE
+#define RF_RECOVERED_DENOISE
+// Hair surface preparation. Inputs use native top-left pixel coordinates,
+// linear view depth and decoded G-buffer vectors (without renormalizing them).
+// Include in GLSL 4.30+, or enable GL_ARB_gpu_shader5 for GLSL 3.30.
+
+float3 hairViewPosition(float2 pixel, float depth, float2 inverseDimensions,
+                      float4 screenToViewA, float2 screenToViewB) {
+    float2 uv = (pixel + 0.5) * inverseDimensions;
+#if 1
+    precise float2 screen = mad(uv, screenToViewA.xy, screenToViewA.zw);
+    precise float scale = mad(screenToViewB.x, depth, screenToViewB.y);
+#else
+    float2 screen = uv * screenToViewA.xy + screenToViewA.zw;
+    float scale = screenToViewB.x * depth + screenToViewB.y;
+#endif
+    return float3(screen * scale, depth);
+}
+
+
+// HairDenoise uses D3D top-left UVs, decoded packed vectors (without another
+// normalization), conservative half depth, fractional masks and three gathers.
+// The caller supplies resource access so captured and preview bindings share
+// the same arithmetic. Gather components follow D3D's xyzw order.
+// Include hair_surface.glsl before this source.
+float4 hairDenoiseGatherDepth(float2 uv);
+float4 hairDenoiseGatherMask(float2 uv);
+float4 hairDenoiseGatherColor(float2 uv, int component);
+bool hairDenoiseTileActive(float2 uv);
+
+float hairDenoiseHalfDepth(float depth) {
+    // Strictly greater representable half: 122,142 captured masked pixels
+    // match floor-to-half plus one code, including exactly representable input.
+    if (depth < 0.00006103515625) {
+        return (floor(max(depth, 0.0) * 16777216.0) + 1.0) / 16777216.0;
+    }
+    if (depth >= 65504.0) return asfloat(0x7f800000u);
+    return asfloat((asuint(depth) & 0xffffe000u) + 8192u);
+}
+
+struct HairDenoiseRay {
+    float3 samplePosition; // UV and reciprocal linear depth
+    float3 step;
+    float extent;
+};
+
+HairDenoiseRay hairDenoiseBuildRay(
+        float2 pixel, float depth, float3 normal, float3 strand, float3 viewTangent,
+        float2 inverseDimensions, float4 screenToViewA, float2 screenToViewB,
+        float4 viewToScreen, float phase) {
+    float rayLength = min(0.0025, sqrt(1.0 - abs(dot(normal, strand))) * 0.05);
+    float3 position = hairViewPosition(
+        pixel, depth, inverseDimensions, screenToViewA, screenToViewB
+    );
+#if 1
+    float3 negative = mad(-viewTangent, (float3)(rayLength * 0.5), position);
+    float3 positive = mad(viewTangent, (float3)(rayLength * 0.5), position);
+#else
+    float3 offset = viewTangent * (rayLength * 0.5);
+    float3 negative = position - offset;
+    float3 positive = position + offset;
+#endif
+    float inverseNegative = 1.0 / negative.z;
+    float inversePositive = 1.0 / positive.z;
+    float2 negativeNdc = negative.xy * inverseNegative;
+#if 1
+    float2 startUV = mad(negativeNdc, viewToScreen.xy, viewToScreen.zw);
+    float2 deltaUV = mad(positive.xy, (float2)(inversePositive), -negativeNdc)
+        * viewToScreen.xy * asfloat(0x3eaaaaabu);
+#else
+    float2 startUV = negativeNdc * viewToScreen.xy + viewToScreen.zw;
+    float2 deltaUV = (positive.xy * inversePositive - negativeNdc)
+        * viewToScreen.xy * asfloat(0x3eaaaaabu);
+#endif
+    float deltaDepth = (inversePositive - inverseNegative) * asfloat(0x3eaaaaabu);
+    HairDenoiseRay ray;
+#if 1
+    ray.samplePosition = float3(mad(deltaUV, (float2)(phase), startUV),
+                              mad(deltaDepth, phase, inverseNegative));
+#else
+    ray.samplePosition = float3(startUV + deltaUV * phase,
+                              inverseNegative + deltaDepth * phase);
+#endif
+    ray.step = float3(deltaUV, deltaDepth);
+    ray.extent = rayLength;
+    return ray;
+}
+
+float4 hairDenoiseDepthWeight(float4 difference, float scale) {
+#if 1
+    // A fused operation is observable at stored-color boundaries. Explicit ray
+    // FMAs above also preserve projection arithmetic when precise propagates.
+    // All 11,215 captured float RGB values and sums match with this ordering.
+    precise float4 value = mad(difference, (float4)(scale), (float4)(1.0));
+    return clamp(value, 0.0, 1.0);
+#else
+    return clamp(difference * scale + 1.0, 0.0, 1.0);
+#endif
+}
+
+float3 hairDenoiseFilter(HairDenoiseRay ray, float3 centerColor, float centerDepth) {
+    float3 colorSum = centerColor;
+    float weightSum = 1.0;
+    for (int i = 0; i < 3; ++i) {
+        if (hairDenoiseTileActive(ray.samplePosition.xy)) {
+            float4 depths = hairDenoiseGatherDepth(ray.samplePosition.xy);
+            float4 weights = hairDenoiseDepthWeight(
+                depths - 1.0 / ray.samplePosition.z, 200.0 / centerDepth
+            ) * hairDenoiseGatherMask(ray.samplePosition.xy);
+            float3 gathered = float3(
+                dot(hairDenoiseGatherColor(ray.samplePosition.xy, 0), weights),
+                dot(hairDenoiseGatherColor(ray.samplePosition.xy, 1), weights),
+                dot(hairDenoiseGatherColor(ray.samplePosition.xy, 2), weights)
+            );
+            colorSum += gathered;
+            weightSum += dot(weights, (float4)(1.0));
+            // The retail loop advances only when the tile's Hair bit is set.
+            ray.samplePosition += ray.step;
+        }
+    }
+    return colorSum * (1.0 / weightSum);
+}
+
+#endif

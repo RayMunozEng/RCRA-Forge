@@ -27,6 +27,7 @@ a = Analysis(
     datas=[
         # Include README so it's accessible from Help menu if desired
         ('README.md', '.'),
+        ('core/*.glsl', 'core'),
     ] + imagecodecs_datas,
     hiddenimports=[
         # imagecodecs — texture decompression (BC1/BC7 etc.)

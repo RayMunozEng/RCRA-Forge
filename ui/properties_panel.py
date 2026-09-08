@@ -556,132 +556,25 @@ class PropertiesPanel(QWidget):
         self._export_zone_fn = fn
 
     def _do_dump_zone(self):
-        """Dump raw field values for the first 5 zone entries to the log."""
-        import struct, math
+        """Report the same indexed entries used by scene display and export."""
         zone = getattr(self, '_current_zone', None)
         if zone is None:
             return
-
-        TAG_SCENE_NODES_ART  = 0x9CCAA06F   # RCRA art zones (320-byte entries)
-        TAG_SCENE_NODES_BOTH = 0x06ABCAB2   # GP zones and some art zones
-        TAG_MODEL_ASSETS     = 0xC6A5905E
-        TAG_MODEL_INDICES    = 0x6987F172
-
-        raw_data = getattr(zone, '_raw_data', None)
-        if raw_data is None:
-            self.log("[DUMP] No raw zone data stored. Re-select the zone asset to reload it.")
-            return
-
-        dat1_off = raw_data.find(b'\x31\x54\x41\x44')
-        if dat1_off == -1:
-            self.log("[DUMP] No DAT1 found in stored zone data.")
-            return
-
-        section_count, _ = struct.unpack_from('<HH', raw_data, dat1_off + 12)
-        sections = {}
-        for i in range(section_count):
-            base = dat1_off + 0x10 + i * 12
-            tag, sec_off, sec_size = struct.unpack_from('<III', raw_data, base)
-            abs_off = dat1_off + sec_off
-            sections[tag] = raw_data[abs_off:abs_off + sec_size]
-
-        # Report all sections present
-        sec_list = ', '.join(f'{t:#010x}({len(d)}B)' for t, d in sorted(sections.items()))
-        lines = [
-            f"[DUMP] Zone: {zone.name}",
-            f"[DUMP] is_art_zone={zone.is_art_zone}  entries={zone.entry_count}",
-            f"[DUMP] Sections: {sec_list}",
-            "",
-        ]
-        print(f"[DUMP] {zone.name}: sections = {sec_list}")
-
-        # Pick which scene section to dump
-        if TAG_SCENE_NODES_ART in sections:
-            scene_tag  = TAG_SCENE_NODES_ART
-            entry_size = 0x140   # 320 bytes
-            header     = 32
-            lines.append(f"[DUMP] Using 0x9CCAA06F (art zone, {entry_size}-byte entries, {header}-byte header)")
-        elif TAG_SCENE_NODES_BOTH in sections:
-            scene_tag  = TAG_SCENE_NODES_BOTH
-            # Determine entry size from zone type flag and section size
-            # Art zones using 0x06ABCAB2: try 320 first, fall back to 176
-            entry_size = 0x140 if zone.is_art_zone else 0xB0
-            header     = 32 if zone.is_art_zone else 0
-            lines.append(f"[DUMP] Using 0x06ABCAB2 (is_art={zone.is_art_zone}, "
-                         f"trying entry_size={entry_size:#x}, header={header})")
-        else:
-            lines.append("[DUMP] No scene node section found (neither 0x9CCAA06F nor 0x06ABCAB2).")
-            self.log('\n'.join(lines))
-            return
-
-        scene_data = sections[scene_tag]
-        payload    = scene_data[header:]
-
-        # Try both entry sizes and report which divides evenly
-        for es in (0x140, 0xB0, 0x80, 0x60):
-            if len(payload) % es == 0:
-                lines.append(f"[DUMP] payload {len(payload)}B ÷ {es:#x} = {len(payload)//es} entries (exact)")
-        lines.append("")
-
-        n = len(payload) // entry_size
-
-        model_ids = []
-        if TAG_MODEL_ASSETS in sections:
-            ma = sections[TAG_MODEL_ASSETS]
-            model_ids = [struct.unpack_from('<Q', ma, i*8)[0] for i in range(len(ma)//8)]
-
-        mi_data = sections.get(TAG_MODEL_INDICES, b'')
-        model_indices = [struct.unpack_from('<I', mi_data, i*4)[0] for i in range(len(mi_data)//4)]
-
-        lines.append(f"[DUMP] model_ids={len(model_ids)}  model_indices={len(model_indices)}")
-        lines.append("")
-
-        for ei in range(min(5, n)):
-            base = ei * entry_size
-            raw  = payload[base:base + entry_size]
-            if len(raw) < entry_size:
-                break
-
-            r0, r1, r2 = struct.unpack_from('<3f', raw, 0x00)
-            mag02 = math.sqrt(r0*r0 + r2*r2)
-            mag01 = math.sqrt(r0*r0 + r1*r1)
-
-            x10, y10, z10 = struct.unpack_from('<3f', raw, 0x10)
-            x30, y30, z30 = struct.unpack_from('<3f', raw, 0x30)
-            flags = struct.unpack_from('<I', raw, 0x5C)[0] if entry_size > 0x5C else 0
-
-            # Model index — try +0xF0 (art 320) and +0x80 (gp 176)
-            mi_f0 = struct.unpack_from('<I', raw, 0xF0)[0] if entry_size >= 0xF4 else None
-            mi_80 = struct.unpack_from('<Q', raw, 0x80)[0] if entry_size >= 0x88 else None
-
-            model_id_f0 = (model_ids[mi_f0] if mi_f0 is not None and mi_f0 < len(model_ids) else 0)
-
-            nine = struct.unpack_from('<9f', raw, 0x00)
-            nine_str = ', '.join(f'{v:.4f}' for v in nine)
-
-            angle_02 = math.degrees(math.atan2(r2, r0))
-            angle_01 = math.degrees(math.atan2(r1, r0))
-
-            lines += [
-                f"  ── Entry {ei} ──",
-                f"  +0x00  r[0,1,2] = {r0:.6f}, {r1:.6f}, {r2:.6f}",
-                f"          |r0,r2|={mag02:.5f} → θ={angle_02:.2f}°  "
-                f"|r0,r1|={mag01:.5f} → θ={angle_01:.2f}°",
-                f"  +0x10  xyz = {x10:.3f}, {y10:.3f}, {z10:.3f}",
-                f"  +0x30  xyz = {x30:.3f}, {y30:.3f}, {z30:.3f}",
-                f"  +0x5C  flags = {flags:#010x}",
-            ]
-            if mi_f0 is not None:
-                lines.append(f"  +0xF0  model_idx={mi_f0} → {model_id_f0:#018x}")
-            if mi_80 is not None:
-                lines.append(f"  +0x80  instance_id={mi_80:#018x}  (gp field)")
-            lines += [f"  9f@0x00: [{nine_str}]", ""]
-
-            print(f"[DUMP] Entry {ei}: r=({r0:.4f},{r1:.4f},{r2:.4f}) "
-                  f"θ02={angle_02:.1f}° "
-                  f"pos@0x10=({x10:.1f},{y10:.1f},{z10:.1f}) "
-                  f"pos@0x30=({x30:.1f},{y30:.1f},{z30:.1f})")
-
+        lines = [f'[DUMP] Zone: {zone.name}',
+                 f'[DUMP] {zone.entry_count} indexed nodes; matrices are zone-local']
+        for entry in zone.entries[:5]:
+            lines.extend([
+                f'  [{entry.index}] {entry.name}',
+                f'  Scene offset {entry.scene_offset:#x}, type {entry.node_type}, {len(entry.raw)} bytes',
+                f'  Instance {entry.instance_id:016X}',
+                f'  Actor {entry.asset_id:016X}, model {entry.model_id:016X}',
+                f'  Renderer instance {entry.renderer_instance_id:016X}',
+            ])
+            for row in range(4):
+                lines.append('  ' + ', '.join(f'{v:.6g}' for v in entry.matrix[row*4:row*4+4]))
+            for component in entry.components:
+                lines.append(f'  Component {component.name or "(unnamed)"}: '
+                             f'type {component.type_id:08X}, {len(component.data)} bytes')
         self.log('\n'.join(lines))
 
     def _do_export_list(self):

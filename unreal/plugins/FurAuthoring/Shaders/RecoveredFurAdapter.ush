@@ -1,0 +1,97 @@
+#ifndef FUR_RECOVERED_ADAPTER_USH
+#define FUR_RECOVERED_ADAPTER_USH
+#include "/Plugin/FurAuthoring/RecoveredFurCore.ush"
+
+// Halton base 2, samples 1..32; the independent cycle feeds hairScreenPhase.
+float RFTemporalIndex(uint frame)
+{
+    return float(reversebits((frame & 31u)+1u))*2.3283064365386963e-10;
+}
+
+// Fixed-depth authoring adapter. Native view-dependent triangle rejection
+// requires a dedicated mesh pass; it is deliberately not approximated here.
+// Inputs use UE local coordinates/cm. Recovered wind uses Y-up/meters.
+float3 RFOffset(float3 normalUE, float3 tangentUE, float handedness,
+    float2 uv, float depth, float lengthCm, float controlLength,
+    float3 windUE, float time, float strength, float turbulence, float phase, float radius)
+{
+    float3 n = normalize(normalUE.xzy);
+    float3 t = normalize(tangentUE.xzy);
+    float lengthM = max(lengthCm, 0.0) * 0.01;
+    float3 shellNormal = n;
+    if (strength > 0.0 && lengthM > 0.0)
+    {
+        float3 w = retailWindOffset(uv, windUE.xzy, time, turbulence, phase, radius, strength);
+        float3 b = normalize(cross(t, n)) * handedness;
+        float3 frameOffset = t * dot(t, w) + b * dot(b, w);
+        float gate = saturate((controlLength * lengthM - 0.0075) * 50.0);
+        float3 bend = frameOffset * gate * (depth * depth + 0.4 * depth) / max(lengthM, 0.000001);
+        shellNormal = normalize(n + bend);
+    }
+    // Wetness does not change shell length or bend in the recovered VS.
+    return shellNormal.xzy * (lengthCm * controlLength * depth);
+}
+
+float RFControlLength(Texture2D control, float2 uv)
+{
+    uint width, height;
+    control.GetDimensions(width, height);
+    return control.Load(int3(int2(floor(frac(uv) * float2(width, height))), 0)).b;
+}
+
+float RFCountedCoverageWithMask(Texture2DArray layers, SamplerState layerSampler,
+    float2 uv, float4 control, float depth, float density, float lengthCm,
+    float offsetScale, float wetness, float facing, float2 pixel, float2 inverseDimensions,
+    float temporalIndex, float temporalCycle, float coverageMask, float shellCount)
+{
+    // Authoring extension: masks remove fur, never the base surface.
+    if (depth > 0.0 && (control.b <= 0.0 || coverageMask <= 0.0)) return 0.0;
+    float phase = hairScreenPhase(pixel, inverseDimensions, temporalIndex, temporalCycle);
+    float divisor = 1.0 + 3.0 * hairWetnessStep(wetness, phase);
+    float3 groom = furGroom(control.rg, offsetScale);
+    float curved = (depth * depth + 0.4 * depth) * lengthCm * 0.01 * offsetScale;
+    float2 layerUV = furLayerUV(uv, density, groom, curved, divisor);
+    float slice = depth * 32.0;
+    float bias = -2.0 * (1.0 - saturate(facing)) * (1.0 - saturate(facing));
+    float sampled = layers.SampleBias(layerSampler, float3(layerUV, slice), bias).r;
+    float value = furWetLayerValue(sampled, saturate(wetness));
+    // Source albedo alpha is one; the recovered wet response also attenuates it.
+    float alpha = furWetAlbedo(float4(1,1,1,1), saturate(wetness), depth).a;
+    float coverage = saturate(value * alpha * saturate(coverageMask) + (depth == 0.0 ? 1.0 : 0.0)) * saturate(1.0 - slice / 64.0);
+    // Optional authoring resampling: preserve optical depth as the number of
+    // nonbase samples changes. Exact reference path at 32 shells. This assumes
+    // independent equal-density samples; it is not a recovered native rule.
+    if (depth > 0.0 && shellCount > 1.0 && shellCount != 32.0)
+        coverage = 1.0 - pow(max(1.0 - coverage, 0.0), 31.0 / (shellCount - 1.0));
+    float threshold = hairCoveragePhase(pixel, slice, inverseDimensions, temporalIndex, temporalCycle);
+    return coverage >= threshold ? 1.0 : 0.0;
+}
+
+float RFCoverageWithMask(Texture2DArray layers, SamplerState layerSampler,
+    float2 uv, float4 control, float depth, float density, float lengthCm,
+    float offsetScale, float wetness, float facing, float2 pixel, float2 inverseDimensions,
+    float temporalIndex, float temporalCycle, float coverageMask)
+{
+    return RFCountedCoverageWithMask(layers, layerSampler, uv, control, depth,
+        density, lengthCm, offsetScale, wetness, facing, pixel, inverseDimensions,
+        temporalIndex, temporalCycle, coverageMask, 32.0);
+}
+
+float RFCoverage(Texture2DArray layers, SamplerState layerSampler,
+    float2 uv, float4 control, float depth, float density, float lengthCm,
+    float offsetScale, float wetness, float facing, float2 pixel, float2 inverseDimensions,
+    float temporalIndex, float temporalCycle)
+{
+    return RFCoverageWithMask(layers, layerSampler, uv, control, depth, density,
+        lengthCm, offsetScale, wetness, facing, pixel, inverseDimensions,
+        temporalIndex, temporalCycle, 1.0);
+}
+
+float RFLengthMap(Texture2D map, float2 uv, float enabled)
+{
+    if (enabled < 0.5) return 1.0;
+    uint w,h;
+    map.GetDimensions(w,h);
+    return saturate(map.Load(int3(int2(floor(frac(uv)*float2(w,h))),0)).r);
+}
+#endif

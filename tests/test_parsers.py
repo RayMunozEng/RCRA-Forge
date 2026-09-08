@@ -30,11 +30,14 @@ def test_retail_packed_frame_decodes_normal_tangent_and_handedness():
     assert tangent[2] > -0.01
     assert tangent[3] == 1.0
     assert _decode_tangent(-512, packed)[3] == -1.0
+    # The hemisphere sign applies after abs, including quantized rim values.
+    assert _decode_normal(0xFFFFFFFF)[2] > 0.999
+    assert _decode_tangent(1023, 0xFFFFFFFF)[2] > 0.999
     np.testing.assert_allclose(
         _decode_position_correction(0x7E00),
-        1.0 / ((0x7C00 * 0.000032) ** 2),
+        1.0, rtol=1e-7,
     )
-    assert _decode_position_correction(0) == 0.0
+    assert np.isposinf(_decode_position_correction(0))
 
 
 def test_sphere_model():

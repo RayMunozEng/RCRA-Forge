@@ -1,0 +1,5 @@
+# Optional isolated retail light-grid reconstruction; ordinary Forge does not need it.
+unicorn==2.1.4
+# Streaming RDC section/chunk inspection; ordinary Forge does not need it.
+zstandard==0.25.0
+lz4==4.4.5

@@ -6,6 +6,10 @@ import base64
 import zlib
 
 
+# Captured g_EnvProbeDefault at the verified frame-7328 Hair dispatch.
+DEFAULT_HAIR_ENVIRONMENT_ASSET_ID = 0x8F083136CEB5FB07
+
+
 # Resource 4946, Default Brdf Lookup, slice 0 from the retail frame-7328
 # capture. Hair reads only RG; retaining those R16G16_FLOAT samples avoids
 # bundling the unused BA channels.

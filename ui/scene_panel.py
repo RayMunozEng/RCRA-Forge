@@ -3,7 +3,7 @@ ui/scene_panel.py
 Scene / level info panel for RCRA Forge.
 
 Shows scene nodes (placed actor instances) from the currently loaded
-zone asset, including world-space position and asset ID per node.
+zone asset, including zone-local position and separate instance/asset IDs.
 """
 
 from PyQt6.QtWidgets import (
@@ -29,6 +29,7 @@ class ScenePanel(QWidget):
         """Display scene nodes from a core.zone.ZoneDef object."""
         self._zone = zone
         self._tree.clear()
+        self._tree.setHeaderLabels(['Node', 'Position'])
         self._info.clear()
 
         # Root node — zone name
@@ -69,13 +70,17 @@ class ScenePanel(QWidget):
         for e in zone.entries:
             name = e.name.split('\\')[-1] if e.name else '(unnamed)'
             lines.append(f"[{e.index}] {name}")
-            lines.append(f"     ID:  {e.asset_id:#018x}")
-            lines.append(f"     Pos: ({e.x:.2f}, {e.y:.2f}, {e.z:.2f})")
+            lines.append(f"     Instance: {e.instance_id:#018x}")
+            lines.append(f"     Asset: {(e.asset_id or e.model_id):#018x}")
+            lines.append(f"     Zone-local position: ({e.x:.2f}, {e.y:.2f}, {e.z:.2f})")
+            if e.components:
+                lines.append(f"     Component overrides: {len(e.components)}")
             lines.append("")
         self._info.setPlainText('\n'.join(lines))
 
     def load_level(self, level_info):
         """Display info from a core.level.LevelInfo object."""
+        self._zone = None
         self._tree.clear()
         root = QTreeWidgetItem(self._tree)
         root.setText(0, f"📦  {level_info.asset_type}")
@@ -86,8 +91,14 @@ class ScenePanel(QWidget):
         root.setFont(1, f)
         root.setForeground(0, QColor('#5dade2'))
         root.setExpanded(True)
+        for zone in level_info.zones:
+            child = QTreeWidgetItem(root)
+            child.setText(0, zone.name.replace('\\', '/').rsplit('/', 1)[-1] or '(unnamed zone)')
+            child.setText(1, f'{zone.asset_id:016X}')
+            child.setToolTip(0, zone.name)
+        self._tree.setHeaderLabels(['Zone', 'Asset ID'])
         self._info.setPlainText(level_info.description)
-        self._status.setText(f"Asset type: {level_info.asset_type}")
+        self._status.setText(f"Asset type: {level_info.asset_type} · {len(level_info.zones)} zone references")
 
     def load_instances(self, inst_table):
         """Stub — instance tables not yet decoded."""
@@ -138,7 +149,7 @@ class ScenePanel(QWidget):
         self._info.setPlaceholderText(
             "Click a .zone asset in the browser to see its scene nodes.\n\n"
             "Tile zones (tile_*_gp.zone) contain placed actor instances\n"
-            "with world-space positions and rotation matrices."
+            "with zone-local positions and rotation matrices."
         )
         layout.addWidget(self._info, 1)
 

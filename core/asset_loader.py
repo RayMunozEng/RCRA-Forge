@@ -218,6 +218,39 @@ def _resolve_model_material_names(model, raw: bytes) -> None:
         print(f"[asset_loader] material path resolution failed: {ex}")
 
 
+def load_fur_environment(tex_data: dict, toc_parser):
+    """Load the recovered Hair defaults for both the app and GPU smoke tool.
+
+    Returns ``(cube_mips, brdf_rg_half, brdf_size)`` or None for non-fur
+    models. Missing/undecodable resources raise so verification cannot silently
+    claim the normal lighting path ran without its environment.
+    """
+    if not any(
+        isinstance(slots, dict) and 'fur_control' in slots
+        for slots in (tex_data or {}).values()
+    ):
+        return None
+
+    from core.fur_resources import (
+        DEFAULT_HAIR_ENVIRONMENT_ASSET_ID,
+        default_hair_brdf_rg_half,
+    )
+    from core.texture import TextureParser
+
+    probe_entry = toc_parser.find_entry(DEFAULT_HAIR_ENVIRONMENT_ASSET_ID)
+    if probe_entry is None:
+        raise RuntimeError("Recovered Hair environment is absent from TOC")
+    probe = TextureParser(toc_parser.extract_asset(probe_entry)).parse()
+    if probe.fmt != 0x5F:
+        raise RuntimeError('Recovered Hair environment is not BC6U')
+    from core.cube_texture import CubeMipChain, validate_cube_mips
+    cube_mips = CubeMipChain(probe.compressed_cube_mips(), 'bc6u')
+    if not cube_mips:
+        raise RuntimeError("Recovered Hair environment has no BC6 cube payload")
+    validate_cube_mips(cube_mips)
+    return cube_mips, default_hair_brdf_rg_half(), (64, 64)
+
+
 def load_model_textures(model, entry, toc_parser, lookup, on_texture=None) -> dict:
     """
     Resolve and decode all PBR texture slots for a parsed ModelAsset.

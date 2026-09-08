@@ -1,0 +1,782 @@
+[
+  {
+    "path": "unreal/fur/audit_native_ear.py",
+    "bytes": 5681,
+    "sha256": "71c8790fb552ce07433b693c0843dae27c3f1924cce4e20d7eb2ab7685df965c"
+  },
+  {
+    "path": "unreal/fur/audit_native_strand_draws.py",
+    "bytes": 2533,
+    "sha256": "bbd5fe3200bef65567f8da2ccfb1c18e4646fb0a0d897df1b656e7ef9f20f046"
+  },
+  {
+    "path": "unreal/fur/audit_native_strand_shaders.py",
+    "bytes": 2099,
+    "sha256": "900e911bcaf5a4c6c63129ac9ebd11437f43310e327134bbf51450b071882325"
+  },
+  {
+    "path": "unreal/fur/audit_windows_atoms.py",
+    "bytes": 2301,
+    "sha256": "abd1c3520f0bf3053b27ff6e32e2670d7d9d6f0a5c896f5670dfb02112f45766"
+  },
+  {
+    "path": "unreal/fur/capture_demo.py",
+    "bytes": 3320,
+    "sha256": "17751245a4f0c834e950f6a2a67f4fea246177a60da0c6dd937469284bcb31d8"
+  },
+  {
+    "path": "unreal/fur/capture_denoise_kernel.py",
+    "bytes": 1325,
+    "sha256": "27cf4da491818a00ded67a3c75eb12f4116476a2e69ac11b7aaf4857916a1ee9"
+  },
+  {
+    "path": "unreal/fur/capture_dry_cycle_sheep.py",
+    "bytes": 253,
+    "sha256": "3e7fd6e952f3ea23ffb0eabe1a15a75e90d11b2cd667f47f120a41646d721b8a"
+  },
+  {
+    "path": "unreal/fur/capture_dry_multilight.py",
+    "bytes": 4744,
+    "sha256": "f088b825ed0f4bb6813a15a90ebb8ee9c2e3ced5d17aa560f30a1ad645dbea03"
+  },
+  {
+    "path": "unreal/fur/capture_dry_multilight_sheep.py",
+    "bytes": 167,
+    "sha256": "44c9d1151734eba0ecde7c970f7931f9fbf9923049bbb02660aaead0e7637994"
+  },
+  {
+    "path": "unreal/fur/capture_forge_environment.py",
+    "bytes": 9757,
+    "sha256": "f21a46ae96a4b927537eda9320cd2e5d36f40c826991378c8967ef9da2ab6c19"
+  },
+  {
+    "path": "unreal/fur/capture_forge_reference.py",
+    "bytes": 1452,
+    "sha256": "f2179092b1ef0efaebedd86eeabe94850f95098ef8d44b7a151a4c9759c4d893"
+  },
+  {
+    "path": "unreal/fur/capture_fur_surface_live.py",
+    "bytes": 3348,
+    "sha256": "0e5aaf536feabce330699de4caf05b8d05ddf9e509f37b5db9d6836efeb89fc4"
+  },
+  {
+    "path": "unreal/fur/capture_fur_surface_outputs.py",
+    "bytes": 266,
+    "sha256": "c3235871f65551d867e74f08c13d2f9cef1812546faa7efa5440e72cf504941e"
+  },
+  {
+    "path": "unreal/fur/capture_fur_surface_ratchet.py",
+    "bytes": 202,
+    "sha256": "90846cacaa9c66b91385dc72b355bdfce328fcde22a050cd25daec6243f2da68"
+  },
+  {
+    "path": "unreal/fur/capture_mapped_fur.py",
+    "bytes": 3224,
+    "sha256": "cd45eb3998b8e1cb170d9347377028532e490c6fd3bf3fb3103c6f75e89138b8"
+  },
+  {
+    "path": "unreal/fur/capture_recovered.py",
+    "bytes": 3683,
+    "sha256": "008512debc1cbb6d0b3350247d4f3eb2329a8ae9ec20028557b296a3e8d29162"
+  },
+  {
+    "path": "unreal/fur/capture_reference_dry_motion.py",
+    "bytes": 3158,
+    "sha256": "90c65495550ec529c81701e2b454dca2a3bca2ab9df415b59792d96e465bb238"
+  },
+  {
+    "path": "unreal/fur/capture_reference_dynamics.py",
+    "bytes": 8874,
+    "sha256": "953dc4f5d041ed1765c08dad7ad2b990c8e5a2a786b965ae7bdc90ed05a5f6fb"
+  },
+  {
+    "path": "unreal/fur/capture_reference_ear_boundary.py",
+    "bytes": 2908,
+    "sha256": "0746031535645b456530c2595c52900dc58f243959ed240626fb64814a978bdc"
+  },
+  {
+    "path": "unreal/fur/capture_reference_ear_contours.py",
+    "bytes": 2665,
+    "sha256": "e28c5681c7fc4960c47ccb1d61dac22e6f188682095d328f90857507704ffbf0"
+  },
+  {
+    "path": "unreal/fur/capture_reference_ear_facing.py",
+    "bytes": 2880,
+    "sha256": "3a04ec99d6820fb6ebdb4b7ab6b7b5698c68eb17cf63f1c7d669076d7c2d3b26"
+  },
+  {
+    "path": "unreal/fur/capture_reference_ear_resampling.py",
+    "bytes": 2849,
+    "sha256": "1ee8004a5af55d6dd832afe334ab600bb124d93db7ff8e123f44321991642eb2"
+  },
+  {
+    "path": "unreal/fur/capture_reference_ear_sequence.py",
+    "bytes": 5166,
+    "sha256": "4be66c0501e500784f93ab262d9c756c0a166c865f3400b60cbc921413af1d43"
+  },
+  {
+    "path": "unreal/fur/capture_reference_ear_spacing.py",
+    "bytes": 2879,
+    "sha256": "0a60d774fa475fa7670fffa93429c4bc7aa429d38871d6a5a13e4533f77c83ad"
+  },
+  {
+    "path": "unreal/fur/capture_reference_environment.py",
+    "bytes": 4561,
+    "sha256": "1c402006ba4b602643c24b679f528a3d1e231cc88d999d80dc435f20eadb21e8"
+  },
+  {
+    "path": "unreal/fur/capture_reference_environment_controls.py",
+    "bytes": 3174,
+    "sha256": "6508bbbebdb40518edd14a444ece1be9bc1a0d54ffb388f9c102259221d8598a"
+  },
+  {
+    "path": "unreal/fur/capture_reference_environment_sampling.py",
+    "bytes": 3751,
+    "sha256": "e2118a001396d170363c3d8fe23c3b07c625654ec6ba03976f434b868da900a0"
+  },
+  {
+    "path": "unreal/fur/capture_reference_filtered_shadows.py",
+    "bytes": 313,
+    "sha256": "5cdb8afb9cfb803d399aca5e39d0aee5966191c2494fefa80ec21b05777305aa"
+  },
+  {
+    "path": "unreal/fur/capture_reference_fur.py",
+    "bytes": 4236,
+    "sha256": "aa5c90667fac5304f423ad3924df2183906316321189c326d753f0a6205e18b1"
+  },
+  {
+    "path": "unreal/fur/capture_reference_fur_wind_accuracy.py",
+    "bytes": 5928,
+    "sha256": "13a4c6dd0a603af6bd8bba8d946e6a893bed2dfdc4b9360e49a1c2de358b1e32"
+  },
+  {
+    "path": "unreal/fur/capture_reference_hair.py",
+    "bytes": 1662,
+    "sha256": "e04575ae7c6b4c92f5492d3b63e2eeb9e692b2854f9c840a7a71a48ede6001e2"
+  },
+  {
+    "path": "unreal/fur/capture_reference_ratchet_dynamics.py",
+    "bytes": 231,
+    "sha256": "d6f0d2d148937683573f4984932a724849ef58f988f1c2febb6fb08af7843d22"
+  },
+  {
+    "path": "unreal/fur/capture_reference_scene.py",
+    "bytes": 6550,
+    "sha256": "6006f7299755f82903edbb1b2af55826d316a2bb1926a7a1bf9468aebf36730b"
+  },
+  {
+    "path": "unreal/fur/capture_reference_self_shadows.py",
+    "bytes": 2912,
+    "sha256": "b9cb7fd223b895818f606122923d1baf67b4ca31224105604c8f4e3618615786"
+  },
+  {
+    "path": "unreal/fur/capture_reference_shadows.py",
+    "bytes": 4169,
+    "sha256": "1497116a45259770dd9e6e210715676ef7ca0b2d7bf8ea722a0938a305c28aca"
+  },
+  {
+    "path": "unreal/fur/capture_reference_sheep.py",
+    "bytes": 176,
+    "sha256": "cbd432f2d13ce52021a67c68f636c14261026c2513ca541cc7042b961b41a088"
+  },
+  {
+    "path": "unreal/fur/capture_reference_sheep_dry_motion.py",
+    "bytes": 164,
+    "sha256": "c7873fed40d14b72be855a61f3c6f3f7ca4ae756ed939d7d7423855fc1a0f917"
+  },
+  {
+    "path": "unreal/fur/capture_reference_sheep_dynamics.py",
+    "bytes": 229,
+    "sha256": "ada77cce10f666adf5e7ece3c66311b988c3233fb3f5d115cc404cc26325f8db"
+  },
+  {
+    "path": "unreal/fur/capture_reference_sheep_environment.py",
+    "bytes": 170,
+    "sha256": "0c4d23b0a95c5834e493251b27b1a46405e38a1c7af8e209216a86905ee060d4"
+  },
+  {
+    "path": "unreal/fur/capture_reference_sheep_environment_inputs.py",
+    "bytes": 3315,
+    "sha256": "628bb031c3e6b63332cc7e8e1d95b9c65685dd5d5e2ed395026016deb72ab2a7"
+  },
+  {
+    "path": "unreal/fur/capture_reference_sheep_motion.py",
+    "bytes": 3402,
+    "sha256": "39ff62d2ac7574f83c0e4e642fc388f4ebe0eae70b8e05ec528f82edad2a6f68"
+  },
+  {
+    "path": "unreal/fur/capture_reference_sheep_velocity_float.py",
+    "bytes": 2949,
+    "sha256": "c10d13dd9652e21cde72664b9961e79fd121f0783c12339084241a1bc47352ba"
+  },
+  {
+    "path": "unreal/fur/capture_reference_sheep_viewport.py",
+    "bytes": 230,
+    "sha256": "4d888aff96da30ab500ab88c5608cdd2fbcd4b7ce8719448cfb2af1f4f2c1ee0"
+  },
+  {
+    "path": "unreal/fur/capture_reference_skeletal_accuracy.py",
+    "bytes": 3941,
+    "sha256": "66e2da3dd78ff9cc4e34db17d2f9184eba1b9e775e2eca35f4fbe2eb5e93e3f0"
+  },
+  {
+    "path": "unreal/fur/capture_reference_skeletal_velocity.py",
+    "bytes": 2823,
+    "sha256": "6978066e3c9636aa9d58b0a541790276f5d46c0add47b8c33970ddb28da89494"
+  },
+  {
+    "path": "unreal/fur/capture_reference_skeletal_wind.py",
+    "bytes": 3246,
+    "sha256": "0d6947f873f8417d15287607ddf09256bc1d890aa828b37dc64852a5776e865c"
+  },
+  {
+    "path": "unreal/fur/capture_reference_stream.py",
+    "bytes": 2638,
+    "sha256": "410d7a440951f2cdc895aafee82a6e1b744fd9ebaa9e2e9680e3666ee56daa20"
+  },
+  {
+    "path": "unreal/fur/capture_reference_velocity_calibration.py",
+    "bytes": 4804,
+    "sha256": "4155d36f0e6a8f5ca442f4dc9402c3b5b5d7fdb12d144ed7c8dacdacc6db87e4"
+  },
+  {
+    "path": "unreal/fur/capture_reference_viewport.py",
+    "bytes": 4132,
+    "sha256": "2a8f6668ec936b5978fb3939dfb24eda38b6befd4d4cf064e964ae2fcfadd1a0"
+  },
+  {
+    "path": "unreal/fur/capture_skeletal_fur.py",
+    "bytes": 4080,
+    "sha256": "3248ac7726f102826aec07d20bfe73e0f64671d9db040fd9128439d1efe0cd47"
+  },
+  {
+    "path": "unreal/fur/CHECKPOINT.md",
+    "bytes": 85131,
+    "sha256": "d31eeac4bdee3e1cfed3fd7c0c87b25cc8d9905b0309ad1502bbbe5bd6a98cd1"
+  },
+  {
+    "path": "unreal/fur/compare_ear_boundary.py",
+    "bytes": 2149,
+    "sha256": "ed80ad9631e973cfa70cec05871de2bae13f6dea11cfd410efdce534080b2a7d"
+  },
+  {
+    "path": "unreal/fur/compare_ear_post.py",
+    "bytes": 5021,
+    "sha256": "665883e5923c9e7b8c31ea074d4224a0e54369bf932121ccb158b06efdb5e1ad"
+  },
+  {
+    "path": "unreal/fur/compare_ear_sequence.py",
+    "bytes": 5546,
+    "sha256": "6f9de2a307afe1aef111d81d4e949f910dfbc22c298a41995c3a285bb8c401d9"
+  },
+  {
+    "path": "unreal/fur/compare_ear_spacing.py",
+    "bytes": 1963,
+    "sha256": "a0e60ad290deaacb2372179be97b26a8523aba1bb05efb3831fb941446176479"
+  },
+  {
+    "path": "unreal/fur/compare_forge_environment.py",
+    "bytes": 2494,
+    "sha256": "1fb1dcd4465d662919e7ec04764e7e6116e31e87784f9db476abd1e562b8d47f"
+  },
+  {
+    "path": "unreal/fur/compare_reference.py",
+    "bytes": 1401,
+    "sha256": "f7546abb72de40f4c528ec8d1ea97cc54e7d752eed62dc8568a808b532e8b18f"
+  },
+  {
+    "path": "unreal/fur/compare_sheep_lighting.py",
+    "bytes": 2595,
+    "sha256": "c42aa74096bcedbfc6144b8c835253d1cad22a28e5d34cfbc33a247745e61a74"
+  },
+  {
+    "path": "unreal/fur/compare_sheep_lighting_inputs.py",
+    "bytes": 2328,
+    "sha256": "be7712abbb705b7b40562db9202f9b8444eb9c520bd5f7ef73d2d0774755e1c2"
+  },
+  {
+    "path": "unreal/fur/convert_reference_fbx.py",
+    "bytes": 3045,
+    "sha256": "1c7a4049a0868e6ea425504e54d0f3f38448bdf6092e27d1789266c9b44655ab"
+  },
+  {
+    "path": "unreal/fur/create_map_fixtures.py",
+    "bytes": 983,
+    "sha256": "8cdb2f88dae0c64224841628af18662e5ffc1dbe48aa4c077ed634d4177719d3"
+  },
+  {
+    "path": "unreal/fur/create_reference_material.py",
+    "bytes": 510,
+    "sha256": "926eba01b5937f979d44c8c44530861ad5a5f70cfb042269240dffb8de6abc88"
+  },
+  {
+    "path": "unreal/fur/DRY_FUR_COMPLETION.md",
+    "bytes": 3581,
+    "sha256": "3b8f682c3ffbd562d47411e568e5f291d8eb6086f27680cda290a4560fbfbc98"
+  },
+  {
+    "path": "unreal/fur/EAR_CONTOURS.md",
+    "bytes": 17751,
+    "sha256": "bccca061f667c8903e2c11312ac30067115a351d93088c9826ddcb437198a6e6"
+  },
+  {
+    "path": "unreal/fur/ear_scene_fixture.py",
+    "bytes": 5741,
+    "sha256": "0f092db696634727118fe65ac3a34b9257ee69bb1c40729fcd394f1c35ad1acb"
+  },
+  {
+    "path": "unreal/fur/ENVIRONMENT_NEXT.md",
+    "bytes": 3239,
+    "sha256": "90c230dd1d984db27ce9b9a75e666fa3b2ec88668f91aba346ba492af49c9332"
+  },
+  {
+    "path": "unreal/fur/export_ratchet_reference.py",
+    "bytes": 6275,
+    "sha256": "402243c427564cf283cf3bd539fa7c45190be8b26cfb287bee3cffa682ec3ff4"
+  },
+  {
+    "path": "unreal/fur/export_recovered_core.py",
+    "bytes": 4758,
+    "sha256": "10fd9f1f8d61fec75d7df6b5fd7bdf3f146dad7b5e658528f56f48d5637901db"
+  },
+  {
+    "path": "unreal/fur/export_recovered_denoise.py",
+    "bytes": 1625,
+    "sha256": "75c9a1f54f06402c7f95471265a235ede8eab22f062a5ed747eaf69cc38101b8"
+  },
+  {
+    "path": "unreal/fur/export_reference_lighting.py",
+    "bytes": 7454,
+    "sha256": "1d8908df997bc0060d2d8129827901fbd54a16875b80cccb9e7137f2ea10d1e3"
+  },
+  {
+    "path": "unreal/fur/FORGE_COMPARISON.md",
+    "bytes": 2694,
+    "sha256": "4fa07387daed49db0eb33a6c17714d9d8cb71f96b3be7470390bd2185e5b977c"
+  },
+  {
+    "path": "unreal/fur/FUR_FILTER_INTEGRATION.md",
+    "bytes": 3870,
+    "sha256": "e85b6487b3af7ee0422b6f70d6d1b023a63c020e0fabb5086bd7390299b5279a"
+  },
+  {
+    "path": "unreal/fur/import_recovered_array.py",
+    "bytes": 2127,
+    "sha256": "be29b30f086c2da2aa348229a53f6f6d071ad52fc540c7af05f7c9f2f9020ba1"
+  },
+  {
+    "path": "unreal/fur/inspect_steam_desktop.py",
+    "bytes": 1020,
+    "sha256": "a7325a5e53b36bf311c67143396552ab3dc6cc78dd6e27eaac0f2e012faefabc"
+  },
+  {
+    "path": "unreal/fur/inventory_native_thumbnails.py",
+    "bytes": 2743,
+    "sha256": "3573c6ac26931e965e6af6b8d15cc0ae8d31e62b12e4edd9a8796640c1c8ab63"
+  },
+  {
+    "path": "unreal/fur/NATIVE_EAR_AUDIT.md",
+    "bytes": 5514,
+    "sha256": "0c8f1393edce2537571fc81aa812b10b39fdd5a08197a7a534b8650cc7b7ff82"
+  },
+  {
+    "path": "unreal/fur/NATIVE_HEAP_TRACE.md",
+    "bytes": 9070,
+    "sha256": "e2d3648fe8c66cfcf8cde4fcbcf02bda07a2be90528e74ebdcef2aff9a11e956"
+  },
+  {
+    "path": "unreal/fur/package_maps_preview.py",
+    "bytes": 11664,
+    "sha256": "0c4a0b396638600348fab1bc536039fa55124f0aa8033efb5be9e78bc5babd66"
+  },
+  {
+    "path": "unreal/fur/package_plugin.py",
+    "bytes": 2197,
+    "sha256": "a576f13f2a95161c066c70a77154f733e1da687cddf7c9988c9e108733eb39d5"
+  },
+  {
+    "path": "unreal/fur/package_shell_count_fix.py",
+    "bytes": 3730,
+    "sha256": "c0ba9cbf632d8ad35fbdba7115ae26f4b6441ee5b2c8b6fd0686fe03a1f35039"
+  },
+  {
+    "path": "unreal/fur/prepare_environment_inputs.py",
+    "bytes": 1739,
+    "sha256": "4fb9c3f82147bfe9855f43797bf71b23adff4e84b372073d9a3a226aedf49b20"
+  },
+  {
+    "path": "unreal/fur/prepare_reference_textures.py",
+    "bytes": 2133,
+    "sha256": "7d6bfac73b4f524de744aca845909bfed606918ed940a7722adcc01f1a60c678"
+  },
+  {
+    "path": "unreal/fur/probe_native_heap.py",
+    "bytes": 1906,
+    "sha256": "6b9a898ce0be138dec1bf5efc353ff22d59c44f2679c39b4bd3f7183c7c64cb9"
+  },
+  {
+    "path": "unreal/fur/run_check.py",
+    "bytes": 12845,
+    "sha256": "cc2662b6478b8993b688ea4e44f126682ac501a6bf01de5a5a67eefe53e245c8"
+  },
+  {
+    "path": "unreal/fur/run_forge_environment_check.py",
+    "bytes": 2836,
+    "sha256": "5701691cb4a1bbec09eb65dee7ace86557b79d43d59421da1a26a36fd5b6ea17"
+  },
+  {
+    "path": "unreal/fur/run_forge_reference.py",
+    "bytes": 1057,
+    "sha256": "57121c0594c304c562d74834d730df56d9de8fcabe4a11f49e269c7cab1acf16"
+  },
+  {
+    "path": "unreal/fur/run_lowmemory_native.py",
+    "bytes": 3313,
+    "sha256": "4fea4b352a577aa9f8f4d8bf690f98721e683834a2e5644a395e58af87e57671"
+  },
+  {
+    "path": "unreal/fur/save_recovered_demo.py",
+    "bytes": 2086,
+    "sha256": "7bd2dfb2e0337242b51d9058302814ac377dcd86e1211c7ef720b1bad57b39e1"
+  },
+  {
+    "path": "unreal/fur/scan_memory_config.py",
+    "bytes": 2678,
+    "sha256": "494c2f6df5a186ed0d7a2b581f116581ac7e9bcaa54b09d85c5c7633aaa5c39e"
+  },
+  {
+    "path": "unreal/fur/trace_native_heap_static.py",
+    "bytes": 1879,
+    "sha256": "966ea6bb71641537ebc1b7ffa2b586bd9e6229b693eb96c16eb14cb32c04b2da"
+  },
+  {
+    "path": "unreal/fur/validate_dry_multilight.py",
+    "bytes": 2900,
+    "sha256": "a8f07974a2a3ed1c7fd4d8f8081ed1277b09d59956cc4ddfbb87efd81b95b875"
+  },
+  {
+    "path": "unreal/fur/validate_in_editor.py",
+    "bytes": 2975,
+    "sha256": "f086715cb536710ab482144d785c3dff0fad48df8b4bd5554c44366375cb88d6"
+  },
+  {
+    "path": "unreal/fur/validate_mapped_fur.py",
+    "bytes": 3926,
+    "sha256": "1440884019d282ac0dbfad9ee9904fe6e0b9032c20f9f0c9251cf4ec437c6411"
+  },
+  {
+    "path": "unreal/fur/validate_reference_fur.py",
+    "bytes": 7180,
+    "sha256": "5400bcc6e42bb9faefda8bcb41c387a2fdda9fac32cfb87f134bdbf05e4d4e15"
+  },
+  {
+    "path": "unreal/fur/validate_reference_sheep.py",
+    "bytes": 175,
+    "sha256": "b4404105b5c36429801a6624b6f75b7f0740d2c1125f4113c0291b855d13686b"
+  },
+  {
+    "path": "unreal/fur/validate_skeletal_fur.py",
+    "bytes": 4604,
+    "sha256": "d6be071bf3956c84f3e6272a851c076739f96cbb036ca3e23851d83ac5314190"
+  },
+  {
+    "path": "unreal/fur/ValidationProject/FurValidation.uproject",
+    "bytes": 679,
+    "sha256": "b6ae6e21fe47aaab20a983268a1e006ab0b586b3f18f5cf83a707658b5f11115"
+  },
+  {
+    "path": "unreal/fur/ValidationProject/Source/FurValidation/FurDenoiseTest.cpp",
+    "bytes": 3355,
+    "sha256": "efbecafd7a93e335d63ea5a13fd44c79a349653ac94c8c12135f1fff9d729b1a"
+  },
+  {
+    "path": "unreal/fur/ValidationProject/Source/FurValidation/FurSkeletalProbe.cpp",
+    "bytes": 2114,
+    "sha256": "83391ad5e69279d589d76fa9fb8230ff24ea2886595bb34a862e979934b8bded"
+  },
+  {
+    "path": "unreal/fur/ValidationProject/Source/FurValidation/FurSurfaceReadback.cpp",
+    "bytes": 9398,
+    "sha256": "86039ba665dd7e7697ad3e37c96d9d3c172e3642c69e342cb416994f856507cf"
+  },
+  {
+    "path": "unreal/fur/ValidationProject/Source/FurValidation/FurValidation.Build.cs",
+    "bytes": 631,
+    "sha256": "e0e6e923562f3fa7ff359b5ffb2e72880097c91058ad34ea6b8f0d57f0cb0976"
+  },
+  {
+    "path": "unreal/fur/ValidationProject/Source/FurValidation/FurValidation.cpp",
+    "bytes": 122,
+    "sha256": "905b01ce1df0521413e53501ca26e209abf496a74b052b01063d040259fa6ecc"
+  },
+  {
+    "path": "unreal/fur/ValidationProject/Source/FurValidation/FurVelocityReadback.cpp",
+    "bytes": 4174,
+    "sha256": "02537581dd8a2efa0ff2236f9ec164ae9f1c3d803955dd674b934c9313854430"
+  },
+  {
+    "path": "unreal/fur/ValidationProject/Source/FurValidation/FurViewportProbe.cpp",
+    "bytes": 4565,
+    "sha256": "ef8704d57d60149d6e841fd54d66ce4cf654dd9c2ee9e30da4552e6d7bd7183d"
+  },
+  {
+    "path": "unreal/fur/ValidationProject/Source/FurValidation/FurViewportProbe.h",
+    "bytes": 1721,
+    "sha256": "6004921ffbbc802e8ba882b84fd898fa140bc7bce0f31e17d5b45aee6de56656"
+  },
+  {
+    "path": "unreal/fur/ValidationProject/Source/FurValidation.Target.cs",
+    "bytes": 319,
+    "sha256": "7eaf33f773ea968cf353c42982ef27dc3837b3e19d591a7854e0e05850295026"
+  },
+  {
+    "path": "unreal/fur/ValidationProject/Source/FurValidationEditor.Target.cs",
+    "bytes": 333,
+    "sha256": "c267fa496323efe057bb516927449c6042e2104e7aa41c7baa0d525cd0725be9"
+  },
+  {
+    "path": "unreal/fur/verify_dry_motion.py",
+    "bytes": 3291,
+    "sha256": "f93638b775ce9e59c620f443312ffbb00899c3b9c48d8a1129212bc00e87bb67"
+  },
+  {
+    "path": "unreal/fur/verify_dry_multilight.py",
+    "bytes": 2963,
+    "sha256": "68e12251b9c3b8915653179789c9b2bd04953af53109e6b9338245f2f04945e7"
+  },
+  {
+    "path": "unreal/fur/verify_dry_temporal_schedule.py",
+    "bytes": 1176,
+    "sha256": "dd9ef1e62f6fc0c4fb430a6788a714f9b410022caa26a4f04ab52d299981c017"
+  },
+  {
+    "path": "unreal/fur/verify_dynamics.py",
+    "bytes": 3012,
+    "sha256": "66b0dfcd32f4209a48cf1d97dd47a04a1e45a81eb2f4694825ae696948f80021"
+  },
+  {
+    "path": "unreal/fur/verify_environment.py",
+    "bytes": 2069,
+    "sha256": "c72875f063b1edf1fc808186cf5350bb67f2ae9bc6362669bb0712685ad179de"
+  },
+  {
+    "path": "unreal/fur/verify_environment_controls.py",
+    "bytes": 1403,
+    "sha256": "5756909671626ea3053f84cb06ba1be3e5e716a80a20713f9a5ce06e4aa1162e"
+  },
+  {
+    "path": "unreal/fur/verify_environment_sampling.py",
+    "bytes": 1603,
+    "sha256": "81e1f2d4b244bd68ba30a5da8daa6d650afdb91490b1516a86a234889ce3191c"
+  },
+  {
+    "path": "unreal/fur/verify_filtered_shadows.py",
+    "bytes": 2919,
+    "sha256": "f049c8d1a1bc889a6621b8ec283c0c237f24a3d7ef22139b643d0d1cd2d23561"
+  },
+  {
+    "path": "unreal/fur/verify_fur_surface_live.py",
+    "bytes": 6088,
+    "sha256": "398c51b444dea3b62def382e6e0057e21b7096a7ea9573d2277ee2dff945fc32"
+  },
+  {
+    "path": "unreal/fur/verify_fur_wind_accuracy.py",
+    "bytes": 5361,
+    "sha256": "a90877990b5aa6ec9f2f0e9a91c640e3c8f2f455f0415751bce6775d8838cc8a"
+  },
+  {
+    "path": "unreal/fur/verify_scene_images.py",
+    "bytes": 1579,
+    "sha256": "95f252269b08d13352fe5dbee6fc6695471c9a9078ea8c64c357fbe58bc0d246"
+  },
+  {
+    "path": "unreal/fur/verify_sheep_motion.py",
+    "bytes": 5753,
+    "sha256": "be4ceada5c0bbe955a742f2cc8a89a1bb387e60cfb7eb76e641e44e9e6e9fd90"
+  },
+  {
+    "path": "unreal/fur/verify_sheep_srgb_fix.py",
+    "bytes": 3198,
+    "sha256": "f8a65b6b1cc341800b1855586694db3c47323098bfc3d3284160235e9145d75c"
+  },
+  {
+    "path": "unreal/fur/verify_sheep_velocity_float.py",
+    "bytes": 4475,
+    "sha256": "31be55b2bc653b0e59fb05bba0834e1e30908a9de9733ed8aad2128529cc9c19"
+  },
+  {
+    "path": "unreal/fur/verify_skeletal_accuracy.py",
+    "bytes": 4582,
+    "sha256": "e1df72256120881130302fb1d7dcd6cd587f41e484fe4265abc2cba7d6926df2"
+  },
+  {
+    "path": "unreal/fur/verify_skeletal_velocity.py",
+    "bytes": 2970,
+    "sha256": "9b67e5c8c0016fe53911c1287dae0d197516ae24da9b470408b302e07ef8aec6"
+  },
+  {
+    "path": "unreal/fur/verify_skeletal_wind.py",
+    "bytes": 3320,
+    "sha256": "2fc62954dda92bbbe8323510994223b97de9b076e3b53069293e7c7f491612fb"
+  },
+  {
+    "path": "unreal/fur/verify_stream_shadows.py",
+    "bytes": 2547,
+    "sha256": "90d3c28471e6b5dd66086bc60a3ce74a622bc299ed2d9b4097526c30747f71f5"
+  },
+  {
+    "path": "unreal/fur/verify_temporal_phase.py",
+    "bytes": 1074,
+    "sha256": "be0d66dae7c48bd0a81625415fa81ffe2b23c550c7dc7e5ea18b79ece8864d3c"
+  },
+  {
+    "path": "unreal/fur/verify_velocity_calibration.py",
+    "bytes": 2821,
+    "sha256": "50ecf67c1371415c30d8d8a648327484d8ff312004f1dc3da78ed8628fe5d421"
+  },
+  {
+    "path": "unreal/fur/verify_viewport_history.py",
+    "bytes": 1770,
+    "sha256": "ed43b0e7a0f666aa82bbf7c6eb4957c459fbac867b8ed1c6c97c7cb120337f1b"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/Content/Python/create_fur_material.py",
+    "bytes": 4488,
+    "sha256": "58bfd1c7f0885f09fb5c46ca92c8b64dc16c763201a4b85f7f2cba7ec31a8f3f"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/Content/Python/create_recovered_material.py",
+    "bytes": 8603,
+    "sha256": "fc6f6d15dad599950a5cce3170738d7be2ad6ceab4ba25e674376a6b47d71414"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/Content/Python/create_scene_fur.py",
+    "bytes": 14895,
+    "sha256": "e2e09d8ede7c67719db375624c0613c14b16d22085a03e0774c8db0e6bcc7e51"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/FurAuthoring.uplugin",
+    "bytes": 371,
+    "sha256": "75bcd26e9908b62f4a84b761b1e62ea5630f10a31fe4df9ad597b8e8a1e5858c"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/README.md",
+    "bytes": 17384,
+    "sha256": "35b7240d0dbb3ab1bb61576d6573f6693f5c40a99f8a428cd88f5ca68f4ace2c"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/Shaders/FurActiveTiles.usf",
+    "bytes": 518,
+    "sha256": "aca060037be134f367692789b1b8ae856c162a06dcb295d11cbbc336baf1ecac"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/Shaders/FurAuthoring.ush",
+    "bytes": 1654,
+    "sha256": "195f7fae205c6d92e334ba952684219969b62cb61baf6a875328663551408b79"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/Shaders/FurDenoise.usf",
+    "bytes": 3188,
+    "sha256": "6c2c54996c5de6a917b445ef831619cbabe644c448e7fea539516b45ed51eae5"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/Shaders/FurSceneShadow.ush",
+    "bytes": 1425,
+    "sha256": "20d071597ae8299895e1a07e3e626fb2c84889209a9e23a8c100bf7064ee4131"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/Shaders/FurSurface.usf",
+    "bytes": 1692,
+    "sha256": "073ed8dc1d49d603afc69ab16f03372dc4250d35c9e9a439bff43692d4e74ca7"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/Shaders/RecoveredFurAdapter.ush",
+    "bytes": 4915,
+    "sha256": "0fe051f23f595971e46e029d39ac3b49d8e200d161e8ccddea53ac4f96e04dec"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/Shaders/RecoveredFurCore.ush",
+    "bytes": 11409,
+    "sha256": "c7cc9ea5dbb0c6c200f11e3380c0389c4b4160d4eebd8681d1b1da12e87d06a9"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/Shaders/RecoveredFurDenoise.ush",
+    "bytes": 5449,
+    "sha256": "337fc8a7e050ec3849e06262d20afe70806c1bc74ca304185c80178153c3047d"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/Shaders/ReferenceHairLighting.ush",
+    "bytes": 16941,
+    "sha256": "a3bcb37143e05486c1403c5aea6444c67bb5698162fb9130be7349289116b818"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/Source/FurAuthoring/FurAuthoring.Build.cs",
+    "bytes": 619,
+    "sha256": "32ce5f318d67911f279e1ae1e4f861157739957b2e29925719d16999cbcb4fb1"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/Source/FurAuthoring/Private/FurAuthoringActor.cpp",
+    "bytes": 5837,
+    "sha256": "09bf2d88d68914cb7829654ea6b7c22339ff5ec88c51736c8a800595ebd30294"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/Source/FurAuthoring/Private/FurAuthoringModule.cpp",
+    "bytes": 1141,
+    "sha256": "a27654e5431effe4bc423d6195af647e365785b46bfb862462903bedb8261592"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/Source/FurAuthoring/Private/FurDenoise.cpp",
+    "bytes": 5467,
+    "sha256": "a143f4f6220dbc81184c03af59c7f99412986b4ad956d8031f99d7dcf398ca6a"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/Source/FurAuthoring/Private/FurLightingController.cpp",
+    "bytes": 12911,
+    "sha256": "c4dcaf4a7485dd6fd116b2dee5ef2be860affdcfbd1715c504149dd29ad242f9"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/Source/FurAuthoring/Private/FurSurfacePass.cpp",
+    "bytes": 6328,
+    "sha256": "47d04dc9a387cfa6128057c1a3c95ad9f88cd963cafdd0fbb1ecee8e2fdc06af"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/Source/FurAuthoring/Private/MaterialExpressionFurSurfaceOutput.cpp",
+    "bytes": 1178,
+    "sha256": "271bd6d58ec4130b98e09a3066198ad65f26b7cfb95d481692b7dfda4104ae3e"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/Source/FurAuthoring/Private/SkeletalFurAuthoringActor.cpp",
+    "bytes": 4994,
+    "sha256": "74317721fd6a88350ea155380e2c08a41e6db3c4a69b53e8f852230790e2ff1f"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/Source/FurAuthoring/Public/FurAuthoringActor.h",
+    "bytes": 4770,
+    "sha256": "e263cbc6ac6a35deb70c9eeb0497a01f9f4cc7667e3b6130d3784871625919ac"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/Source/FurAuthoring/Public/FurDenoise.h",
+    "bytes": 1530,
+    "sha256": "dd6c7299be186af64e691da579d15ccffdf38600769fc44a9ecd12aa2fddb87d"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/Source/FurAuthoring/Public/FurLightingController.h",
+    "bytes": 4955,
+    "sha256": "e1ff6a8da5ae88dec50d36c9139dbac4bb1bc049ff2fe12cc602a58f829bfd00"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/Source/FurAuthoring/Public/FurSurfacePass.h",
+    "bytes": 1031,
+    "sha256": "87b5b5fafb5709c3ea1d2faf393c8f20d2f7b5d2367e416f33dc54c1cd16e598"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/Source/FurAuthoring/Public/MaterialExpressionFurSurfaceOutput.h",
+    "bytes": 1397,
+    "sha256": "f088c9e182902ac6aa0fd56b3c7520417b48b3c1d850a83d336f6ff39c2c46f4"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/Source/FurAuthoring/Public/SkeletalFurAuthoringActor.h",
+    "bytes": 1732,
+    "sha256": "1be93dafbd5892f6e4a411ba1e1c7eeec88ea723b31effb2ed5982f401921f76"
+  }
+]

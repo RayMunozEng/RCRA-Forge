@@ -1,0 +1,11 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "0.1.0",
+  "FriendlyName": "Fur Authoring",
+  "Description": "Editable shell fur for your static meshes, with grooming, wind and wetness.",
+  "Category": "Rendering",
+  "CanContainContent": true,
+  "IsBetaVersion": true,
+  "Modules": [{"Name": "FurAuthoring", "Type": "Runtime", "LoadingPhase": "PostConfigInit"}]
+}
