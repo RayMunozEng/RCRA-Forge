@@ -1,6 +1,7 @@
-"""Rebuild portable fur kernels and lossless DDS array from the verified Forge source.
+"""Rebuild portable fur kernels and lossless DDS array from this Forge checkout.
 
-Run with external/RCRA-Forge/.venv/Scripts/python.exe. No renderer is started.
+No renderer is started. Older outer-workspace layouts remain supported so the
+historical validation commands recorded in CHECKPOINT.md stay reproducible.
 """
 import ast
 import hashlib
@@ -11,7 +12,7 @@ import struct
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
-FORGE = ROOT / 'external/RCRA-Forge'
+FORGE = ROOT if (ROOT / 'ui/viewport.py').is_file() else ROOT / 'external/RCRA-Forge'
 PLUGIN = ROOT / 'unreal/plugins/FurAuthoring'
 OUT = ROOT / 'unreal/fur/recovered'
 

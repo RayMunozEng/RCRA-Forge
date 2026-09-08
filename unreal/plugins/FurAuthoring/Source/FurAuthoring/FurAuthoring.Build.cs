@@ -6,7 +6,9 @@ public class FurAuthoring : ModuleRules
     {
         PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
         PublicDependencyModuleNames.AddRange(new[] { "Core", "CoreUObject", "Engine" });
-        PrivateDependencyModuleNames.AddRange(new[] { "RenderCore", "RHI", "Renderer" });
+        PrivateDependencyModuleNames.AddRange(new[] { "Projects", "RenderCore", "RHI", "Renderer" });
+        PrivateIncludePaths.Add(Path.Combine(EngineDirectory, "Source/Runtime/Renderer/Private"));
+        PrivateIncludePaths.Add(Path.Combine(EngineDirectory, "Source/Runtime/Renderer/Internal"));
         string ShaderDir = Path.GetFullPath(Path.Combine(ModuleDirectory, "../../Shaders")).Replace('\\', '/');
         PrivateDefinitions.Add("FUR_AUTHORING_SOURCE_SHADER_DIR=TEXT(\"" + ShaderDir + "\")");
     }

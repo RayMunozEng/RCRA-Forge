@@ -2,9 +2,11 @@ from pathlib import Path
 dynamics_fixture=globals().get('surface_fixture','sheep')
 dynamics_material='M_FurSurface_'+dynamics_fixture+'_v2'
 fur_surface_outputs=True
+surface_filter_mode=globals().get('surface_filter_mode','probe')
 p=Path(__file__).with_name('capture_reference_dynamics.py')
 exec(compile(p.read_text(encoding='utf-8').split('labels=',1)[0],str(p),'exec'),globals())
-out=root/'recovered'/('fur-surface-live-'+dynamics_fixture);out.mkdir(exist_ok=True)
+surface_output_tag=('fur-surface-production-' if surface_filter_mode=='production' else 'fur-surface-live-')+dynamics_fixture
+out=root/'recovered'/surface_output_tag;out.mkdir(exist_ok=True)
 controller.enable_shadows=False
 fill=actors.spawn_actor_from_class(unreal.DirectionalLight,unreal.Vector(),unreal.MathLibrary.find_look_at_rotation(unreal.Vector(-1,1,.4),unreal.Vector()))
 rim=actors.spawn_actor_from_class(unreal.DirectionalLight,unreal.Vector(),unreal.MathLibrary.find_look_at_rotation(unreal.Vector(-.8,-1,.5),unreal.Vector()))
@@ -16,7 +18,8 @@ controller.fill_light=fill;controller.rim_light=rim;controller.refresh_lighting(
 started=time.monotonic();state=dict(last=started,busy=False,armed=False,done=False,stage=0,stage_time=started,rows=[])
 def stop():
  state['done']=True
- unreal.FurViewportProbe.set_surface_filter_enabled(False)
+ if surface_filter_mode=='production':command('r.FurAuthoring.Denoise 0')
+ else:unreal.FurViewportProbe.set_surface_filter_enabled(False)
  unreal.unregister_slate_post_tick_callback(state['handle'])
  unreal.EditorPythonScripting.set_keep_python_script_alive(False);command('QUIT_EDITOR')
 def tick(delta):
@@ -43,9 +46,11 @@ def tick(delta):
     stage=state['stage'];label={1:'unfiltered-a',2:'unfiltered-b',3:'filtered-a',4:'filtered-b'}[stage]
     row=json.loads(unreal.FurViewportProbe.capture(str(out/(label+'.png'))));row['label']=label
     state['rows'].append(row)
-    if stage==2:assert unreal.FurViewportProbe.set_surface_filter_enabled(True)
+    if stage==2:
+     if surface_filter_mode=='production':command('r.FurAuthoring.Denoise 1')
+     else:assert unreal.FurViewportProbe.set_surface_filter_enabled(True)
     if stage==4:
-     (out/'report.json').write_text(json.dumps(dict(status='complete',material=material.get_path_name(),frames=state['rows']),indent=2),encoding='utf-8')
+     (out/'report.json').write_text(json.dumps(dict(status='complete',filter_mode=surface_filter_mode,material=material.get_path_name(),frames=state['rows']),indent=2),encoding='utf-8')
      if globals().get('verify_kernel',False):
       import runpy
       runpy.run_path(str(root/'capture_denoise_kernel.py'))

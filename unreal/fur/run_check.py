@@ -1,11 +1,17 @@
 """Run a bounded isolated UE fur check with workspace-local temporary paths."""
 import argparse
+import os
 from pathlib import Path
 import subprocess
 import sys
 
 parser = argparse.ArgumentParser()
-parser.add_argument('script',choices=['capture_reference_ear_facing.py','capture_fur_surface_ratchet.py','capture_fur_surface_live.py','capture_fur_surface_outputs.py','capture_denoise_kernel.py','capture_dry_cycle_sheep.py','capture_dry_multilight.py','capture_dry_multilight_sheep.py','validate_dry_multilight.py','capture_reference_dry_motion.py','capture_reference_sheep_dry_motion.py','capture_reference_skeletal_wind.py','capture_reference_skeletal_accuracy.py','capture_reference_skeletal_velocity.py','capture_reference_fur_wind_accuracy.py','capture_reference_velocity_calibration.py','capture_reference_sheep_velocity_float.py','capture_reference_sheep_motion.py','capture_reference_sheep_environment_inputs.py','validate_mapped_fur.py','capture_mapped_fur.py','validate_skeletal_fur.py','capture_skeletal_fur.py','validate_reference_fur.py','capture_reference_fur.py','capture_reference_hair.py','capture_reference_scene.py','validate_reference_sheep.py','capture_reference_sheep.py','capture_reference_viewport.py','capture_reference_sheep_viewport.py','capture_reference_dynamics.py','capture_reference_ratchet_dynamics.py','capture_reference_sheep_dynamics.py','capture_reference_stream.py','capture_reference_shadows.py','capture_reference_filtered_shadows.py','capture_reference_self_shadows.py','capture_reference_environment.py','capture_reference_sheep_environment.py','capture_reference_environment_sampling.py','capture_reference_environment_controls.py','capture_reference_ear_contours.py','capture_reference_ear_sequence.py','capture_reference_ear_boundary.py','capture_reference_ear_resampling.py','capture_reference_ear_spacing.py'])
+parser.add_argument('script',choices=['capture_synthetic_production_filter.py','validate_production_filter_registration.py','capture_reference_ear_facing.py','capture_fur_surface_ratchet.py','capture_fur_surface_live.py','capture_fur_surface_production.py','capture_fur_surface_outputs.py','capture_denoise_kernel.py','capture_dry_cycle_sheep.py','capture_dry_multilight.py','capture_dry_multilight_sheep.py','validate_dry_multilight.py','capture_reference_dry_motion.py','capture_reference_sheep_dry_motion.py','capture_reference_skeletal_wind.py','capture_reference_skeletal_accuracy.py','capture_reference_skeletal_velocity.py','capture_reference_fur_wind_accuracy.py','capture_reference_velocity_calibration.py','capture_reference_sheep_velocity_float.py','capture_reference_sheep_motion.py','capture_reference_sheep_environment_inputs.py','validate_mapped_fur.py','capture_mapped_fur.py','validate_skeletal_fur.py','capture_skeletal_fur.py','validate_reference_fur.py','capture_reference_fur.py','capture_reference_hair.py','capture_reference_scene.py','validate_reference_sheep.py','capture_reference_sheep.py','capture_reference_viewport.py','capture_reference_sheep_viewport.py','capture_reference_dynamics.py','capture_reference_ratchet_dynamics.py','capture_reference_sheep_dynamics.py','capture_reference_stream.py','capture_reference_shadows.py','capture_reference_filtered_shadows.py','capture_reference_self_shadows.py','capture_reference_environment.py','capture_reference_sheep_environment.py','capture_reference_environment_sampling.py','capture_reference_environment_controls.py','capture_reference_ear_contours.py','capture_reference_ear_sequence.py','capture_reference_ear_boundary.py','capture_reference_ear_resampling.py','capture_reference_ear_spacing.py'])
+parser.add_argument('--engine-root',type=Path,help='UE installation root containing Engine/Binaries/Win64')
+parser.add_argument('--min-physical-gib',type=float,default=8,
+    help='Private runner free-physical-memory floor (default: 8 GiB)')
+parser.add_argument('--max-job-memory-gib',type=float,default=6,
+    help='Private runner aggregate job-memory ceiling (default: 6 GiB)')
 args = parser.parse_args()
 root = Path(__file__).resolve().parents[2]
 fur = root/'unreal/fur'
@@ -18,6 +24,7 @@ if args.script=='capture_reference_viewport.py': tag='reference-viewport-render'
 if 'sheep' in args.script: tag='reference-sheep-'+('render' if render else 'api')
 if args.script=='capture_reference_sheep_viewport.py': tag='reference-sheep-viewport-render'
 output = fur/'recovered'
+output.mkdir(parents=True,exist_ok=True)
 marker = None
 if 'reference' in args.script:
     marker = fur/'matched-reference'/('import-validation.json' if reference_import else
@@ -133,6 +140,10 @@ if args.script=='capture_fur_surface_live.py':
     tag='fur-surface-live-sheep'
     marker=output/tag/'report.json'
     old_marker=marker.stat().st_mtime_ns if marker.exists() else 0
+if args.script=='capture_fur_surface_production.py':
+    tag='fur-surface-production-sheep'
+    marker=output/tag/'report.json'
+    old_marker=marker.stat().st_mtime_ns if marker.exists() else 0
 if args.script=='capture_fur_surface_outputs.py':
     tag='fur-surface-sheep'
     marker=output/tag/'report.json'
@@ -141,13 +152,31 @@ if args.script=='validate_dry_multilight.py':
     tag='dry-multilight-api'
     marker=output/'dry-multilight-validation.json'
     old_marker=marker.stat().st_mtime_ns if marker.exists() else 0
-argv = [sys.executable,str(root/'external/RCRA-Forge/tools/private_desktop.py'),
+if args.script=='validate_production_filter_registration.py':
+    tag='fur-denoise-production-registration'
+    marker=output/'fur-denoise-production-registration.json'
+    old_marker=marker.stat().st_mtime_ns if marker.exists() else 0
+if args.script=='capture_synthetic_production_filter.py':
+    tag='fur-denoise-production-synthetic'
+    marker=output/tag/'report.json'
+    old_marker=marker.stat().st_mtime_ns if marker.exists() else 0
+engine_candidates=[]
+if args.engine_root: engine_candidates.append(args.engine_root)
+if os.environ.get('UE_ENGINE_ROOT'): engine_candidates.append(Path(os.environ['UE_ENGINE_ROOT']))
+engine_candidates.extend(Path(path) for path in (
+    'C:/Program Files/Epic Games/UE_5.8','D:/Epic Games/UE_5.8','E:/Epic Games/UE_5.8','F:/Epic Games/UE_5.8'))
+engine=next((path for path in engine_candidates
+    if (path/'Engine/Binaries/Win64/UnrealEditor.exe').is_file()),None)
+if engine is None: raise SystemExit('UE 5.8 not found; pass --engine-root')
+private_desktop=root/'tools/private_desktop.py'
+if not private_desktop.is_file(): raise SystemExit('missing private desktop runner: '+str(private_desktop))
+argv = [sys.executable,str(private_desktop),
         '--cwd',str(root),'--report',str(output/(tag+'-job.json')),
         '--exit-with-root',
-        '--seconds',str(300 if render else 180),'--min-physical-gib','8',
+        '--seconds',str(300 if render else 180),'--min-physical-gib',str(args.min_physical_gib),
         '--min-pagefile-gib','8','--min-disk-gib','2',
-        '--max-job-memory-gib',str(6 if render else 4),'--priority','below-normal','--',
-        'F:/Epic Games/UE_5.8/Engine/Binaries/Win64/'+('UnrealEditor.exe' if render or reference_import else 'UnrealEditor-Cmd.exe'),
+        '--max-job-memory-gib',str(args.max_job_memory_gib if render else min(args.max_job_memory_gib,4)),'--priority','below-normal','--',
+        str(engine/'Engine/Binaries/Win64'/('UnrealEditor.exe' if render or reference_import else 'UnrealEditor-Cmd.exe')),
         str(project/'FurValidation.uproject')]
 if render:
     if 'reference' in args.script:
@@ -175,14 +204,26 @@ import json
 project_file=project/'FurValidation.uproject'
 project_original=project_file.read_bytes()
 use_cached_plugins=render or reference_import
+engine_config=project/'Config/DefaultEngine.ini'
+engine_config_original=engine_config.read_bytes() if engine_config.exists() else None
 try:
     descriptor=json.loads(project_original)
     descriptor['DisableEnginePluginsByDefault']=not use_cached_plugins
     project_file.write_text(json.dumps(descriptor,indent=2),encoding='utf-8')
+    if args.script=='capture_synthetic_production_filter.py':
+        engine_config.parent.mkdir(parents=True,exist_ok=True)
+        with engine_config.open('a',encoding='utf-8') as config:
+            config.write('\n[DevOptions.Shaders]\nPercentageUnusedShaderCompilingThreads=100\n'
+                         'NumUnusedShaderCompilingThreads=64\n'
+                         'NumUnusedShaderCompilingThreadsDuringGame=64\n')
     with (output/(tag+'-launch.log')).open('w') as log:
         subprocess.run(argv,cwd=root,stdout=log,stderr=subprocess.STDOUT,check=True)
 finally:
     project_file.write_bytes(project_original)
+    if engine_config_original is None:
+        engine_config.unlink(missing_ok=True)
+    else:
+        engine_config.write_bytes(engine_config_original)
 # The job wrapper's exit code alone does not indicate UE success.
 import json
 report = json.loads((output/(tag+'-job.json')).read_text())

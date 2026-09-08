@@ -56,8 +56,8 @@
   },
   {
     "path": "unreal/fur/capture_fur_surface_live.py",
-    "bytes": 3348,
-    "sha256": "0e5aaf536feabce330699de4caf05b8d05ddf9e509f37b5db9d6836efeb89fc4"
+    "bytes": 3709,
+    "sha256": "69847496066dc612437cf8f51be4096a80f7da5c2e64098a7e931bd6aec20ae6"
   },
   {
     "path": "unreal/fur/capture_fur_surface_outputs.py",
@@ -301,8 +301,8 @@
   },
   {
     "path": "unreal/fur/create_map_fixtures.py",
-    "bytes": 983,
-    "sha256": "8cdb2f88dae0c64224841628af18662e5ffc1dbe48aa4c077ed634d4177719d3"
+    "bytes": 1182,
+    "sha256": "26cce94a640e98d795c4f6a21f2833c78fc47de99bbc21d47c41ebf23de96ccd"
   },
   {
     "path": "unreal/fur/create_reference_material.py",
@@ -336,8 +336,8 @@
   },
   {
     "path": "unreal/fur/export_recovered_core.py",
-    "bytes": 4758,
-    "sha256": "10fd9f1f8d61fec75d7df6b5fd7bdf3f146dad7b5e658528f56f48d5637901db"
+    "bytes": 4970,
+    "sha256": "36d653164e0ddca7a6f374fc0f7fe9a5e463aa07b261cdcf03fbcb41da0e06a4"
   },
   {
     "path": "unreal/fur/export_recovered_denoise.py",
@@ -356,8 +356,8 @@
   },
   {
     "path": "unreal/fur/FUR_FILTER_INTEGRATION.md",
-    "bytes": 3870,
-    "sha256": "e85b6487b3af7ee0422b6f70d6d1b023a63c020e0fabb5086bd7390299b5279a"
+    "bytes": 6251,
+    "sha256": "2b17e2166b35383234aeea4366e430e1d93029bcef179e688188af6fdac08b2d"
   },
   {
     "path": "unreal/fur/import_recovered_array.py",
@@ -416,8 +416,8 @@
   },
   {
     "path": "unreal/fur/run_check.py",
-    "bytes": 12845,
-    "sha256": "cc2662b6478b8993b688ea4e44f126682ac501a6bf01de5a5a67eefe53e245c8"
+    "bytes": 15446,
+    "sha256": "a5fabbb1caf12118c88c5d4d575a705f043ae35453585a2b55fa65ed5ec4ba6b"
   },
   {
     "path": "unreal/fur/run_forge_environment_check.py",
@@ -661,8 +661,8 @@
   },
   {
     "path": "unreal/plugins/FurAuthoring/README.md",
-    "bytes": 17384,
-    "sha256": "35b7240d0dbb3ab1bb61576d6573f6693f5c40a99f8a428cd88f5ca68f4ace2c"
+    "bytes": 17795,
+    "sha256": "58f1f6593445488700b177ab6b3b8eeae809e6b7205e188b9e86e7380f07bc91"
   },
   {
     "path": "unreal/plugins/FurAuthoring/Shaders/FurActiveTiles.usf",
@@ -711,8 +711,8 @@
   },
   {
     "path": "unreal/plugins/FurAuthoring/Source/FurAuthoring/FurAuthoring.Build.cs",
-    "bytes": 619,
-    "sha256": "32ce5f318d67911f279e1ae1e4f861157739957b2e29925719d16999cbcb4fb1"
+    "bytes": 827,
+    "sha256": "9d934387491f96724a07f9546c7e435c2a0eb2292ae9c7fe4f95a0b5ea9d7698"
   },
   {
     "path": "unreal/plugins/FurAuthoring/Source/FurAuthoring/Private/FurAuthoringActor.cpp",
@@ -721,8 +721,8 @@
   },
   {
     "path": "unreal/plugins/FurAuthoring/Source/FurAuthoring/Private/FurAuthoringModule.cpp",
-    "bytes": 1141,
-    "sha256": "a27654e5431effe4bc423d6195af647e365785b46bfb862462903bedb8261592"
+    "bytes": 2402,
+    "sha256": "f2780e7c15602a80f192fe07c5bf4172302db279cbac246ca93ff953109f8d6d"
   },
   {
     "path": "unreal/plugins/FurAuthoring/Source/FurAuthoring/Private/FurDenoise.cpp",
@@ -778,5 +778,55 @@
     "path": "unreal/plugins/FurAuthoring/Source/FurAuthoring/Public/SkeletalFurAuthoringActor.h",
     "bytes": 1732,
     "sha256": "1be93dafbd5892f6e4a411ba1e1c7eeec88ea723b31effb2ed5982f401921f76"
+  },
+  {
+    "path": "unreal/fur/EAR_CHECKPOINT_20260908.md",
+    "bytes": 3246,
+    "sha256": "3b1e75c0602a7b0df9bba726ed1b6901a3684866c89f5e899826795a8e41e1e3"
+  },
+  {
+    "path": "unreal/fur/PRODUCTION_FILTER_CHECKPOINT_20260908.md",
+    "bytes": 3677,
+    "sha256": "436044294037b1c815f387de2408e13436412f60d6938d46dd5266bae470c3ee"
+  },
+  {
+    "path": "unreal/fur/capture_fur_surface_production.py",
+    "bytes": 283,
+    "sha256": "26ceae4f84e93876a75b63c85e6f59cebbf9a4204b82b9533b2b575a4b3c3832"
+  },
+  {
+    "path": "unreal/fur/capture_synthetic_production_filter.py",
+    "bytes": 8605,
+    "sha256": "6f4776445a110eb2187284faed692c553f072b2a2d8722c938047d18bc04760d"
+  },
+  {
+    "path": "unreal/fur/validate_production_filter_registration.py",
+    "bytes": 1554,
+    "sha256": "7b4bb0df0fd417f80594f3d0337994f2551dfb7738a4a4921a353cf8d0c6cd67"
+  },
+  {
+    "path": "unreal/fur/verify_synthetic_production_filter.py",
+    "bytes": 3186,
+    "sha256": "07424e1e4c2ded8030f8ce2301c2d2c97bb668327bc83f28d8edf07853dbc330"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/Source/FurAuthoring/Private/FurDenoiseLibrary.cpp",
+    "bytes": 831,
+    "sha256": "c33a52ed22e4378cec2cceb09f57d0e4e3c39e990fe5ef7a676ef549467a36d3"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/Source/FurAuthoring/Private/FurDenoiseViewExtension.cpp",
+    "bytes": 8297,
+    "sha256": "70007e4421ed4dcda7bdd7943bfd6ecb7c900d3d76a3bd27574b19fb6466cb12"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/Source/FurAuthoring/Private/FurDenoiseViewExtension.h",
+    "bytes": 149,
+    "sha256": "25956d978ab28b60cd33dec96daa0b9b174bd85630c1ce88fadf85dbfb484894"
+  },
+  {
+    "path": "unreal/plugins/FurAuthoring/Source/FurAuthoring/Public/FurDenoiseLibrary.h",
+    "bytes": 813,
+    "sha256": "51c6a0d528e4ab127a659cb480734afb75e9fff52f588068e79f6d2b3711b2aa"
   }
 ]

@@ -647,3 +647,18 @@ Continue with live spatial-database contents and scene membership, the live mana
 the frame-specific runtime scheduler completion sequence and captured placement/prepared-stream
 values, including the concrete owner transform selected for the frame. Active-Hair output validation remains separate
 work. No game or graphics workload is needed for the static continuation.
+
+## UE production-filter receiving-computer update - 2026-09-08
+
+The recovered denoiser is integrated into the FurAuthoring runtime plugin as an
+opt-in pre-TAA scene view extension (`r.FurAuthoring.Denoise`, default 0), with
+Blueprint enable/registration queries. UE5.8 build and post-engine-init lifecycle
+validation passed. A repository-owned 32-shell tagged sphere produced four
+private TAA captures and a render-thread execution marker for the production
+pass; the verifier passed at a 4.312 GiB job peak. Synthetic off/on temporal-pair
+MAE was 1.926/1.951 RGB8, so this proves wiring only and does not prove quality
+or retail parity. The imported character fixtures and saved retail ModelStrand
+capture are absent on this computer. Next, rerun the production A/B on both
+characters where those assets exist, then resume the bounded ModelStrand ear
+audit before implementing any ear-specific renderer. Exact commands and files
+are in `unreal/fur/PRODUCTION_FILTER_CHECKPOINT_20260908.md`.

@@ -40,3 +40,14 @@ NEXT: restore sufficient F: capacity, run bounded saved-frame strand audit
 under existing inactive desktop/memory/disk guards, identify exact scene-object
 and pixels changed by strand draws. Only then connect this missing pipeline
 to the ear or rule it out. Do not present new strand discovery as a proven fix.
+
+## Receiving-computer update - 2026-09-08
+
+The standalone clone is at
+`C:/Users/rmuno/Documents/Codex/2026-08-31/i/RCRA-Forge`. This computer does
+not have the source machine's F: volume, saved retail capture, imported Ratchet
+or sheep assets, or ear-strand audit inputs. No retail or ear claim was inferred
+from their absence. Production pre-TAA filter integration continued using a
+generated tagged shell-fur fixture; see FUR_FILTER_INTEGRATION.md and
+PRODUCTION_FILTER_CHECKPOINT_20260908.md. The original NEXT action above remains
+unchanged and must run on the computer containing the saved capture.

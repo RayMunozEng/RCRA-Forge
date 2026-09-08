@@ -35,3 +35,11 @@ desktop.ini
 assets/icon.ico
 hashes.txt.cache
 hashes.txt.cache.cache
+unreal/fur/ValidationProject/Binaries/
+unreal/fur/ValidationProject/Intermediate/
+unreal/fur/ValidationProject/Saved/
+unreal/fur/ValidationProject/DerivedDataCache/
+unreal/fur/ValidationProject/Config/
+unreal/fur/ValidationProject/Content/
+unreal/fur/recovered/
+unreal/plugins/FurAuthoring/Content/Textures/T_DefaultFurShells.uasset
