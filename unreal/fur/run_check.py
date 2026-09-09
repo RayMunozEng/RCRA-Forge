@@ -6,17 +6,23 @@ import subprocess
 import sys
 
 parser = argparse.ArgumentParser()
-parser.add_argument('script',choices=['capture_synthetic_production_filter.py','validate_production_filter_registration.py','capture_reference_ear_facing.py','capture_fur_surface_ratchet.py','capture_fur_surface_live.py','capture_fur_surface_production.py','capture_fur_surface_outputs.py','capture_denoise_kernel.py','capture_dry_cycle_sheep.py','capture_dry_multilight.py','capture_dry_multilight_sheep.py','validate_dry_multilight.py','capture_reference_dry_motion.py','capture_reference_sheep_dry_motion.py','capture_reference_skeletal_wind.py','capture_reference_skeletal_accuracy.py','capture_reference_skeletal_velocity.py','capture_reference_fur_wind_accuracy.py','capture_reference_velocity_calibration.py','capture_reference_sheep_velocity_float.py','capture_reference_sheep_motion.py','capture_reference_sheep_environment_inputs.py','validate_mapped_fur.py','capture_mapped_fur.py','validate_skeletal_fur.py','capture_skeletal_fur.py','validate_reference_fur.py','capture_reference_fur.py','capture_reference_hair.py','capture_reference_scene.py','validate_reference_sheep.py','capture_reference_sheep.py','capture_reference_viewport.py','capture_reference_sheep_viewport.py','capture_reference_dynamics.py','capture_reference_ratchet_dynamics.py','capture_reference_sheep_dynamics.py','capture_reference_stream.py','capture_reference_shadows.py','capture_reference_filtered_shadows.py','capture_reference_self_shadows.py','capture_reference_environment.py','capture_reference_sheep_environment.py','capture_reference_environment_sampling.py','capture_reference_environment_controls.py','capture_reference_ear_contours.py','capture_reference_ear_sequence.py','capture_reference_ear_boundary.py','capture_reference_ear_resampling.py','capture_reference_ear_spacing.py'])
+parser.add_argument('script',choices=['inspect_ratchet_tail_textures_unreal.py','import_ratchet_body_private.py','capture_retail_ear_strands.py','capture_synthetic_production_filter.py','validate_production_filter_registration.py','capture_reference_ear_facing.py','capture_fur_surface_ratchet.py','capture_fur_surface_live.py','capture_fur_surface_production.py','capture_fur_surface_production_ratchet.py','capture_fur_surface_outputs.py','capture_denoise_kernel.py','capture_dry_cycle_sheep.py','capture_dry_multilight.py','capture_dry_multilight_sheep.py','validate_dry_multilight.py','capture_reference_dry_motion.py','capture_reference_sheep_dry_motion.py','capture_reference_skeletal_wind.py','capture_reference_skeletal_accuracy.py','capture_reference_skeletal_velocity.py','capture_reference_fur_wind_accuracy.py','capture_reference_velocity_calibration.py','capture_reference_sheep_velocity_float.py','capture_reference_sheep_motion.py','capture_reference_sheep_environment_inputs.py','validate_mapped_fur.py','capture_mapped_fur.py','validate_skeletal_fur.py','capture_skeletal_fur.py','validate_reference_fur.py','capture_reference_fur.py','capture_reference_hair.py','capture_reference_scene.py','validate_reference_sheep.py','capture_reference_sheep.py','capture_reference_viewport.py','capture_reference_sheep_viewport.py','capture_reference_dynamics.py','capture_reference_ratchet_dynamics.py','capture_reference_sheep_dynamics.py','capture_reference_stream.py','capture_reference_shadows.py','capture_reference_filtered_shadows.py','capture_reference_self_shadows.py','capture_reference_environment.py','capture_reference_sheep_environment.py','capture_reference_environment_sampling.py','capture_reference_environment_controls.py','capture_reference_ear_contours.py','capture_reference_ear_sequence.py','capture_reference_ear_boundary.py','capture_reference_ear_resampling.py','capture_reference_ear_spacing.py'])
 parser.add_argument('--engine-root',type=Path,help='UE installation root containing Engine/Binaries/Win64')
 parser.add_argument('--min-physical-gib',type=float,default=8,
     help='Private runner free-physical-memory floor (default: 8 GiB)')
 parser.add_argument('--max-job-memory-gib',type=float,default=6,
     help='Private runner aggregate job-memory ceiling (default: 6 GiB)')
+next(action for action in parser._actions if action.dest == 'script').choices.append(
+    'capture_ratchet_full_body_registration.py')
+next(action for action in parser._actions if action.dest == 'script').choices.extend((
+    'capture_ratchet_strand_binding.py', 'capture_ratchet_head_binding.py'))
 args = parser.parse_args()
 root = Path(__file__).resolve().parents[2]
 fur = root/'unreal/fur'
 render = args.script.startswith('capture_')
-reference_import = args.script in ('validate_reference_fur.py','validate_reference_sheep.py')
+reference_import = args.script in (
+    'validate_reference_fur.py', 'validate_reference_sheep.py',
+    'import_ratchet_body_private.py')
 tag = ('reference' if 'reference' in args.script else ('skeletal' if 'skeletal' in args.script else 'maps')) + ('-render' if render else '-api')
 if args.script=='capture_reference_hair.py': tag='reference-hair-render'
 if args.script=='capture_reference_scene.py': tag='reference-scene-render'
@@ -132,6 +138,30 @@ if args.script=='capture_reference_ear_facing.py':
     tag='ear-facing-audit'
     marker=output/tag/'capture-report.json'
     old_marker=marker.stat().st_mtime_ns if marker.exists() else 0
+if args.script=='capture_retail_ear_strands.py':
+    tag='retail-ear-strands'
+    marker=output/tag/'report.json'
+    old_marker=marker.stat().st_mtime_ns if marker.exists() else 0
+if args.script=='capture_ratchet_full_body_registration.py':
+    tag='ratchet-full-body-registration'
+    marker=output/tag/'report.json'
+    old_marker=marker.stat().st_mtime_ns if marker.exists() else 0
+if args.script=='capture_ratchet_strand_binding.py':
+    tag='ratchet-strand-binding'
+    marker=output/tag/'report.json'
+    old_marker=marker.stat().st_mtime_ns if marker.exists() else 0
+if args.script=='capture_ratchet_head_binding.py':
+    tag='ratchet-head-binding'
+    marker=output/tag/'report.json'
+    old_marker=marker.stat().st_mtime_ns if marker.exists() else 0
+if args.script=='import_ratchet_body_private.py':
+    tag='ratchet-body-import'
+    marker=output/'ratchet-body/ue-import-report.json'
+    old_marker=marker.stat().st_mtime_ns if marker.exists() else 0
+if args.script=='inspect_ratchet_tail_textures_unreal.py':
+    tag='ratchet-tail-texture-roundtrip'
+    marker=output/tag/'report.json'
+    old_marker=marker.stat().st_mtime_ns if marker.exists() else 0
 if args.script=='capture_fur_surface_ratchet.py':
     tag='fur-surface-live-ratchet'
     marker=output/tag/'report.json'
@@ -142,6 +172,10 @@ if args.script=='capture_fur_surface_live.py':
     old_marker=marker.stat().st_mtime_ns if marker.exists() else 0
 if args.script=='capture_fur_surface_production.py':
     tag='fur-surface-production-sheep'
+    marker=output/tag/'report.json'
+    old_marker=marker.stat().st_mtime_ns if marker.exists() else 0
+if args.script=='capture_fur_surface_production_ratchet.py':
+    tag='fur-surface-production-ratchet'
     marker=output/tag/'report.json'
     old_marker=marker.stat().st_mtime_ns if marker.exists() else 0
 if args.script=='capture_fur_surface_outputs.py':
@@ -175,7 +209,11 @@ argv = [sys.executable,str(private_desktop),
         '--exit-with-root',
         '--seconds',str(300 if render else 180),'--min-physical-gib',str(args.min_physical_gib),
         '--min-pagefile-gib','8','--min-disk-gib','2',
-        '--max-job-memory-gib',str(args.max_job_memory_gib if render else min(args.max_job_memory_gib,4)),'--priority','below-normal','--',
+        '--max-job-memory-gib',str(
+            args.max_job_memory_gib
+            if render or args.script == 'import_ratchet_body_private.py'
+            else min(args.max_job_memory_gib, 4)),
+        '--priority','below-normal','--',
         str(engine/'Engine/Binaries/Win64'/('UnrealEditor.exe' if render or reference_import else 'UnrealEditor-Cmd.exe')),
         str(project/'FurValidation.uproject')]
 if render:
@@ -190,7 +228,14 @@ if render:
 elif reference_import:
     # StaticMeshEditorSubsystem is not initialized in a commandlet. The full
     # editor with NullRHI provides it without starting a GPU render.
-    argv += ['-ExecutePythonScript='+str(fur/args.script),'-NullRHI','-NoShaderCompile','-NoLiveCoding']
+    argv += ['-ExecutePythonScript='+str(fur/args.script)]
+    if args.script == 'import_ratchet_body_private.py':
+        # UE 5.8 Interchange asserts during full-editor initialization under
+        # NullRHI. Keep it on the isolated desktop using the proven SM5 path.
+        argv += ['-d3d11', '-sm5', '-windowed', '-ResX=320', '-ResY=240']
+    else:
+        argv += ['-NullRHI', '-NoShaderCompile']
+    argv += ['-NoLiveCoding']
 else:
     argv += ['-run=pythonscript','-script='+str(fur/args.script),'-NullRHI','-NoShaderCompile']
 argv += ['-unattended','-nosound','-nosplash','-DDC=InstalledNoZenLocalFallback',
@@ -210,7 +255,9 @@ try:
     descriptor=json.loads(project_original)
     descriptor['DisableEnginePluginsByDefault']=not use_cached_plugins
     project_file.write_text(json.dumps(descriptor,indent=2),encoding='utf-8')
-    if args.script=='capture_synthetic_production_filter.py':
+    if args.script in ('capture_synthetic_production_filter.py',
+                       'capture_fur_surface_production.py',
+                       'capture_fur_surface_production_ratchet.py'):
         engine_config.parent.mkdir(parents=True,exist_ok=True)
         with engine_config.open('a',encoding='utf-8') as config:
             config.write('\n[DevOptions.Shaders]\nPercentageUnusedShaderCompilingThreads=100\n'
@@ -232,7 +279,11 @@ if report.get('root_exit_code') != 0:
     raise SystemExit(1)
 if marker:
     log_text=(output/(tag+'.log')).read_text(errors='replace')
-    if 'LogPython: Error:' in log_text or 'Failed to compile Material' in log_text:
-        raise SystemExit('UE exited, but the reference script or material failed; inspect '+str(output/(tag+'.log')))
+    # Material nodes are connected incrementally, so Unreal can log temporary
+    # compile failures before the final graph exists. The material builder now
+    # checks RecompileMaterial's final error list and raises a Python error when
+    # that final compile is invalid.
+    if 'LogPython: Error:' in log_text:
+        raise SystemExit('UE exited, but the reference script failed; inspect '+str(output/(tag+'.log')))
     if not marker.exists() or marker.stat().st_mtime_ns<=old_marker:
         raise SystemExit('Reference completion report was not refreshed: '+str(marker))

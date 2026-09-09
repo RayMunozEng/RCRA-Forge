@@ -1,5 +1,13 @@
 # Fur Rendering Computer Transfer
 
+Latest 2026-09-09: continue with
+[MODELSTRAND_HANDOFF_20260909.md](MODELSTRAND_HANDOFF_20260909.md). Ratchet now
+uses the recovered shell path plus capture-derived tail, sparse-head, and ear
+ModelStrand groups with retail topology budgets and an exact captured wind-only
+state. Skeletal binding, persistent arbitrary-time wind, and a common-frame
+animated retail comparison remain open. The new handoff lists the ignored
+fixtures, regeneration tools, private-desktop command, and measured evidence.
+
 Latest 2026-09-05: read [FUR_POSE_STREAMS.md](FUR_POSE_STREAMS.md) for paired deformed-position integration, bounded camera-motion results, static-image regression, and the remaining animated-frame parity boundary. The generic TAA capture is a menu frame, not a fur appearance reference.
 
 Newest continuation: read

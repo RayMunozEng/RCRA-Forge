@@ -32,12 +32,21 @@ if skeletal:
 else:
     sheep=fixture=='sheep'
     asset='/Game/FurReference/'+('Sheep/' if sheep else '')
-    unreal.EditorLoadingAndSavingUtils.load_map(asset+'SceneLighting')
+    scene=asset+'SceneLighting' if sheep else asset+'MatchedRatchet'
+    unreal.EditorLoadingAndSavingUtils.load_map(scene)
     fur=next(a for a in actors.get_all_level_actors() if isinstance(a,unreal.FurAuthoringActor))
     mid='0' if sheep else '2'
     textures={r:unreal.load_asset(asset+'Textures/M'+mid+'_'+r) for r in ('base_color','fur_control','specular_color')}
     shape=dict(length=9,density=3,offset=0,transmittance=.2) if sheep else dict(length=3,density=16,offset=1,transmittance=.1)
-    inputs=json.loads((root/('sheep-reference' if sheep else 'matched-reference')/'inputs.json').read_text())
+    fixture_inputs='sheep-reference' if sheep else 'matched-reference'
+    input_candidates=(
+        root/fixture_inputs/'inputs.json',
+        Path.home()/'Cloud-Drive/Github/gem-shader/unreal/fur'/fixture_inputs/'inputs.json',
+    )
+    inputs_path=next((path for path in input_candidates if path.is_file()),None)
+    if inputs_path is None:
+        raise FileNotFoundError('fixture inputs not found: '+', '.join(map(str,input_candidates)))
+    inputs=json.loads(inputs_path.read_text(encoding='utf-8'))
     eye=unreal.Vector(*inputs['camera']['ue_eye_cm']);target=unreal.Vector(*inputs['camera']['ue_target_cm'])
 material=builder.create(globals().get('dynamics_material','M_Dynamics_'+fixture+'_v1'),textures,fur=True,recovered=True,temporal=True,scene=True,
     environment=globals().get('test_environment'),environment_brdf=globals().get('test_environment_brdf'),
@@ -61,7 +70,20 @@ if skeletal:
     controller=actors.spawn_actor_from_class(unreal.FurLightingController,unreal.Vector())
     controller.key_light=light;controller.targets=[fur];controller.enable_shadows=False
 else:
-    controller=next(a for a in actors.get_all_level_actors() if isinstance(a,unreal.FurLightingController))
+    level_actors=actors.get_all_level_actors()
+    controller=next((a for a in level_actors if isinstance(a,unreal.FurLightingController)),None)
+    if controller is None:
+        key=next((a for a in level_actors if isinstance(a,unreal.DirectionalLight)),None)
+        if key is None:
+            key=actors.spawn_actor_from_class(
+                unreal.DirectionalLight,unreal.Vector(),
+                unreal.MathLibrary.find_look_at_rotation(
+                    unreal.Vector(.6,.8,1),unreal.Vector()))
+            key.light_component.set_intensity(3.14159265)
+        controller=actors.spawn_actor_from_class(unreal.FurLightingController,unreal.Vector())
+        controller.key_light=key
+        controller.targets=[fur]
+        controller.enable_shadows=False
 controller.refresh_lighting()
 camera=actors.spawn_actor_from_class(unreal.CameraActor,eye,unreal.MathLibrary.find_look_at_rotation(eye,target))
 camera.camera_component.set_field_of_view(50 if skeletal else 60)

@@ -810,7 +810,7 @@ def main() -> None:
             "cull_backfaces": args.cull_backfaces,
             "uniform_unlit_fur": args.uniform_unlit_fur,
             "albedo_unlit_fur": args.albedo_unlit_fur,
-            "fur_renderer": "recovered_shells_with_material_specific_surfaces",
+            "fur_renderer": "recovered_shells_and_capture_derived_model_strands",
             "vertex_tangent_frame": "retail_packed_authored_tangent_and_handedness",
             "fur_layer_volume": (
                 "recovered_procedural_128x128x32_exact_integer_mips"
@@ -939,6 +939,15 @@ def main() -> None:
                 "field": "captured_64_vector_cubic_procedural",
             },
             "fur_weighted_oit": False,
+            "model_strands": {
+                "program_ready": bool(viewport._model_strand_material_prog),
+                "groups": [group.summary for group in viewport._gpu_model_strands],
+                "material_path": "shared_native_hair_gbuffer_decode_lighting_denoise",
+                "dynamics": sorted({
+                    group.summary.get("dynamics", "unknown")
+                    for group in viewport._gpu_model_strands
+                }),
+            },
             "fur_material_count": len({mesh.material_index for mesh in fur_meshes}),
             "fur_mesh_count": len(fur_meshes),
             "authored_wool_surface_mesh_count": sum(

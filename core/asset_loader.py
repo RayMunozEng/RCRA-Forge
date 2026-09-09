@@ -251,7 +251,9 @@ def load_fur_environment(tex_data: dict, toc_parser):
     return cube_mips, default_hair_brdf_rg_half(), (64, 64)
 
 
-def load_model_textures(model, entry, toc_parser, lookup, on_texture=None) -> dict:
+def load_model_textures(
+        model, entry, toc_parser, lookup, on_texture=None,
+        material_indices=None) -> dict:
     """
     Resolve and decode all PBR texture slots for a parsed ModelAsset.
 
@@ -299,6 +301,9 @@ def load_model_textures(model, entry, toc_parser, lookup, on_texture=None) -> di
             mesh.material_index for mesh in primary_meshes
             if mesh.lod_level == material_lod
         })
+        if material_indices is not None:
+            requested = {int(index) for index in material_indices}
+            mat_indices = [index for index in mat_indices if index in requested]
 
         # Re-extract the model bytes to read TAG_MATERIALS section
         raw  = toc_parser.extract_asset(entry)

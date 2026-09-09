@@ -18,11 +18,17 @@ def create(name, textures, fur=False, unlit=False, recovered=False, temporal=Fal
     path = asset_path
     existing = unreal.load_asset(path+'/'+name)
     if existing:
+        compile_errors=unreal.MaterialEditingLibrary.recompile_material(existing)
+        if compile_errors:
+            raise RuntimeError('Final material compile failed: '+'; '.join(compile_errors))
         return existing
     mat = unreal.AssetToolsHelpers.get_asset_tools().create_asset(name,path,unreal.Material,unreal.MaterialFactoryNew())
     if surface_outputs:
         mat.set_editor_property('enable_new_hlsl_generator',False)
-    mat.set_editor_property('two_sided',True)
+    # Captured retail fur raster state is CCW with back-face culling. Rendering
+    # recovered shells two-sided exposes inward-facing expanded triangles and
+    # feeds their flipped normals into the Hair lighting path.
+    mat.set_editor_property('two_sided',not (fur and recovered))
     mat.set_editor_property('blend_mode',unreal.BlendMode.BLEND_MASKED)
     mat.set_editor_property('used_with_instanced_static_meshes',fur)
     mat.set_editor_property('used_with_skeletal_mesh',skeletal)
@@ -75,15 +81,38 @@ def create(name, textures, fur=False, unlit=False, recovered=False, temporal=Fal
         if skeletal:
             # Pose-sharing components already supply i/count, unlike static
             # instances' i/(count-1). Never read instance data on a skinned mesh.
-            depth=scalar('ShellDepth',0)
+            raw_depth=scalar('ShellDepth',0)
         else:
             raw=node(unreal.MaterialExpressionPerInstanceCustomData)
             raw.set_editor_property('data_index',0)
-            depth=custom('return Raw*(Count-1)/max(Count,1);',dict(Raw=raw,Count=scalar('RecoveredShellCount',32)))
-        pd=node(unreal.MaterialExpressionVertexInterpolator)
-        link(depth,pd,'VS')
-        length=scalar('FurLength',settings['length'])
+            raw_depth=custom('return Raw*(Count-1)/max(Count,1);',dict(Raw=raw,Count=scalar('RecoveredShellCount',32)))
         normal=node(unreal.MaterialExpressionVertexNormalWS)
+        camera=node(unreal.MaterialExpressionCameraPositionWS)
+        position=node(unreal.MaterialExpressionWorldPosition)
+        decode_uv=node(unreal.MaterialExpressionTextureCoordinate)
+        decode_uv.set_editor_property('coordinate_index',1)
+        budget=custom('''
+float3 viewDirection=normalize(Camera-Position);
+float correction=Decode.x*UseCorrection;
+float front=saturate(dot(viewDirection,normalize(N))-correction*0.0065-0.025);
+float available=min(2.0*(1.0-front)*(1.0-front)+0.1,1.0);
+float unbounded=Raw/max(available,0.000001);
+return float2(saturate(unbounded),unbounded<=1.0 ? 1.0 : 0.0);
+''',dict(Raw=raw_depth,N=normal,Camera=camera,Position=position,Decode=decode_uv,
+         UseCorrection=scalar('UseRetailDecodeCorrection',0)),
+            unreal.CustomMaterialOutputType.CMOT_FLOAT2)
+        def component_mask(source, red=False, green=False):
+            mask=node(unreal.MaterialExpressionComponentMask)
+            mask.set_editor_property('r',red)
+            mask.set_editor_property('g',green)
+            link(source,mask,'')
+            return mask
+        depth=component_mask(budget,red=True)
+        pd=node(unreal.MaterialExpressionVertexInterpolator)
+        link(budget,pd,'VS')
+        shell_depth=component_mask(pd,red=True)
+        shell_visible=component_mask(pd,green=True)
+        length=scalar('FurLength',settings['length'])
         tangent=node(unreal.MaterialExpressionVertexTangentWS)
         clock=custom('return lerp(T,Manual,saturate(Override));',
             dict(T=node(unreal.MaterialExpressionTime),Manual=scalar('WindTimeOverride',0),
@@ -107,11 +136,11 @@ def create(name, textures, fur=False, unlit=False, recovered=False, temporal=Fal
         cycle='float(View.StateFrameIndex % 160u)' if temporal else '0'
         # Native mip bias uses the signed geometric normal after front-face correction.
         # Folding negative smooth-normal facing with abs changes silhouette sampling.
-        opacity=custom('return RFCoverageWithMask(Layers,LayersSampler,UV,C,D,Density,L,Scale,Wet,saturate(dot(normalize(Parameters.TangentToWorld[2])*Parameters.TwoSidedSign,V)),Parameters.SvPosition.xy,View.ViewSizeAndInvSize.zw,'+phase+','+cycle+',Alpha);',
-            dict(Layers=layers,UV=uv,C=(control,'RGBA'),D=pd,Density=scalar('RecoveredDensity',settings['density']),L=length,
+        opacity=custom('if (Visible<0.999) return 0.0; return RFCoverageWithMask(Layers,LayersSampler,UV,C,D,Density,L,Scale,Wet,saturate(dot(normalize(Parameters.TangentToWorld[2])*Parameters.TwoSidedSign,V)),Parameters.SvPosition.xy,View.ViewSizeAndInvSize.zw,'+phase+','+cycle+',Alpha);',
+            dict(Layers=layers,UV=uv,C=(control,'RGBA'),D=shell_depth,Visible=shell_visible,Density=scalar('RecoveredDensity',settings['density']),L=length,
                  Scale=scalar('OffsetScale',settings['offset']),Wet=wet,N=pn,V=view,Alpha=(color,'A')))
-        output_color=custom('return furWetAlbedo(C,Wet,D).rgb;',dict(C=(color,'RGBA'),Wet=wet,D=pd),f3)
-        ao=custom('return saturate(D*0.5)*(1-A)+A;',dict(D=pd,A=(control,'A')))
+        output_color=custom('return furWetAlbedo(C,Wet,D).rgb;',dict(C=(color,'RGBA'),Wet=wet,D=shell_depth),f3)
+        ao=custom('return saturate(D*0.5)*(1-A)+A;',dict(D=shell_depth,A=(control,'A')))
         assert lib.connect_material_property(ao,'',unreal.MaterialProperty.MP_AMBIENT_OCCLUSION)
         if recovered:
             response=sample('specular_color')
@@ -165,7 +194,7 @@ float handedness=dot(cross(n0,t),b)<0 ? -1 : 1;
 float3 strand=furStrandDirection(n,float4(t,handedness),furGroom(C.rg,Scale),false);
 float2 response=furGlossSpecular(S.rg,1,1,Wet,D);
 return RFSceneDirect(n,strand,normalize(V.xzy),'''+light_code+''',float4(Albedo,AO),response,Depth*.01,Transmission)*'''+multiplier+additional_code+environment_code+';',
-dict(C=(control,'RGBA'),S=(response,'RGBA'),Wet=wet,D=pd,V=view,Albedo=output_color,AO=ao,Depth=pixel_depth,
+dict(C=(control,'RGBA'),S=(response,'RGBA'),Wet=wet,D=shell_depth,V=view,Albedo=output_color,AO=ao,Depth=pixel_depth,
      Scale=scalar('OffsetScale',settings['offset']),Transmission=scalar('Transmittance',settings['transmittance']),**light_inputs),f3)
             output_color.set_editor_property('include_file_paths',[
                 '/Plugin/FurAuthoring/RecoveredFurAdapter.ush','/Plugin/FurAuthoring/ReferenceHairLighting.ush',
@@ -200,7 +229,9 @@ float3 strand=furStrandDirection(n,float4(t,handedness),furGroom(C.rg,Scale),fal
         src,out=src if isinstance(src,tuple) else (src,'')
         assert lib.connect_material_property(src,out,prop)
     lib.layout_material_expressions(mat)
-    lib.recompile_material(mat)
+    compile_errors=lib.recompile_material(mat)
+    if compile_errors:
+        raise RuntimeError('Final material compile failed: '+'; '.join(compile_errors))
     assert unreal.EditorAssetLibrary.save_loaded_asset(mat)
     return mat
 

@@ -6,7 +6,9 @@ from PIL import Image,ImageDraw
 import sys
 fixture=sys.argv[1] if len(sys.argv)>1 else 'sheep'
 assert fixture in ('sheep','ratchet')
-root=Path(__file__).resolve().parent/'recovered'/('fur-surface-live-'+fixture)
+mode=sys.argv[2] if len(sys.argv)>2 else 'live'
+assert mode in ('live','production')
+root=Path(__file__).resolve().parent/'recovered'/('fur-surface-'+mode+'-'+fixture)
 meta=json.loads((root/'surface.json').read_text(encoding='utf-8-sig'))
 h,w=meta['height'],meta['width']
 n=np.fromfile(root/'surface-normal.f32',dtype='<f4').reshape(h,w,4)
@@ -22,7 +24,7 @@ lengths={name:np.linalg.norm(data[...,:3][mask],axis=-1) for name,data in [('nor
 assert all(((v>.8)&(v<1.2)).all() for v in lengths.values())
 assert np.count_nonzero(s[~mask])==0
 assert np.count_nonzero(n[...,:3][mask]!=n[...,:3][mask].astype(np.float16).astype(np.float32))>1000,'Normal vector was rounded to half'
-report=dict(status='passed',surface_format='RGBA32F normal/mask and strand/depth; no intermediate half rounding',submitted_batches=meta['submitted_batches'],dimensions=[w,h],fur_pixels=count,
+report=dict(status='passed',mode=mode,surface_format='RGBA32F normal/mask and strand/depth; no intermediate half rounding',submitted_batches=meta['submitted_batches'],dimensions=[w,h],fur_pixels=count,
  depth_meters=[float(s[...,3][mask].min()),float(s[...,3][mask].max())],
  vector_lengths={name:[float(v.min()),float(v.max())] for name,v in lengths.items()},
  limits=['One '+fixture+' static view only.','Opaque scene depth equality used; binary surviving-sample mask.','Pre-TAA filtering is connected in the private validation fixture; not yet a shipped plugin feature.'])
@@ -47,13 +49,20 @@ report['filter']={'non_fur_pixels_changed':0,'alpha_changed':False,'fur_pixels_c
 frames=json.loads((root/'report.json').read_text())['frames']
 assert [x['label'] for x in frames]==['unfiltered-a','unfiltered-b','filtered-a','filtered-b']
 assert all(x['draw_realtime'] and x['resolved_aa_method']==2 for x in frames)
+if mode=='production':
+ expected=[False,False,True,True]
+ assert [x['production_filter_enabled'] for x in frames]==expected
+ log=(root.parent/('fur-surface-production-'+fixture+'.log')).read_text(errors='replace')
+ assert 'Production pre-TAA fur denoise executed:' in log
+ assert 'LogPython: Error:' not in log and 'Ensure condition failed' not in log
+ report['production_evidence']={'enabled_states':expected,'render_thread_execution_logged':True}
 photos={x['label']:np.asarray(Image.open(root/(x['label']+'.png')).convert('RGB'),dtype=float) for x in frames}
 quality_mask=photos['unfiltered-b'].max(2)>30;quality_mask[:150]=False
 quality={mode:float(abs(photos[mode+'-a']-photos[mode+'-b'])[quality_mask].mean()) for mode in ['unfiltered','filtered']}
 report['static_pair_mae_rgb8']=quality
 report['static_quality_pass']=quality['filtered']<3
 report['limits'].append('One unregistered temporal pair per mode; not a frame-locked comparison or native parity proof.')
-job=json.loads((root.parent/('fur-surface-live-'+fixture+'-job.json')).read_text())
+job=json.loads((root.parent/('fur-surface-'+mode+'-'+fixture+'-job.json')).read_text())
 assert job['root_exit_code']==0
 report['peak_job_gib']=job['job_memory']['peak_job_gib']
 (root/'validation.json').write_text(json.dumps(report,indent=2))
@@ -65,12 +74,12 @@ for label,data in [('NORMAL',n),('STRAND',s)]:
 canvas=Image.new('RGB',(1280,465),(16,20,25));draw=ImageDraw.Draw(canvas)
 for i,(label,im) in enumerate(imgs):
  canvas.paste(im,(i*640,32));draw.text((i*640+14,10),label,fill='white')
-draw.text((14,445),'Actual Unreal fur-data buffers. Diagnostic colors; visible fur is still unfiltered.',fill='white')
+draw.text((14,445),'Actual Unreal fur-data buffers. Diagnostic colors; validation mode: '+mode+'.',fill='white')
 canvas.save(root/'buffers.jpg',quality=92)
 beauty=Image.new('RGB',(1280,350),(16,20,25));draw=ImageDraw.Draw(beauty)
 for i,(name,label) in enumerate([('unfiltered-b','Filter off: settled TAA'),('filtered-b','Recovered filter on: settled TAA')]):
  im=Image.fromarray(photos[name].astype(np.uint8));im.thumbnail((640,300));beauty.paste(im,(i*640,32));draw.text((i*640+12,10),label,fill='white')
 draw.text((12,330),'Actual UE captures. Same material, camera and key/fill/rim lights; different temporal frames.',fill='white')
 beauty.save(root/'settled-review.jpg',quality=94)
-(root/'comparison.html').write_text('<!doctype html><meta charset="utf-8"><title>Live fur filter</title><body style="background:#101419;color:#ddd;font:18px system-ui;padding:24px"><h1>Recovered fur filter running before TAA</h1><p>Actual '+fixture+' captures under key/fill/rim lighting. The filter is connected in the private validation fixture.</p><img style="max-width:100%" src="settled-review.jpg"><p>Unchanged-frame MAE (RGB8): off '+format(quality['unfiltered'],'.3f')+', on '+format(quality['filtered'],'.3f')+'. These are separate temporal pairs, not frame-locked native comparisons.</p><p>Zero non-fur pixels changed in the saved same-frame GPU check. Fur surface vectors and depths validated.</p><img style="max-width:100%" src="buffers.jpg"><p>Full dry fur parity remains incomplete. The plugin still needs its production integration and Ratchet edge/motion validation.</p></body>')
+(root/'comparison.html').write_text('<!doctype html><meta charset="utf-8"><title>Live fur filter</title><body style="background:#101419;color:#ddd;font:18px system-ui;padding:24px"><h1>Recovered fur filter running before TAA</h1><p>Actual '+fixture+' captures under key/fill/rim lighting. Validation mode: '+mode+'.</p><img style="max-width:100%" src="settled-review.jpg"><p>Unchanged-frame MAE (RGB8): off '+format(quality['unfiltered'],'.3f')+', on '+format(quality['filtered'],'.3f')+'. These are separate temporal pairs, not frame-locked native comparisons.</p><p>Zero non-fur pixels changed in the saved same-frame GPU check. Fur surface vectors and depths validated.</p><img style="max-width:100%" src="buffers.jpg"><p>Full dry fur parity remains incomplete until the character and retail acceptance gates pass.</p></body>',encoding='utf-8')
 print(json.dumps(report,indent=2))

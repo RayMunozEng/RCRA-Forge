@@ -7,5 +7,6 @@
   "Category": "Rendering",
   "CanContainContent": true,
   "IsBetaVersion": true,
-  "Modules": [{"Name": "FurAuthoring", "Type": "Runtime", "LoadingPhase": "PostConfigInit"}]
+  "Modules": [{"Name": "FurAuthoring", "Type": "Runtime", "LoadingPhase": "PostConfigInit"}],
+  "Plugins": [{"Name": "ProceduralMeshComponent", "Enabled": true}]
 }

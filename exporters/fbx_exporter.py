@@ -172,6 +172,11 @@ class FbxExporter:
         self.name  = name
         self.lod   = lod
 
+    def _mesh_weights(self, mesh: MeshDefinition):
+        if mesh.flags & 0x100:
+            return self.model.rcra_weights, mesh.first_weight_index
+        return self.model.skin_weights, mesh.vertex_start
+
     def export(self, path: str):
         global _uid_counter
         _uid_counter = 100_000_000
@@ -192,14 +197,12 @@ class FbxExporter:
         cluster_uids: dict[tuple, int] = {}
 
         for si, mesh in enumerate(target_meshes):
-            if not (mesh.flags & 0x100):
-                continue
-            ws = mesh.first_weight_index
+            source, ws = self._mesh_weights(mesh)
             bone_set: set[int] = set()
             for vi in range(mesh.vertex_count):
                 wi = ws + vi
-                if wi >= len(self.model.rcra_weights): break
-                for bi, w in self.model.rcra_weights[wi]:
+                if wi >= len(source): break
+                for bi, w in source[wi]:
                     if w > 0: bone_set.add(int(bi))
             for bi in bone_set:
                 cluster_uids[(si, bi)] = _uid()
@@ -397,10 +400,8 @@ class FbxExporter:
             le.child("TypedIndex", 0)
 
         # Skin deformers + clusters
-        if has_skel and self.model.rcra_weights:
+        if has_skel and (self.model.rcra_weights or self.model.skin_weights):
             for si, mesh in enumerate(target_meshes):
-                if not (mesh.flags & 0x100):
-                    continue
                 mname    = f"{self.name}-subset{si}-LOD_{self.lod}"
                 skin_uid = skin_uids[si]
 
@@ -409,13 +410,13 @@ class FbxExporter:
                 sn.child("Link_DeformAcuracy", 50.0)
 
                 # Per-bone vertex/weight arrays
-                ws           = mesh.first_weight_index
+                source, ws   = self._mesh_weights(mesh)
                 bv:  dict[int, list[int]]   = {}
                 bw:  dict[int, list[float]] = {}
                 for vi in range(mesh.vertex_count):
                     wi = ws + vi
-                    if wi >= len(self.model.rcra_weights): break
-                    for bi, w in self.model.rcra_weights[wi]:
+                    if wi >= len(source): break
+                    for bi, w in source[wi]:
                         if w > 0:
                             bv.setdefault(int(bi), []).append(vi)
                             bw.setdefault(int(bi), []).append(float(w))
@@ -462,14 +463,14 @@ class FbxExporter:
             conn(geo_uid,  node_uid)
             mat_uid = mat_uid_map.get(mesh.material_index)
             if mat_uid: conn(mat_uid, node_uid)
-            if has_skel and (mesh.flags & 0x100):
+            if has_skel:
                 conn(skin_uids[si], geo_uid)
-                ws       = mesh.first_weight_index
+                source, ws = self._mesh_weights(mesh)
                 bone_set = set()
                 for vi in range(mesh.vertex_count):
                     wi = ws + vi
-                    if wi >= len(self.model.rcra_weights): break
-                    for bi, w in self.model.rcra_weights[wi]:
+                    if wi >= len(source): break
+                    for bi, w in source[wi]:
                         if w > 0: bone_set.add(int(bi))
                 for bone_idx in bone_set:
                     if bone_idx >= len(self.model.joints): continue

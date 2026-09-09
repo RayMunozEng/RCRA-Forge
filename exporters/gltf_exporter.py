@@ -14,7 +14,13 @@ import struct
 import numpy as np
 from typing import Optional
 
-from core.mesh import ModelAsset, MeshDefinition, mesh_to_numpy
+from core.mesh import (
+    ModelAsset,
+    MeshDefinition,
+    mesh_decode_corrections_to_numpy,
+    mesh_tangents_to_numpy,
+    mesh_to_numpy,
+)
 
 GLTF_FLOAT          = 5126
 GLTF_UNSIGNED_BYTE  = 5121
@@ -129,8 +135,17 @@ class GltfExporter:
 
         has_skeleton = bool(self.model.joints)
         skin_idx = None
+        skeleton_scene_root = None
         if has_skeleton:
             skin_idx = self._build_skeleton()   # inserts N bone nodes at 0..N-1
+            authored_roots = [i for i, joint in enumerate(self.model.joints)
+                              if joint.parent == -1]
+            skeleton_scene_root = len(self._nodes)
+            self._nodes.append({
+                "name": f"{self.name}_SkeletonRoot",
+                "children": authored_roots,
+            })
+            self._skins[skin_idx]["skeleton"] = skeleton_scene_root
 
         # One mesh node per sub-mesh (matches the importer structure in screenshot 4)
         mesh_node_indices = []
@@ -149,12 +164,14 @@ class GltfExporter:
             self._nodes.append(node)
             mesh_node_indices.append(node_idx)
 
-        # Scene root: mesh nodes only.
-        # Bone nodes must NOT appear in scenes[].nodes — Blender renders any
-        # scene-level node without a mesh as a visible Icosphere empty.
-        # The skin reference on each mesh node is enough for Blender to
-        # resolve the skeleton; bone nodes just need to exist in nodes[].
-        scene_nodes = list(mesh_node_indices)
+        # A joint hierarchy must be reachable from the active scene. Merely
+        # referencing joint nodes from skins[].joints leaves the hierarchy
+        # disconnected and causes strict importers to reject or recurse while
+        # trying to synthesize a skeleton root. Include each authored root;
+        # nodes without meshes are transforms and do not render in glTF.
+        skeleton_roots = ([skeleton_scene_root]
+                          if skeleton_scene_root is not None else [])
+        scene_nodes = skeleton_roots + list(mesh_node_indices)
 
         buf: dict = {"byteLength": len(self._bin)}
         if bin_uri: buf["uri"] = bin_uri
@@ -268,14 +285,33 @@ class GltfExporter:
         if normals is not None:
             attribs["NORMAL"] = self._add_accessor(
                 normals, "VEC3", GLTF_FLOAT, GLTF_ARRAY_BUFFER)
+        tangents = mesh_tangents_to_numpy(self.model, mesh)
+        if (tangents is not None and tangents.shape == (len(positions), 4)
+                and np.isfinite(tangents).all()
+                and np.all(np.linalg.norm(tangents[:, :3], axis=1) > 1e-8)):
+            attribs["TANGENT"] = self._add_accessor(
+                tangents, "VEC4", GLTF_FLOAT, GLTF_ARRAY_BUFFER)
         if uvs is not None:
-            import numpy as np
             uvs_flipped = uvs.copy()
             uvs_flipped[:, 1] = 1.0 - uvs_flipped[:, 1]
             attribs["TEXCOORD_0"] = self._add_accessor(
                 uvs_flipped, "VEC2", GLTF_FLOAT, GLTF_ARRAY_BUFFER)
+        decode_corrections = mesh_decode_corrections_to_numpy(self.model, mesh)
+        if (decode_corrections is not None
+                and decode_corrections.shape == (len(positions), 1)
+                and np.isfinite(decode_corrections).all()
+                and np.any(decode_corrections != 0.0)):
+            # UE imports float TEXCOORD channels on skeletal meshes. Preserve
+            # the retail position-decode correction in UV1.x so recovered fur
+            # materials can reproduce the native per-vertex shell budget.
+            correction_uv = np.concatenate((
+                decode_corrections.astype(np.float32),
+                np.zeros_like(decode_corrections, dtype=np.float32),
+            ), axis=1)
+            attribs["TEXCOORD_1"] = self._add_accessor(
+                correction_uv, "VEC2", GLTF_FLOAT, GLTF_ARRAY_BUFFER)
 
-        if self.model.joints and self.model.rcra_weights:
+        if self.model.joints and (self.model.rcra_weights or self.model.skin_weights):
             j_arr, w_arr = self._build_skin_arrays(mesh)
             if j_arr is not None:
                 attribs["JOINTS_0"]  = self._add_accessor(
@@ -296,18 +332,18 @@ class GltfExporter:
         return {"attributes": attribs, "indices": idx_acc, "material": mat_idx, "mode": 4}
 
     def _build_skin_arrays(self, mesh: MeshDefinition):
-        if not (mesh.flags & 0x100):
-            return None, None
-        weight_offset = mesh.first_weight_index
+        use_rcra = bool(mesh.flags & 0x100)
+        source = self.model.rcra_weights if use_rcra else self.model.skin_weights
+        weight_offset = mesh.first_weight_index if use_rcra else mesh.vertex_start
         vc    = mesh.vertex_count
-        total = len(self.model.rcra_weights)
+        total = len(source)
 
         j_out = np.zeros((vc, MAX_INFLUENCES), dtype=np.uint8)
         w_out = np.zeros((vc, MAX_INFLUENCES), dtype=np.float32)
         for vi in range(vc):
             wi = weight_offset + vi
             if wi >= total: break
-            for slot, (bone_idx, weight) in enumerate(self.model.rcra_weights[wi][:MAX_INFLUENCES]):
+            for slot, (bone_idx, weight) in enumerate(source[wi][:MAX_INFLUENCES]):
                 j_out[vi,slot] = int(bone_idx) & 0xFF
                 w_out[vi,slot] = float(weight)
             s = w_out[vi].sum()

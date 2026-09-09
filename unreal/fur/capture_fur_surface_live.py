@@ -45,6 +45,8 @@ def tick(delta):
    elif now-state['stage_time']>({1:15,2:5,3:20,4:5}[state['stage']]):
     stage=state['stage'];label={1:'unfiltered-a',2:'unfiltered-b',3:'filtered-a',4:'filtered-b'}[stage]
     row=json.loads(unreal.FurViewportProbe.capture(str(out/(label+'.png'))));row['label']=label
+    if surface_filter_mode=='production':
+     row['production_filter_enabled']=unreal.FurDenoiseLibrary.is_recovered_fur_denoise_enabled()
     state['rows'].append(row)
     if stage==2:
      if surface_filter_mode=='production':command('r.FurAuthoring.Denoise 1')

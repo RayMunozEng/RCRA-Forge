@@ -16,7 +16,7 @@ from typing import Optional
 
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from PyQt6.QtCore import Qt, QPoint
-from PyQt6.QtGui import QMouseEvent, QWheelEvent
+from PyQt6.QtGui import QImage, QMouseEvent, QWheelEvent
 
 from core.cube_texture import validate_cube_mips
 from core.hair_temporal import (
@@ -46,6 +46,14 @@ from core.mesh import (
     mesh_decode_corrections_to_numpy,
     mesh_tangents_to_numpy,
     mesh_to_numpy,
+)
+from core.model_strands import (
+    CAPTURED_WIND_STRENGTH as MODEL_STRAND_CAPTURED_WIND_STRENGTH,
+    CAPTURED_WIND_TIME as MODEL_STRAND_CAPTURED_WIND_TIME,
+    PROFILES as MODEL_STRAND_PROFILES,
+    build_group as build_model_strand_group,
+    fixture_directory as model_strand_fixture_directory,
+    ratchet_strand_fixtures_available,
 )
 
 
@@ -1750,6 +1758,149 @@ void main() {
 }
 """
 
+
+# Discrete ModelStrand accents use the same packed material targets as shell
+# fur.  The vertex inputs are generated from the captured guide buffers using
+# the retail live-sample layout and profile curves; the shader performs the
+# captured child-clump, thickness-mask, and camera-facing ribbon expansion.
+MODEL_STRAND_VERT_SRC = """
+#version 330 core
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec3 aRootNormal;
+layout(location=2) in vec3 aCurveTangent;
+layout(location=3) in vec3 aFrameY;
+layout(location=4) in vec2 aRootUV;
+layout(location=5) in vec4 aCurve; // thickness, clump x/y, along
+layout(location=6) in vec4 aIds;   // child, guide, side, width scale
+
+uniform mat4 uMVP;
+uniform mat4 uPreviousMVP;
+uniform mat4 uModel;
+uniform mat3 uNormal;
+uniform vec3 uEye;
+uniform sampler2D uThickness;
+uniform float uChildCount;
+uniform float uStrayBase;
+uniform float uStrayStrength;
+uniform float uStrayPower;
+
+out vec2 vStrandUV;
+out vec3 vStrandWorldPosition;
+out vec3 vStrandNormal;
+out vec3 vStrandTangent;
+out float vStrandAlong;
+out vec4 vStrandPreviousClip;
+
+void main() {
+    float child = aIds.x;
+    float along = clamp(aCurve.w, 0.0, 1.0);
+    vec3 normal = normalize(uNormal * aRootNormal);
+    vec3 tangent = normalize(uNormal * aCurveTangent);
+    vec3 frameY = normalize(uNormal * aFrameY);
+    vec4 mask = textureLod(uThickness, aRootUV, 0.0);
+    float angle = child * 2.39996;
+    float radius = sqrt((child + 1.0) / uChildCount);
+    float radialCos = cos(angle) * radius;
+    float radialSin = sin(angle) * radius;
+    float maskAlong = mix(mask.g, mask.b, along);
+    vec3 clumpOffset = normal * (radialCos * 2.0 * maskAlong * aCurve.y)
+        + frameY * (radialSin * 2.0 * maskAlong * aCurve.z);
+    float hashBase = fract((aIds.y + child) * 0.318310 + 0.1);
+    float strayRandom = fract((hashBase * hashBase * 83521.0)
+        * hashBase * (hashBase * 3.0));
+    float stray = uStrayBase * along * uStrayStrength
+        * pow(strayRandom, uStrayPower);
+    clumpOffset += (normal * radialCos + frameY * radialSin) * stray;
+
+    vec3 center = (uModel * vec4(aPos + clumpOffset, 1.0)).xyz;
+    vec3 viewDirection = normalize(uEye - center);
+    vec3 facing = cross(tangent, viewDirection);
+    if (dot(facing, facing) < 1e-12) facing = cross(tangent, normal);
+    facing = normalize(facing);
+    float ribbonWidth = 2.0 * mask.r * aCurve.x * aIds.w;
+    vec3 worldPosition = center + facing * ((aIds.z - 0.5) * ribbonWidth);
+
+    vStrandUV = aRootUV;
+    vStrandWorldPosition = worldPosition;
+    vStrandNormal = normal;
+    vStrandTangent = tangent;
+    vStrandAlong = along;
+    vec4 sideClip = uMVP * vec4(aPos + clumpOffset
+        + facing * ((aIds.z - 0.5) * ribbonWidth), 1.0);
+    vStrandPreviousClip = uPreviousMVP * vec4(aPos + clumpOffset
+        + facing * ((aIds.z - 0.5) * ribbonWidth), 1.0);
+    gl_Position = sideClip;
+}
+"""
+
+MODEL_STRAND_MATERIAL_FRAG_SRC = """
+#version 330 core
+#extension GL_ARB_gpu_shader5 : enable
+in vec2 vStrandUV;
+in vec3 vStrandWorldPosition;
+in vec3 vStrandNormal;
+in vec3 vStrandTangent;
+in float vStrandAlong;
+in vec4 vStrandPreviousClip;
+uniform sampler2D uDiffuse;
+uniform float uReflectance;
+uniform float uFurWetness;
+uniform float uTransmittance;
+uniform vec2 uViewportSize;
+uniform float uMotionNearPlane;
+uniform uint uFurRenderFlags;
+layout(location = 0) out uvec4 Material;
+layout(location = 1) out vec4 AlbedoOcclusion;
+layout(location = 2) out float LinearDepth;
+layout(location = 3) out uint Strand;
+layout(location = 4) out vec2 Motion;
+layout(location = 5) out uint Stencil;
+/* FUR_MATERIAL */
+/* FUR_GBUFFER */
+
+vec2 nativePixel(vec2 fragmentPixel) {
+#ifdef RCRA_NATIVE_UPPER_LEFT
+    return fragmentPixel;
+#else
+    return vec2(fragmentPixel.x, uViewportSize.y - fragmentPixel.y);
+#endif
+}
+
+void main() {
+    vec3 textureColor = texture(uDiffuse, vStrandUV).rgb;
+    vec3 authoredGamma = pow(vec3(clamp(uReflectance, 0.0, 1.0)), vec3(0.447761));
+    vec3 textureGamma = pow(clamp(textureColor, vec3(0.0), vec3(1.0)), vec3(0.447761));
+    vec3 multiplyBranch = authoredGamma * (2.0 * textureGamma);
+    vec3 screenBranch = 1.0 - (1.0 - textureGamma)
+        * (1.0 - (authoredGamma - 0.5) * 2.0);
+    vec3 gammaCombined = mix(screenBranch, multiplyBranch, step(vec3(0.5), textureGamma));
+    vec4 albedo = furWetAlbedo(
+        vec4(pow(clamp(gammaCombined, vec3(0.0), vec3(1.0)), vec3(2.23333)), 1.0),
+        clamp(uFurWetness, 0.0, 1.0), clamp(vStrandAlong, 0.0, 1.0));
+    vec2 response = furGlossSpecular(
+        vec2(0.2, 0.0395462364), 1.0, 1.0,
+        clamp(uFurWetness, 0.0, 1.0), clamp(vStrandAlong, 0.0, 1.0));
+    vec3 normal = normalize(vStrandNormal) * (gl_FrontFacing ? 1.0 : -1.0);
+    vec3 tangent = normalize(vStrandTangent);
+    Material = furPackGBuffer(normal, response.x, response.y, uFurRenderFlags);
+    Strand = furPackExtra(tangent, uTransmittance);
+    AlbedoOcclusion = albedo;
+    LinearDepth = 1.0 / gl_FragCoord.w;
+    Motion = furMotionVector(nativePixel(gl_FragCoord.xy),
+        1.0 / max(uViewportSize, vec2(1.0)), vStrandPreviousClip,
+        uMotionNearPlane, uViewportSize);
+    Stencil = 128u;
+}
+"""
+for _marker, _filename in (
+    ('/* FUR_MATERIAL */', 'fur_material.glsl'),
+    ('/* FUR_GBUFFER */', 'fur_gbuffer.glsl'),
+):
+    MODEL_STRAND_MATERIAL_FRAG_SRC = MODEL_STRAND_MATERIAL_FRAG_SRC.replace(
+        _marker,
+        (Path(__file__).resolve().parents[1] / 'core' / _filename).read_text(encoding='utf-8'),
+    )
+
 FUR_SHELL_FRAG_SRC = FUR_SHELL_MATERIAL_COMMON + _HAIR_PREVIEW_LIGHTING + """
 layout(location = 0) out vec4 FragColor;
 layout(location = 1) out vec4 BrightColor;
@@ -3359,6 +3510,97 @@ class GpuSubMesh:
                 setattr(self, attr, 0)
 
 
+class GpuModelStrandGroup:
+    """One capture-derived ModelStrand group resident on the GPU."""
+
+    def __init__(self, profile_name: str):
+        self.profile_name = profile_name
+        self.profile = MODEL_STRAND_PROFILES[profile_name]
+        self.vao = 0
+        self.vbo = 0
+        self.ebo = 0
+        self.index_count = 0
+        self.diffuse_texture = 0
+        self.thickness_texture = 0
+        self.summary = {}
+
+    @staticmethod
+    def _upload_png(path: Path, *, srgb: bool) -> int:
+        image = QImage(str(path))
+        if image.isNull():
+            raise RuntimeError(f"Could not read ModelStrand texture {path}")
+        image = image.convertToFormat(QImage.Format.Format_RGBA8888)
+        width, height = image.width(), image.height()
+        bits = image.bits()
+        bits.setsize(image.sizeInBytes())
+        rgba = bytes(bits)
+        texture = int(glGenTextures(1))
+        glBindTexture(GL_TEXTURE_2D, texture)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT)
+        glTexImage2D(
+            GL_TEXTURE_2D, 0, GL_SRGB8_ALPHA8 if srgb else GL_RGBA8,
+            width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba,
+        )
+        glGenerateMipmap(GL_TEXTURE_2D)
+        glBindTexture(GL_TEXTURE_2D, 0)
+        return texture
+
+    def upload(self, *, captured_wind: bool = False):
+        vertices, indices, self.summary = build_model_strand_group(
+            self.profile_name, captured_wind=captured_wind,
+        )
+        self.vao = int(glGenVertexArrays(1))
+        self.vbo = int(glGenBuffers(1))
+        self.ebo = int(glGenBuffers(1))
+        glBindVertexArray(self.vao)
+        glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
+        glBufferData(GL_ARRAY_BUFFER, vertices.nbytes, vertices, GL_STATIC_DRAW)
+        stride = 22 * 4
+        for location, size, offset in (
+            (0, 3, 0), (1, 3, 12), (2, 3, 24), (3, 3, 36),
+            (4, 2, 48), (5, 4, 56), (6, 4, 72),
+        ):
+            glVertexAttribPointer(
+                location, size, GL_FLOAT, GL_FALSE, stride,
+                ctypes.c_void_p(offset),
+            )
+            glEnableVertexAttribArray(location)
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, self.ebo)
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER, indices.nbytes, indices, GL_STATIC_DRAW)
+        self.index_count = int(len(indices))
+        glBindVertexArray(0)
+        fixture_root = model_strand_fixture_directory()
+        if self.profile_name == 'tail':
+            diffuse = fixture_root / 'tail-DiffuseTexture.png'
+            thickness = fixture_root / 'tail-StrandThicknessTexture.png'
+        else:
+            diffuse = fixture_root / 'DiffuseTexture.png'
+            thickness = fixture_root / 'StrandThicknessTexture.png'
+        self.diffuse_texture = self._upload_png(diffuse, srgb=True)
+        self.thickness_texture = self._upload_png(thickness, srgb=False)
+
+    def draw(self):
+        if self.vao and self.index_count:
+            glBindVertexArray(self.vao)
+            glEnable(GL_PRIMITIVE_RESTART_FIXED_INDEX)
+            glDrawElements(GL_TRIANGLE_STRIP, self.index_count, GL_UNSIGNED_INT, None)
+            glDisable(GL_PRIMITIVE_RESTART_FIXED_INDEX)
+
+    def free(self):
+        if self.vao:
+            glDeleteVertexArrays(1, [self.vao])
+            glDeleteBuffers(1, [self.vbo])
+            glDeleteBuffers(1, [self.ebo])
+            self.vao = self.vbo = self.ebo = 0
+        textures = [value for value in (self.diffuse_texture, self.thickness_texture) if value]
+        if textures:
+            glDeleteTextures(len(textures), textures)
+        self.diffuse_texture = self.thickness_texture = 0
+
+
 # ── Viewport Widget ───────────────────────────────────────────────────────────
 
 import ctypes
@@ -3372,6 +3614,8 @@ class Viewport3D(QOpenGLWidget):
         self._native_raster_active = False
         self._fur_shader_prog: int = 0
         self._fur_material_prog: int = 0
+        self._model_strand_material_prog: int = 0
+        self._gpu_model_strands: list[GpuModelStrandGroup] = []
         self._fur_decode_prog: int = 0
         self._fur_lighting_prog: int = 0
         self._fur_layer_texture: int = 0
@@ -3982,6 +4226,30 @@ class Viewport3D(QOpenGLWidget):
             self._aabb_max = mx
             self._grid_y   = 0.0  # always at world origin
             self.camera.frame_aabb(mn, mx)
+        self._upload_model_strands(model)
+
+    def _upload_model_strands(self, model):
+        source_path = getattr(model, 'source_path', '')
+        if not ratchet_strand_fixtures_available(source_path):
+            return
+        summaries = []
+        captured_wind = bool(
+            abs(self._fur_wind_strength - MODEL_STRAND_CAPTURED_WIND_STRENGTH) < 1e-7
+            and self._fur_wind_time_override is not None
+            and abs(self._fur_wind_time_override - MODEL_STRAND_CAPTURED_WIND_TIME) < 1e-4
+        )
+        for profile_name in ('tail', 'head-sparse', 'ears'):
+            group = GpuModelStrandGroup(profile_name)
+            try:
+                group.upload(captured_wind=captured_wind)
+            except Exception as ex:
+                group.free()
+                print(f"[model-strand] {profile_name} upload failed: {ex}", flush=True)
+                continue
+            self._gpu_model_strands.append(group)
+            summaries.append(group.summary)
+        if summaries:
+            print(f"[model-strand] capture-derived groups ready: {summaries}", flush=True)
 
     def frame_model(self):
         """Reset camera to frame the loaded model."""
@@ -4265,6 +4533,12 @@ class Viewport3D(QOpenGLWidget):
             self._compile_viewport_shader(FUR_SHELL_VERT_SRC, GL_VERTEX_SHADER),
             self._compile_viewport_shader(FUR_SHELL_GEOM_SRC, GL_GEOMETRY_SHADER),
             self._compile_viewport_shader(FUR_MATERIAL_FRAG_SRC, GL_FRAGMENT_SHADER),
+        )
+        self._model_strand_material_prog = compileProgram(
+            self._compile_viewport_shader(MODEL_STRAND_VERT_SRC, GL_VERTEX_SHADER),
+            self._compile_viewport_shader(
+                MODEL_STRAND_MATERIAL_FRAG_SRC, GL_FRAGMENT_SHADER,
+            ),
         )
         for attribute, source in (('_fur_decode_prog', FUR_DECODE_FRAG),
                                   ('_fur_lighting_prog', FUR_LIGHTING_FRAG)):
@@ -6001,6 +6275,56 @@ class Viewport3D(QOpenGLWidget):
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
+    def _draw_model_strands(self, mvp, previous_mvp, model, normal_mat, eye,
+                            near_plane):
+        """Write captured discrete Ratchet ribbons into the native Hair G-buffer."""
+        if (not self._fur_deferred_active or not self._model_strand_material_prog
+                or not self._gpu_model_strands or not self._show_fur):
+            return
+        program = self._model_strand_material_prog
+        glUseProgram(program)
+        _set_uniform_mat4(program, 'uMVP', mvp)
+        _set_uniform_mat4(program, 'uPreviousMVP', previous_mvp)
+        _set_uniform_mat4(program, 'uModel', model)
+        _set_uniform_mat3(program, 'uNormal', normal_mat)
+        _set_uniform_3f(program, 'uEye', *eye)
+        _set_uniform_2f(program, 'uViewportSize', *self._framebuffer_size())
+        _set_uniform_1f(program, 'uMotionNearPlane', near_plane)
+        _set_uniform_1f(program, 'uFurWetness', self._fur_wetness)
+        _set_uniform_1f(program, 'uTransmittance', 0.1)
+        flags = glGetUniformLocation(program, 'uFurRenderFlags')
+        if flags >= 0:
+            glUniform1ui(flags, 0)
+        for sampler, unit in (('uDiffuse', 0), ('uThickness', 1)):
+            location = glGetUniformLocation(program, sampler)
+            if location >= 0:
+                glUniform1i(location, unit)
+        glDisable(GL_BLEND)
+        glDepthMask(GL_TRUE)
+        glDisable(GL_CULL_FACE)
+        for group in self._gpu_model_strands:
+            profile = group.profile
+            _set_uniform_1f(program, 'uChildCount', float(profile.children))
+            _set_uniform_1f(program, 'uReflectance', profile.reflectance)
+            _set_uniform_1f(
+                program, 'uStrayBase',
+                max(profile.clump_x[0][1], profile.clump_y[0][1]),
+            )
+            _set_uniform_1f(program, 'uStrayStrength', profile.stray_strength)
+            _set_uniform_1f(program, 'uStrayPower', profile.stray_power)
+            glActiveTexture(GL_TEXTURE0)
+            glBindTexture(GL_TEXTURE_2D, group.diffuse_texture)
+            glActiveTexture(GL_TEXTURE1)
+            glBindTexture(GL_TEXTURE_2D, group.thickness_texture)
+            group.draw()
+        glBindVertexArray(0)
+        glActiveTexture(GL_TEXTURE1)
+        glBindTexture(GL_TEXTURE_2D, 0)
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(GL_TEXTURE_2D, 0)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
     def paintGL(self):
         if not _HAS_OPENGL:
             return
@@ -6331,6 +6655,9 @@ class Viewport3D(QOpenGLWidget):
             )
             if self._native_raster_active:
                 glDisable(GL_CULL_FACE)
+            self._draw_model_strands(
+                mvp, previous_mvp, model, normal_mat, eye, near,
+            )
             self._previous_fur_mvp = mvp.copy()
             self._previous_fur_projection = proj.copy()
             self._previous_fur_view = view.copy()
@@ -6506,6 +6833,9 @@ class Viewport3D(QOpenGLWidget):
         for gm in self._gpu_meshes:
             gm.free()
         self._gpu_meshes.clear()
+        for group in self._gpu_model_strands:
+            group.free()
+        self._gpu_model_strands.clear()
         self._reset_temporal_history()
         if self._fur_scene_gpu is not None:
             self._fur_scene_gpu.close()

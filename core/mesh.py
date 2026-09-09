@@ -169,6 +169,7 @@ class ModelAsset:
     joint_quaternions: list[tuple] = field(default_factory=list)
     joint_scales:     list[tuple] = field(default_factory=list)   # per-bone scale from m34[0:3]
     rcra_weights:     list         = field(default_factory=list)  # per-vertex list of (bone, weight) pairs
+    skin_weights:     list         = field(default_factory=list)  # legacy skin-batch weights, global vertex indexed
     lod_count:        int          = 1    # number of LOD levels detected from Look section
     skin_data:        Optional[bytes] = None
     skin_batches:     list = field(default_factory=list)
@@ -201,6 +202,8 @@ class ModelParser:
         rcra_w     = self._parse_rcra_weights(dat1)
         skin_data  = dat1.get_section(TAG_SKIN_DATA)
         skin_batch = self._parse_skin_batches(dat1)
+        skin_w     = self._decode_skin_batch_weights(
+            meshes, skin_batch, skin_data, len(vertexes))
 
         # Overlay UV1 channel if present
         # UV1 raw int16 values use the same uv_scale as the base vertex channel
@@ -240,6 +243,7 @@ class ModelParser:
             joint_quaternions = jquat,
             joint_scales      = jscales,
             rcra_weights      = rcra_w,
+            skin_weights      = skin_w,
             skin_data         = skin_data,
             skin_batches      = skin_batch,
             lod_count         = lod_count,
@@ -510,6 +514,58 @@ class ModelParser:
                 'first_vertex': first_vertex
             })
         return batches
+
+    @staticmethod
+    def _decode_skin_batch_weights(meshes, batches, skin_data, vertex_count) -> list:
+        """Decode the variable RCRA skin stream used by mesh flags 0x11.
+
+        The format follows ALERT's ModelSkinData decoder: one group-count byte
+        per block of 16 vertices, then either one bone byte per rigid vertex or
+        ``(bone, weight_byte)`` pairs. Batch ``first_vertex`` is mesh-local.
+        """
+        result = [[] for _ in range(vertex_count)]
+        if not skin_data or not batches:
+            return result
+        raw = bytes(skin_data)
+        for mesh_index, mesh in enumerate(meshes):
+            if mesh.flags & 0x100:
+                continue
+            first = mesh.first_skin_batch
+            later = [candidate.first_skin_batch for candidate in meshes[mesh_index + 1:]
+                     if candidate.first_skin_batch > first]
+            end = min(later) if later else len(batches)
+            for batch in batches[first:end]:
+                offset = batch['offset']
+                count = batch['vertex_count']
+                first_vertex = batch['first_vertex']
+                for block in range(0, count, 16):
+                    if offset >= len(raw):
+                        raise ValueError("Skin batch group count exceeds skin-data section")
+                    groups = raw[offset] + 1
+                    offset += 1
+                    for lane in range(min(16, count - block)):
+                        entries = {}
+                        if groups == 1:
+                            if offset >= len(raw):
+                                raise ValueError("Rigid skin batch exceeds skin-data section")
+                            entries[raw[offset]] = 1.0
+                            offset += 1
+                        else:
+                            for _ in range(groups):
+                                if offset + 2 > len(raw):
+                                    raise ValueError("Weighted skin batch exceeds skin-data section")
+                                bone, weight = struct.unpack_from('<BB', raw, offset)
+                                offset += 2
+                                entries[bone] = entries.get(bone, 0.0) + weight / 256.0
+                        total = sum(entries.values())
+                        local_vertex = first_vertex + block + lane
+                        global_vertex = mesh.vertex_start + local_vertex
+                        if total > 0 and 0 <= local_vertex < mesh.vertex_count \
+                                and global_vertex < len(result):
+                            result[global_vertex] = sorted(
+                                ((bone, weight / total) for bone, weight in entries.items()),
+                                key=lambda item: -item[1])
+        return result
 
     # ── Material names (section 0x3250BB80) ──────────────────────────────────
 

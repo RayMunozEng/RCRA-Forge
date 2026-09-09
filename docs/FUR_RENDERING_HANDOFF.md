@@ -1,5 +1,12 @@
 # Character Fur Rendering Handoff
 
+Latest 2026-09-09: read
+[MODELSTRAND_HANDOFF_20260909.md](MODELSTRAND_HANDOFF_20260909.md) before
+continuing Ratchet work. It records the recovered tail, sparse-head, and ear
+ModelStrand geometry/material path, retail topology evidence, the exact captured
+wind-only state, private-desktop validation command, local ignored fixtures,
+and the remaining skeletal/persistent-wind/common-frame parity boundary.
+
 Latest 2026-09-05: read [FUR_POSE_STREAMS.md](FUR_POSE_STREAMS.md) for paired deformed-position integration, bounded camera-motion results, static-image regression, and the remaining animated-frame parity boundary. The generic TAA capture is a menu frame, not a fur appearance reference.
 
 For a clean checkout and continuation on another Windows computer, start with
